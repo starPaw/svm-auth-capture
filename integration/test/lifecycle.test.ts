@@ -129,7 +129,7 @@ describe("authorize, capture, capture+void, refund, void through /verify and /se
     expect(v.landed.data[0]).toBe(Tag.void);
     expect(v.landed.data.length).toBe(17);
     expect(v.landed.signers).toEqual([h.facilitatorKey.address, h.server.address]);
-    expect(v.amount).toBe("100");
+    expect(v.amount).toBeUndefined(); // a void settles nothing to the server; see README Results
     expect(v.result).toEqual({ operation: "void", payment, amount: "100", held: "0", refundable: "0" });
     expect(h.state(payment)).toMatchObject({ maximum: M, held: 0n, refundable: 0n });
     expect(h.tokens(await h.payerAta())).toBe(payer0 + 100n);

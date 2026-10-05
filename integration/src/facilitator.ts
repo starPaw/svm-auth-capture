@@ -256,7 +256,14 @@ export class Facilitator {
       return { success: false, errorReason: Reason.settlementPending, ...base };
     }
     if (result.status === "succeeded") {
-      return { success: true, ...base, amount: verified.result.amount, extensions: { [RESULT_KEY]: verified.result } };
+      // A void settles nothing to the server: omit the generic `amount` and keep the released
+      // hold only in the extension result, so generic consumers never read it as revenue.
+      return {
+        success: true,
+        ...base,
+        ...(verified.result.operation === "void" ? {} : { amount: verified.result.amount }),
+        extensions: { [RESULT_KEY]: verified.result },
+      };
     }
     if (result.status === "failed") return { success: false, errorReason: Reason.transactionState, ...base };
     return { success: false, errorReason: Reason.settlementPending, ...base };
