@@ -1,4 +1,4 @@
-//! SAC-001: persistent classic-SPL escrow authorization and direct payer reclaim.
+//! Persistent classic-SPL escrow: authorize, reclaim, capture, and void.
 use solana_program::{
     account_info::AccountInfo,
     clock::Clock,
@@ -98,6 +98,32 @@ pub fn authorize_data(salt: [u8; 32], maximum: u64, dc: i64, dr: i64) -> Vec<u8>
     data
 }
 
+/// Wire: capture=2, amount:u64, releaseRemainder:bool(0/1), expectedH:u64, expectedF:u64.
+/// Accounts: server(s), payment(w), mint, vault(w), server ATA(w), payer ATA(w), classic Token.
+/// The payer ATA is used only for a positive remainder release.
+pub fn capture_data(
+    amount: u64,
+    release_remainder: bool,
+    expected_h: u64,
+    expected_f: u64,
+) -> Vec<u8> {
+    let mut data = vec![2];
+    data.extend_from_slice(&amount.to_le_bytes());
+    data.push(u8::from(release_remainder));
+    data.extend_from_slice(&expected_h.to_le_bytes());
+    data.extend_from_slice(&expected_f.to_le_bytes());
+    data
+}
+
+/// Wire: void=3, expectedH:u64, expectedF:u64.
+/// Accounts: server(s), payment(w), mint, vault(w), payer ATA(w), classic Token.
+pub fn void_data(expected_h: u64, expected_f: u64) -> Vec<u8> {
+    let mut data = vec![3];
+    data.extend_from_slice(&expected_h.to_le_bytes());
+    data.extend_from_slice(&expected_f.to_le_bytes());
+    data
+}
+
 fn require(ok: bool, error: ProgramError) -> ProgramResult {
     if ok {
         Ok(())
@@ -146,6 +172,16 @@ fn token(
     mint: &Pubkey,
     vault: bool,
 ) -> Result<TokenAccount, ProgramError> {
+    transfer_token(account, owner, mint, vault, false)
+}
+
+fn transfer_token(
+    account: &AccountInfo,
+    owner: &Pubkey,
+    mint: &Pubkey,
+    vault: bool,
+    allow_frozen: bool,
+) -> Result<TokenAccount, ProgramError> {
     require(
         account.owner == &spl_token::id(),
         ProgramError::IncorrectProgramId,
@@ -163,7 +199,8 @@ fn token(
     require(
         state.owner == *owner
             && state.mint == *mint
-            && state.state == AccountState::Initialized
+            && (state.state == AccountState::Initialized
+                || (allow_frozen && state.state == AccountState::Frozen))
             && state.is_native == COption::None,
         ProgramError::InvalidAccountData,
     )?;
@@ -184,6 +221,8 @@ pub fn process_instruction(
     match data.first() {
         Some(0) => authorize(program_id, accounts, data),
         Some(1) if data.len() == 1 => reclaim(program_id, accounts),
+        Some(2) if data.len() == 26 && data[9] <= 1 => capture(program_id, accounts, data),
+        Some(3) if data.len() == 17 => void(program_id, accounts, data),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -394,6 +433,205 @@ fn reclaim(program_id: &Pubkey, a: &[AccountInfo]) -> ProgramResult {
         token(vault, payment.key, asset.key, true)?.amount == expected_vault
             && token(destination, payer.key, asset.key, false)?.amount == expected_destination,
         ProgramError::InvalidAccountData,
+    )?;
+    state.held = 0;
+    payment
+        .try_borrow_mut_data()?
+        .copy_from_slice(&state.encode());
+    Ok(())
+}
+
+// Shared server guards enforce identity, authority, exact consent, and vault backing.
+// No new lifecycle state or authority is introduced.
+fn server_state(
+    program_id: &Pubkey,
+    server: &AccountInfo,
+    payment: &AccountInfo,
+    asset: &AccountInfo,
+    vault: &AccountInfo,
+    tokens: &AccountInfo,
+    expected: &[u8],
+) -> Result<Payment, ProgramError> {
+    signer(server)?;
+    writable(payment)?;
+    writable(vault)?;
+    program(tokens, &spl_token::id())?;
+    require(
+        payment.owner == program_id,
+        ProgramError::IncorrectProgramId,
+    )?;
+    let state = Payment::decode(&payment.try_borrow_data()?)?;
+    require(
+        server.key == &state.server && asset.key == &state.mint,
+        ProgramError::InvalidArgument,
+    )?;
+    require(
+        payment.key == &payment_address(program_id, &state.payer, &state.salt).0,
+        ProgramError::InvalidSeeds,
+    )?;
+    require(
+        state.held == u64::from_le_bytes(expected[..8].try_into().unwrap())
+            && state.refundable == u64::from_le_bytes(expected[8..16].try_into().unwrap())
+            && state.held > 0,
+        ProgramError::InvalidArgument,
+    )?;
+    require(
+        token(vault, payment.key, asset.key, true)?.amount >= state.held,
+        ProgramError::InsufficientFunds,
+    )?;
+    Ok(state)
+}
+
+// Frozen destinations retain valid identities: let Token reject the actual CPI.
+// In capture+void this also exercises rollback after a successful server leg.
+#[allow(clippy::too_many_arguments)] // Explicit CPI account roles and stored recipient/amount.
+fn payout<'a>(
+    program_id: &Pubkey,
+    state: &Payment,
+    payment: &AccountInfo<'a>,
+    asset: &AccountInfo<'a>,
+    vault: &AccountInfo<'a>,
+    destination: &AccountInfo<'a>,
+    tokens: &AccountInfo<'a>,
+    recipient: &Pubkey,
+    amount: u64,
+) -> ProgramResult {
+    require(amount > 0, ProgramError::InvalidArgument)?;
+    writable(destination)?;
+    let decimals = mint(asset)?.decimals;
+    let before_vault = token(vault, payment.key, asset.key, true)?.amount;
+    let before_destination = transfer_token(destination, recipient, asset.key, false, true)?.amount;
+    let expected_vault = before_vault
+        .checked_sub(amount)
+        .ok_or(ProgramError::InsufficientFunds)?;
+    let expected_destination = before_destination
+        .checked_add(amount)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    let bump_seed = [payment_address(program_id, &state.payer, &state.salt).1];
+    let seeds = [SEED, state.payer.as_ref(), &state.salt, &bump_seed];
+    invoke_signed(
+        &spl_token::instruction::transfer_checked(
+            &spl_token::id(),
+            vault.key,
+            asset.key,
+            destination.key,
+            payment.key,
+            &[],
+            amount,
+            decimals,
+        )?,
+        &[
+            vault.clone(),
+            asset.clone(),
+            destination.clone(),
+            payment.clone(),
+            tokens.clone(),
+        ],
+        &[&seeds],
+    )?;
+    require(
+        token(vault, payment.key, asset.key, true)?.amount == expected_vault
+            && token(destination, recipient, asset.key, false)?.amount == expected_destination,
+        ProgramError::InvalidAccountData,
+    )
+}
+
+fn capture(program_id: &Pubkey, a: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    let [server, payment, asset, vault, receiver, payer_ata, tokens] = a else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    let mut state = server_state(
+        program_id,
+        server,
+        payment,
+        asset,
+        vault,
+        tokens,
+        &data[10..],
+    )?;
+    distinct(&[
+        server.key,
+        payment.key,
+        asset.key,
+        vault.key,
+        receiver.key,
+        payer_ata.key,
+    ])?;
+    let amount = u64::from_le_bytes(data[1..9].try_into().unwrap());
+    require(
+        Clock::get()?.unix_timestamp < state.capture_deadline && amount > 0 && amount <= state.held,
+        ProgramError::InvalidArgument,
+    )?;
+    let remainder = state
+        .held
+        .checked_sub(amount)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    let next_f = state
+        .refundable
+        .checked_add(amount)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    payout(
+        program_id,
+        &state,
+        payment,
+        asset,
+        vault,
+        receiver,
+        tokens,
+        &state.server,
+        amount,
+    )?;
+    if data[9] == 1 && remainder > 0 {
+        payout(
+            program_id,
+            &state,
+            payment,
+            asset,
+            vault,
+            payer_ata,
+            tokens,
+            &state.payer,
+            remainder,
+        )?;
+    }
+    state.held = if data[9] == 1 { 0 } else { remainder };
+    state.refundable = next_f;
+    payment
+        .try_borrow_mut_data()?
+        .copy_from_slice(&state.encode());
+    Ok(())
+}
+
+fn void(program_id: &Pubkey, a: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    let [server, payment, asset, vault, destination, tokens] = a else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    let mut state = server_state(
+        program_id,
+        server,
+        payment,
+        asset,
+        vault,
+        tokens,
+        &data[1..],
+    )?;
+    distinct(&[
+        server.key,
+        payment.key,
+        asset.key,
+        vault.key,
+        destination.key,
+    ])?;
+    payout(
+        program_id,
+        &state,
+        payment,
+        asset,
+        vault,
+        destination,
+        tokens,
+        &state.payer,
+        state.held,
     )?;
     state.held = 0;
     payment
