@@ -187,9 +187,10 @@ export class Facilitator {
    * finalized outcome. No retry, blockhash replacement, or re-signing. The in-flight entry is
    * set synchronously from the raw message bytes, so a concurrent identical `/settle` always
    * joins it; the joiner validates its own request before joining, so a modified or corrupted
-   * duplicate is rejected instead of receiving the first operation's outcome. The joiner gets
-   * the first operation's outcome with `duplicate: true`; the terminal result is preserved,
-   * not rewritten into pending.
+   * duplicate is rejected instead of joining the in-flight operation. A joined duplicate is
+   * never a second success: it reports `duplicate_settlement`, a non-success with an empty
+   * transaction, and broadcasts nothing. The first request's own response remains the
+   * operation's terminal receipt.
    */
   async settle(body: unknown): Promise<SettleResponse> {
     const key = messageKey(body);
@@ -197,14 +198,17 @@ export class Facilitator {
     if (first) {
       // Validate before joining: an invalid variant of the same message bytes is rejected,
       // never confused with the valid in-flight operation.
+      let payer: string | undefined;
       try {
-        await this.check(body);
+        payer = (await this.check(body)).payer;
       } catch (e) {
         return this.rejectionResponse(e);
       }
-      const r = await first;
-      // Same message bytes and a validated profile: one economic event, one signature.
-      return { ...r, duplicate: true };
+      await first;
+      // Same message bytes and a validated profile: one economic event, one submission. The
+      // standard SettleResponse has no duplicate marker, so a second success would let a
+      // standard caller execute the resource twice; report a stable non-success instead.
+      return { success: false, errorReason: Reason.duplicateSettlement, transaction: "", network: this.network, ...(payer ? { payer } : {}) };
     }
     const settling = this.checkAndBroadcast(body);
     if (key !== undefined) this.inFlight.set(key, settling);

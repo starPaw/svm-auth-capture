@@ -149,7 +149,7 @@ describe("settlement outcomes", () => {
     }
   });
 
-  test("concurrent identical settles: one success, the duplicate re-reports it with a duplicate marker", async () => {
+  test("concurrent identical settles: one success, the duplicate reports duplicate_settlement", async () => {
     // Widen the in-flight window so the duplicate arrives before the first lands.
     const slow = () => new Promise<void>((resolve) => setTimeout(resolve, 50));
     const salt = h.newSalt();
@@ -165,15 +165,10 @@ describe("settlement outcomes", () => {
       h.ledger.beforeSubmit = slow;
       const submitted = h.ledger.submissions.length;
       const results = await Promise.all([h.post("/settle", body), h.post("/settle", body)]);
-      const winners = results.filter((r) => r.json.success === true && !r.json.duplicate);
+      const winners = results.filter((r) => r.json.success === true);
       expect(winners).toHaveLength(1);
-      const duplicate = results.find((r) => r.json.duplicate === true)!;
-      expect(duplicate.json).toMatchObject({
-        success: true,
-        duplicate: true,
-        transaction: winners[0]!.json.transaction,
-        amount: winners[0]!.json.amount,
-      });
+      const duplicate = results.find((r) => r.json.success !== true)!;
+      expect(duplicate.json).toMatchObject({ success: false, errorReason: Reason.duplicateSettlement, transaction: "" });
       expect(h.ledger.submissions.length).toBe(submitted + 1);
       expect(h.state(payment)).toMatchObject(after);
       reset();
@@ -181,13 +176,13 @@ describe("settlement outcomes", () => {
     expect(h.tokens(payerAta)).toBe(before - 100n);
   });
 
-  test("a concurrent duplicate preserves the first request's terminal failure, never pending", async () => {
+  test("a concurrent duplicate is a non-success duplicate_settlement, never a second success", async () => {
     const payment = await h.authorized();
     const body = h.body(await h.capture(payment, 30n, false, 100n, 0n));
     // The first capture is held at submit, after it joined the in-flight map. The duplicate
     // validates against the still-intact hold and joins it. Then a competing void lands and the
-    // first submit fails onchain: both the first request and the joined duplicate get the same
-    // terminal failure, never a rewritten pending.
+    // first submit fails onchain: the duplicate still reports duplicate_settlement (one economic
+    // event), never a success, while the first request carries the terminal failure.
     const competing = await h.signedVoid(payment, 100n, 0n, [h.server, h.facilitatorKey]);
     let entered!: () => void;
     const enteredAtSubmit = new Promise<void>((resolve) => {
@@ -225,9 +220,8 @@ describe("settlement outcomes", () => {
       expect(first.json).toMatchObject({ success: false, errorReason: Reason.transactionState });
       expect(duplicate.json).toMatchObject({
         success: false,
-        duplicate: true,
-        errorReason: Reason.transactionState,
-        transaction: first.json.transaction,
+        errorReason: Reason.duplicateSettlement,
+        transaction: "",
       });
       // The void released the hold; the capture moved nothing.
       expect(h.state(payment)).toMatchObject({ held: 0n, refundable: 0n });
@@ -261,7 +255,6 @@ describe("settlement outcomes", () => {
       const modifiedAccepted = { ...structuredClone(body), paymentPayload: { ...structuredClone(body.paymentPayload), accepted: { ...body.paymentPayload.accepted, amount: "101" } } };
       const rejected = await h.post("/settle", modifiedAccepted);
       expect(rejected.json).toMatchObject({ success: false, errorReason: Reason.acceptedMismatch, transaction: "" });
-      expect(rejected.json.duplicate).toBeUndefined();
 
       // Same message bytes, but the server's economic signature was corrupted: also rejected
       // during validation, before it can join the in-flight operation.
@@ -274,7 +267,6 @@ describe("settlement outcomes", () => {
       const corrupted = h.body(capturePayload(payment, corruptedTxCopy, 30n, false, 100n, 0n));
       const rejectedSig = await h.post("/settle", corrupted);
       expect(rejectedSig.json).toMatchObject({ success: false, errorReason: Reason.signature, transaction: "" });
-      expect(rejectedSig.json.duplicate).toBeUndefined();
     } finally {
       release();
     }
@@ -398,7 +390,7 @@ describe("HTTP surface", () => {
     const supported = await fetch(h.url + "/supported");
     expect(supported.status).toBe(200);
     expect(await supported.json()).toEqual({
-      kinds: [{ x402Version: 2, scheme: "auth-capture", network: NETWORK }],
+      kinds: [{ x402Version: 2, scheme: "auth-capture", network: NETWORK, extra: { feePayer: h.facilitatorKey.address } }],
       extensions: [],
       signers: { [NETWORK]: [h.facilitatorKey.address] },
     });

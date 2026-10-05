@@ -11,7 +11,7 @@ export function createApp(facilitator: Facilitator): Hono {
 
   app.get("/supported", (c) => {
     return c.json({
-      kinds: [{ x402Version: 2, scheme: SCHEME, network: facilitator.network }],
+      kinds: [{ x402Version: 2, scheme: SCHEME, network: facilitator.network, extra: { feePayer: facilitator.feePayerAddress } }],
       extensions: [],
       signers: { [facilitator.network]: [facilitator.feePayerAddress] },
     });
