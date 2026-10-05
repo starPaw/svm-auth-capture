@@ -148,9 +148,10 @@ export class Facilitator {
   private readonly maxUnitLimit: number;
   private readonly maxUnitPrice: bigint;
   /**
-   * Settlements in flight in this process, keyed by the exact message bytes. A concurrent
-   * identical `/settle` must not report a second success for one economic event; it gets the
-   * first one's signature as pending instead. Not durable: no journal or idempotency store.
+   * Settlements in flight in this process, keyed by the exact message bytes of the validated
+   * transaction. A concurrent identical `/settle` must not submit twice for one economic event;
+   * it receives the first operation's outcome with `duplicate: true`. Not durable: no journal
+   * or idempotency store.
    */
   private readonly inFlight = new Map<string, Promise<SettleResponse>>();
 
@@ -183,54 +184,82 @@ export class Facilitator {
 
   /**
    * Re-verifies, co-signs only as fee payer, submits the exact bytes once, and reports the
-   * finalized outcome. No retry, blockhash replacement, or re-signing: an unknown outcome is
-   * returned as `settlement_pending` with the broadcast signature.
+   * finalized outcome. No retry, blockhash replacement, or re-signing. The in-flight entry is
+   * set synchronously from the raw message bytes, so a concurrent identical `/settle` always
+   * joins it; the joiner validates its own request before joining, so a modified or corrupted
+   * duplicate is rejected instead of receiving the first operation's outcome. The joiner gets
+   * the first operation's outcome with `duplicate: true`; the terminal result is preserved,
+   * not rewritten into pending.
    */
   async settle(body: unknown): Promise<SettleResponse> {
     const key = messageKey(body);
-    if (key === undefined) return this.settleOnce(body);
-    const first = this.inFlight.get(key);
+    const first = key === undefined ? undefined : this.inFlight.get(key);
     if (first) {
+      // Validate before joining: an invalid variant of the same message bytes is rejected,
+      // never confused with the valid in-flight operation.
+      try {
+        await this.check(body);
+      } catch (e) {
+        return this.rejectionResponse(e);
+      }
       const r = await first;
-      // Same bytes, same signature: never a second success. A preflight rejection broadcast nothing.
-      return r.transaction === "" ? r : { success: false, errorReason: Reason.settlementPending, transaction: r.transaction, network: r.network, ...(r.payer ? { payer: r.payer } : {}) };
+      // Same message bytes and a validated profile: one economic event, one signature.
+      return { ...r, duplicate: true };
     }
-    const settling = this.settleOnce(body);
-    this.inFlight.set(key, settling);
+    const settling = this.checkAndBroadcast(body);
+    if (key !== undefined) this.inFlight.set(key, settling);
     try {
       return await settling;
     } finally {
-      this.inFlight.delete(key);
+      if (key !== undefined) this.inFlight.delete(key);
     }
   }
 
-  private async settleOnce(body: unknown): Promise<SettleResponse> {
+  private rejectionResponse(e: unknown): SettleResponse {
+    if (e instanceof Rejection) {
+      return { success: false, errorReason: e.reason, transaction: "", network: this.network, ...(e.payer ? { payer: e.payer } : {}) };
+    }
+    return { success: false, errorReason: Reason.unexpectedSettle, transaction: "", network: this.network };
+  }
+
+  /** Validates once, then co-signs as fee payer, submits, and reports the finalized outcome. */
+  private async checkAndBroadcast(body: unknown): Promise<SettleResponse> {
     let verified: Verified;
     try {
       verified = await this.check(body);
     } catch (e) {
-      const reason = e instanceof Rejection ? e.reason : Reason.unexpectedSettle;
-      const payer = e instanceof Rejection ? e.payer : undefined;
-      return { success: false, errorReason: reason, transaction: "", network: this.network, ...(payer ? { payer } : {}) };
+      return this.rejectionResponse(e);
     }
+    return this.broadcast(verified);
+  }
+
+  /** Co-signs as fee payer, submits once, and maps the adapter's three-way outcome. */
+  private async broadcast(verified: Verified): Promise<SettleResponse> {
     const signed = await partiallySignTransaction([this.feePayer.keyPair], verified.transaction);
     const signature = getSignatureFromTransaction(signed);
     const base = { transaction: signature, network: this.network, payer: verified.payer };
-    const pending: SettleResponse = { success: false, errorReason: Reason.settlementPending, ...base };
-    let outcome: unknown;
+    let outcome;
     try {
       outcome = await this.ledger.submit(signed);
     } catch {
-      return pending;
+      return { success: false, errorReason: Reason.settlementPending, ...base };
     }
-    // Only a finalized `succeeded` or `failed` is an outcome; anything else, including a
-    // malformed or mislabeled adapter result, stays pending with the broadcast signature.
-    if (!isObject(outcome) || outcome.commitment !== "finalized") return pending;
-    if (outcome.status === "succeeded") {
+    // The adapter established the exact bytes were never broadcast: a non-pending failure with
+    // an empty transaction. A retry of the same bytes is fresh, not a second movement.
+    if (outcome.kind === "not-submitted") {
+      return { success: false, errorReason: Reason.settlementNotSubmitted, transaction: "", network: this.network, ...(verified.payer ? { payer: verified.payer } : {}) };
+    }
+    // Broadcast but unresolved, or a malformed/mislabeled adapter result: stay pending with the
+    // broadcast signature. Never reclassified as not-submitted; an earlier broadcast may land.
+    const result = outcome.outcome;
+    if (!result || result.commitment !== "finalized") {
+      return { success: false, errorReason: Reason.settlementPending, ...base };
+    }
+    if (result.status === "succeeded") {
       return { success: true, ...base, amount: verified.result.amount, extensions: { [RESULT_KEY]: verified.result } };
     }
-    if (outcome.status === "failed") return { success: false, errorReason: Reason.transactionState, ...base };
-    return pending;
+    if (result.status === "failed") return { success: false, errorReason: Reason.transactionState, ...base };
+    return { success: false, errorReason: Reason.settlementPending, ...base };
   }
 
   private async check(body: unknown): Promise<Verified> {

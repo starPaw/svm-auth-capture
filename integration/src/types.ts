@@ -41,6 +41,12 @@ export type SettleResponse = {
   network: string;
   amount?: string;
   extensions?: Record<string, unknown>;
+  /**
+   * Local wire rule: this response re-reports the outcome of an identical in-flight `/settle`
+   * (same message bytes and validated requirements) that was already submitted once. No second
+   * economic event happened; the resource server should treat it as the same receipt.
+   */
+  duplicate?: boolean;
 };
 
 /** Facilitator-relayed operations. `reclaim` is payer-direct and never relayed. */
@@ -72,7 +78,10 @@ export const Reason = {
   invalidRequirements: "invalid_payment_requirements",
   insufficientFunds: "insufficient_funds",
   transactionState: "invalid_transaction_state",
+  /** The transaction was broadcast but its confirmation could not be established; non-terminal. */
   settlementPending: "settlement_pending",
+  /** The adapter established the exact bytes were never broadcast; a retry of the same bytes is fresh. */
+  settlementNotSubmitted: "settlement_not_submitted",
   unexpectedVerify: "unexpected_verify_error",
   unexpectedSettle: "unexpected_settle_error",
   networkMismatch: "invalid_auth_capture_svm_network_mismatch",

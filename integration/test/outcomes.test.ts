@@ -1,10 +1,10 @@
 // Acceptance 3 and 4: settlement outcome reporting, no automatic retry, reclaim kept out of
 // /settle, and the HTTP surface limited to /verify and /settle.
-import type { Transaction } from "@solana/kit";
+import type { SignatureBytes, Transaction } from "@solana/kit";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { FailedTransactionMetadata } from "litesvm";
 import { LOCAL_PROGRAM_ID, reclaimAccounts, toInstruction } from "../src/program.js";
-import { authorizePayload, buildTransaction, encodeTransaction } from "../src/transactions.js";
+import { authorizePayload, buildTransaction, capturePayload, encodeTransaction } from "../src/transactions.js";
 import { Reason } from "../src/types.js";
 import { createHarness, DC, type Harness, inspect, NETWORK, NOW } from "./fixture.js";
 
@@ -17,6 +17,7 @@ afterAll(() => h.close());
 const reset = () => {
   h.ledger.beforeSubmit = undefined;
   h.ledger.beforeRead = undefined;
+  h.ledger.beforeSimulate = undefined;
   h.ledger.failSubmit = undefined;
   h.ledger.commitment = "finalized";
   h.ledger.outcome = undefined;
@@ -55,25 +56,25 @@ describe("settlement outcomes", () => {
     reset();
   });
 
-  test("an unknown outcome before landing is pending; the caller's resend reuses the exact bytes", async () => {
+  test("a send-time refusal before landing is a non-pending failure with no transaction; the resend is fresh", async () => {
     const payment = await h.authorized();
     const body = h.body(await h.capture(payment, 30n, false, 100n, 0n));
     h.ledger.failSubmit = "before-landing";
     const submitted = h.ledger.submissions.length;
 
-    const pending = await h.post("/settle", body);
+    const refused = await h.post("/settle", body);
 
-    expect(pending.json).toMatchObject({ success: false, errorReason: Reason.settlementPending, network: NETWORK });
-    expect(pending.json.transaction).toBe(h.ledger.submissions.at(-1)!.signature);
-    expect(pending.json.transaction).not.toBe("");
-    expect(h.ledger.submissions.length).toBe(submitted + 1); // no automatic retry
+    expect(refused.json).toMatchObject({ success: false, errorReason: Reason.settlementNotSubmitted, transaction: "", network: NETWORK });
+    expect(refused.json.payer).toBe(h.payer.address);
+    expect(h.ledger.submissions.length).toBe(submitted + 1); // recorded as unknown, but never reported as pending
     expect(h.state(payment)).toMatchObject({ held: 100n, refundable: 0n });
 
-    // A later explicit resend of the same payload broadcasts identical bytes: same signature,
-    // same blockhash, no re-signing or new economic consent.
+    // The bytes never reached the cluster, so a later resend of the same payload is fresh:
+    // same signature, same blockhash, no re-signing or new economic consent.
+    const expectedSignature = h.ledger.submissions.at(-1)!.signature;
     h.ledger.failSubmit = undefined;
     const resent = await h.post("/settle", body);
-    expect(resent.json).toMatchObject({ success: true, transaction: pending.json.transaction, amount: "30" });
+    expect(resent.json).toMatchObject({ success: true, transaction: expectedSignature, amount: "30" });
     const [first, second] = h.ledger.submissions.slice(-2);
     expect(Buffer.from(second!.transaction.messageBytes)).toEqual(Buffer.from(first!.transaction.messageBytes));
     expect(h.state(payment)).toMatchObject({ held: 70n, refundable: 30n });
@@ -148,7 +149,7 @@ describe("settlement outcomes", () => {
     }
   });
 
-  test("concurrent identical settles: one success, the duplicate is pending on the same signature", async () => {
+  test("concurrent identical settles: one success, the duplicate re-reports it with a duplicate marker", async () => {
     // Widen the in-flight window so the duplicate arrives before the first lands.
     const slow = () => new Promise<void>((resolve) => setTimeout(resolve, 50));
     const salt = h.newSalt();
@@ -164,15 +165,123 @@ describe("settlement outcomes", () => {
       h.ledger.beforeSubmit = slow;
       const submitted = h.ledger.submissions.length;
       const results = await Promise.all([h.post("/settle", body), h.post("/settle", body)]);
-      const winners = results.filter((r) => r.json.success === true);
+      const winners = results.filter((r) => r.json.success === true && !r.json.duplicate);
       expect(winners).toHaveLength(1);
-      const duplicate = results.find((r) => r.json.success !== true)!;
-      expect(duplicate.json).toMatchObject({ success: false, errorReason: Reason.settlementPending, transaction: winners[0]!.json.transaction });
+      const duplicate = results.find((r) => r.json.duplicate === true)!;
+      expect(duplicate.json).toMatchObject({
+        success: true,
+        duplicate: true,
+        transaction: winners[0]!.json.transaction,
+        amount: winners[0]!.json.amount,
+      });
       expect(h.ledger.submissions.length).toBe(submitted + 1);
       expect(h.state(payment)).toMatchObject(after);
       reset();
     }
     expect(h.tokens(payerAta)).toBe(before - 100n);
+  });
+
+  test("a concurrent duplicate preserves the first request's terminal failure, never pending", async () => {
+    const payment = await h.authorized();
+    const body = h.body(await h.capture(payment, 30n, false, 100n, 0n));
+    // The first capture is held at submit, after it joined the in-flight map. The duplicate
+    // validates against the still-intact hold and joins it. Then a competing void lands and the
+    // first submit fails onchain: both the first request and the joined duplicate get the same
+    // terminal failure, never a rewritten pending.
+    const competing = await h.signedVoid(payment, 100n, 0n, [h.server, h.facilitatorKey]);
+    let entered!: () => void;
+    const enteredAtSubmit = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    h.ledger.beforeSubmit = async () => {
+      entered();
+      await blocked;
+      const r = h.svm.sendTransaction(competing);
+      if (r instanceof FailedTransactionMetadata) throw new Error(r.toString());
+    };
+    try {
+      const firstP = h.post("/settle", body);
+      await enteredAtSubmit;
+      // The first request's preflight (including simulation) is done; the next simulation is the
+      // duplicate's, and its join into the in-flight map follows immediately after. Release the
+      // first request only then, so the duplicate is guaranteed to join rather than race.
+      let duplicateSimulating!: () => void;
+      const sawSimulate = new Promise<void>((resolve) => {
+        duplicateSimulating = resolve;
+      });
+      h.ledger.beforeSimulate = () => {
+        h.ledger.beforeSimulate = undefined;
+        duplicateSimulating();
+      };
+      const duplicateP = h.post("/settle", body);
+      await sawSimulate;
+      release();
+      const [first, duplicate] = await Promise.all([firstP, duplicateP]);
+
+      expect(first.json).toMatchObject({ success: false, errorReason: Reason.transactionState });
+      expect(duplicate.json).toMatchObject({
+        success: false,
+        duplicate: true,
+        errorReason: Reason.transactionState,
+        transaction: first.json.transaction,
+      });
+      // The void released the hold; the capture moved nothing.
+      expect(h.state(payment)).toMatchObject({ held: 0n, refundable: 0n });
+    } finally {
+      release();
+      reset();
+    }
+  });
+
+  test("an invalid request is rejected before joining an in-flight operation, even with matching message bytes", async () => {
+    const payment = await h.authorized();
+    const body = h.body(await h.capture(payment, 30n, false, 100n, 0n));
+    // Gate the valid capture at submit, after it joined the in-flight map.
+    let entered!: () => void;
+    const enteredAtSubmit = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    h.ledger.beforeSubmit = async () => {
+      entered();
+      await blocked;
+    };
+    const firstP = h.post("/settle", body);
+    await enteredAtSubmit;
+    try {
+      // Same message bytes as the in-flight capture, but the accepted requirements were modified:
+      // the profile is validated before dedup, so this is a rejection, not a pending duplicate.
+      const modifiedAccepted = { ...structuredClone(body), paymentPayload: { ...structuredClone(body.paymentPayload), accepted: { ...body.paymentPayload.accepted, amount: "101" } } };
+      const rejected = await h.post("/settle", modifiedAccepted);
+      expect(rejected.json).toMatchObject({ success: false, errorReason: Reason.acceptedMismatch, transaction: "" });
+      expect(rejected.json.duplicate).toBeUndefined();
+
+      // Same message bytes, but the server's economic signature was corrupted: also rejected
+      // during validation, before it can join the in-flight operation.
+      const corruptedTx = await h.signedCapture(payment, 30n, false, 100n, 0n);
+      const bad = corruptedTx.signatures[h.server.address]!;
+      const corruptedTxCopy: Transaction = {
+        ...corruptedTx,
+        signatures: { ...corruptedTx.signatures, [h.server.address]: new Uint8Array([...bad].map((b, i) => (i === 0 ? b ^ 0xff : b))) as SignatureBytes },
+      };
+      const corrupted = h.body(capturePayload(payment, corruptedTxCopy, 30n, false, 100n, 0n));
+      const rejectedSig = await h.post("/settle", corrupted);
+      expect(rejectedSig.json).toMatchObject({ success: false, errorReason: Reason.signature, transaction: "" });
+      expect(rejectedSig.json.duplicate).toBeUndefined();
+    } finally {
+      release();
+    }
+    const first = await firstP;
+    expect(first.json).toMatchObject({ success: true, amount: "30" });
+    expect(h.state(payment)).toMatchObject({ held: 70n, refundable: 30n });
+    reset();
   });
 
   test("resending an already processed signature is pending, never a finalized failure", async () => {
@@ -184,7 +293,9 @@ describe("settlement outcomes", () => {
     expect(first.json).toMatchObject({ success: false, errorReason: Reason.settlementPending });
     h.ledger.failSubmit = undefined;
     const landed = h.ledger.submissions.at(-1)!;
-    await expect(h.ledger.submit(landed.transaction)).rejects.toThrow(/already processed/);
+    // A resend of already-landed bytes is a refusal without execution: the adapter resolves it as
+    // submitted-but-unresolved, never as not-submitted (an earlier broadcast may have landed).
+    expect(await h.ledger.submit(landed.transaction)).toEqual({ kind: "submitted" });
     expect(h.state(payment)).toMatchObject({ held: 70n, refundable: 30n });
     reset();
   });
@@ -279,11 +390,18 @@ describe("reclaim stays payer-direct", () => {
 });
 
 describe("HTTP surface", () => {
-  test("only POST /verify and POST /settle exist; malformed JSON is rejected", async () => {
-    for (const path of ["/capture", "/void", "/refund", "/reclaim", "/authorize", "/supported"]) {
+  test("only POST /verify and POST /settle exist; GET /supported advertises the bounded profile; malformed JSON is rejected", async () => {
+    for (const path of ["/capture", "/void", "/refund", "/reclaim", "/authorize"]) {
       expect((await fetch(h.url + path, { method: "POST", body: "{}" })).status).toBe(404);
     }
     expect((await fetch(h.url + "/settle")).status).toBe(404);
+    const supported = await fetch(h.url + "/supported");
+    expect(supported.status).toBe(200);
+    expect(await supported.json()).toEqual({
+      kinds: [{ x402Version: 2, scheme: "auth-capture", network: NETWORK }],
+      extensions: [],
+      signers: { [NETWORK]: [h.facilitatorKey.address] },
+    });
     const bad = await fetch(h.url + "/settle", { method: "POST", headers: { "content-type": "application/json" }, body: "{" });
     expect(bad.status).toBe(400);
     expect(await bad.json()).toMatchObject({ success: false, errorReason: Reason.invalidPayload, transaction: "" });

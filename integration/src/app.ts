@@ -1,11 +1,21 @@
-// HTTP binding: x402 v2 facilitator `POST /verify` and `POST /settle` only. No lifecycle
-// endpoint exists; capture, void, and refund are `/settle` payloads, and reclaim is payer-direct.
+// HTTP binding: x402 v2 facilitator `GET /supported`, `POST /verify`, and `POST /settle` only.
+// No lifecycle endpoint exists; capture, void, and refund are `/settle` payloads, and reclaim
+// is payer-direct. Discovery advertises only what this facilitator implements: the bounded
+// auth-capture profile, no extensions, and the sponsor as the sole signer.
 import { Hono } from "hono";
 import type { Facilitator } from "./facilitator.js";
-import { Reason } from "./types.js";
+import { Reason, SCHEME } from "./types.js";
 
 export function createApp(facilitator: Facilitator): Hono {
   const app = new Hono();
+
+  app.get("/supported", (c) => {
+    return c.json({
+      kinds: [{ x402Version: 2, scheme: SCHEME, network: facilitator.network }],
+      extensions: [],
+      signers: { [facilitator.network]: [facilitator.feePayerAddress] },
+    });
+  });
 
   app.post("/verify", async (c) => {
     let body: unknown;

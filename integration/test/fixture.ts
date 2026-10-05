@@ -26,7 +26,7 @@ import {
 import { FailedTransactionMetadata, LiteSVM } from "litesvm";
 import { createApp } from "../src/app.js";
 import { Facilitator } from "../src/facilitator.js";
-import type { Ledger, LedgerAccount, SimulationOutcome, SubmitOutcome } from "../src/ledger.js";
+import type { FinalizedOutcome, Ledger, LedgerAccount, SimulationOutcome, SubmitResult } from "../src/ledger.js";
 import { ata, decodePayment, LOCAL_PROGRAM_ID, type Payment, paymentAddress, TOKEN_PROGRAM_ADDRESS } from "../src/program.js";
 import {
   authorizeInstruction,
@@ -90,8 +90,12 @@ export class LiteSvmLedger implements Ledger {
   /** Replaces what `submit` returns after landing, to model a malformed or unexpected adapter result. */
   outcome?: unknown;
 
+  /** Test seam: runs before a `simulate`, so a test can synchronize with the end of a preflight. */
+  beforeSimulate?: () => void | Promise<void>;
+
   async simulate(transaction: Transaction): Promise<SimulationOutcome> {
     this.simulated.push(transaction);
+    await this.beforeSimulate?.();
     // Like RPC `sigVerify: false`: the sponsor has not signed yet. Restored for every other call.
     this.svm.withSigverify(false);
     let r;
@@ -104,27 +108,30 @@ export class LiteSvmLedger implements Ledger {
     return { ok: true };
   }
 
-  async submit(transaction: Transaction): Promise<SubmitOutcome> {
+  async submit(transaction: Transaction): Promise<SubmitResult> {
     await this.beforeSubmit?.();
     const signature = getSignatureFromTransaction(transaction);
     if (this.failSubmit === "before-landing") {
       this.submissions.push({ signature, status: "unknown", transaction });
-      throw new Error("RPC unavailable before broadcast confirmation");
+      // The adapter established nothing was broadcast; this is not an ambiguous outcome.
+      return { kind: "not-submitted", reason: "RPC unavailable before broadcast confirmation" };
     }
     const r = this.svm.sendTransaction(transaction);
-    // A refusal without execution is not this signature's finalized result: resolve or throw.
-    // TransactionErrorFieldless.AlreadyProcessed (6) and BlockhashNotFound (7); a const enum, so literals.
+    // A refusal without execution is not this signature's finalized result: the exact bytes
+    // may have landed earlier, so the outcome stays submitted-but-unresolved, never
+    // not-submitted. TransactionErrorFieldless.AlreadyProcessed (6) and BlockhashNotFound (7);
+    // a const enum, so literals.
     if (r instanceof FailedTransactionMetadata && [6, 7].includes(r.err() as number)) {
       this.submissions.push({ signature, status: "unknown", transaction });
-      throw new Error("already processed: resolve the signature's recorded status");
+      return { kind: "submitted" };
     }
     const failed = r instanceof FailedTransactionMetadata;
     this.submissions.push({ signature, status: this.failSubmit ? "unknown" : failed ? "failed" : "succeeded", transaction });
-    if (this.failSubmit === "after-landing") throw new Error("confirmation response lost");
-    if (this.outcome !== undefined) return this.outcome as SubmitOutcome;
+    if (this.failSubmit === "after-landing") return { kind: "submitted" };
+    if (this.outcome !== undefined) return { kind: "submitted", outcome: this.outcome as FinalizedOutcome };
     const commitment = this.commitment as "finalized";
-    if (failed) return { status: "failed", commitment, error: r.toString(), logs: r.meta().logs() };
-    return { status: "succeeded", commitment };
+    if (failed) return { kind: "submitted", outcome: { status: "failed", commitment, error: r.toString(), logs: r.meta().logs() } };
+    return { kind: "submitted", outcome: { status: "succeeded", commitment } };
   }
 }
 
