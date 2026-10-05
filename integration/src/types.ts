@@ -78,6 +78,7 @@ export const Reason = {
   networkMismatch: "invalid_auth_capture_svm_network_mismatch",
   acceptedMismatch: "invalid_auth_capture_svm_accepted_mismatch",
   paymentFlow: "invalid_auth_capture_svm_unsupported_payment_flow",
+  unsupportedExtra: "invalid_auth_capture_svm_unsupported_extra",
   programMismatch: "invalid_auth_capture_svm_program_mismatch",
   feePayerMismatch: "invalid_auth_capture_svm_fee_payer_mismatch",
   unsupportedAsset: "invalid_auth_capture_svm_unsupported_asset",
@@ -99,6 +100,10 @@ export const Reason = {
   amount: "invalid_auth_capture_svm_amount",
   emptyHold: "invalid_auth_capture_svm_empty_hold",
   tokenAccount: "invalid_auth_capture_svm_token_account",
+  /** The server wallet, not the client, cannot fund a refund (`insufficient_funds` is the client's). */
+  serverInsufficientFunds: "invalid_auth_capture_svm_server_insufficient_funds",
+  /** The vault does not back the stored hold; unreachable while the program's invariants hold. */
+  vaultShortfall: "invalid_auth_capture_svm_vault_shortfall",
   simulationFailed: "invalid_auth_capture_svm_simulation_failed",
 } as const;
 

@@ -101,7 +101,22 @@ const tokenDecoder = getTokenDecoder();
 const mintDecoder = getMintDecoder();
 const base64 = getBase64Encoder();
 
+/** The only `extra` fields of the supported profile; see integration/README.md. */
+const EXTRA_KEYS = new Set(["paymentFlow", "captureDeadline", "refundDeadline", "programId", "feePayer"]);
+
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+
+/** The exact message bytes a `/settle` body would broadcast, or undefined if it carries none. */
+function messageKey(body: unknown): string | undefined {
+  if (!isObject(body) || !isObject(body.paymentPayload) || !isObject(body.paymentPayload.payload)) return undefined;
+  const value = body.paymentPayload.payload.transaction;
+  if (typeof value !== "string" || value.length === 0) return undefined;
+  try {
+    return Buffer.from(transactionDecoder.decode(base64.encode(value)).messageBytes).toString("base64");
+  } catch {
+    return undefined;
+  }
+}
 
 function parseU64(value: unknown, reason: ReasonCode, field: string): bigint {
   if (typeof value !== "string" || !/^(0|[1-9][0-9]*)$/.test(value)) reject(reason, `${field} must be a u64 decimal string`);
@@ -132,6 +147,12 @@ export class Facilitator {
   private readonly ledger: Ledger;
   private readonly maxUnitLimit: number;
   private readonly maxUnitPrice: bigint;
+  /**
+   * Settlements in flight in this process, keyed by the exact message bytes. A concurrent
+   * identical `/settle` must not report a second success for one economic event; it gets the
+   * first one's signature as pending instead. Not durable: no journal or idempotency store.
+   */
+  private readonly inFlight = new Map<string, Promise<SettleResponse>>();
 
   constructor(config: FacilitatorConfig) {
     if (config.ledger.network !== config.network) {
@@ -162,10 +183,28 @@ export class Facilitator {
 
   /**
    * Re-verifies, co-signs only as fee payer, submits the exact bytes once, and reports the
-   * confirmed outcome. No retry, blockhash replacement, or re-signing: an unknown outcome is
+   * finalized outcome. No retry, blockhash replacement, or re-signing: an unknown outcome is
    * returned as `settlement_pending` with the broadcast signature.
    */
   async settle(body: unknown): Promise<SettleResponse> {
+    const key = messageKey(body);
+    if (key === undefined) return this.settleOnce(body);
+    const first = this.inFlight.get(key);
+    if (first) {
+      const r = await first;
+      // Same bytes, same signature: never a second success. A preflight rejection broadcast nothing.
+      return r.transaction === "" ? r : { success: false, errorReason: Reason.settlementPending, transaction: r.transaction, network: r.network, ...(r.payer ? { payer: r.payer } : {}) };
+    }
+    const settling = this.settleOnce(body);
+    this.inFlight.set(key, settling);
+    try {
+      return await settling;
+    } finally {
+      this.inFlight.delete(key);
+    }
+  }
+
+  private async settleOnce(body: unknown): Promise<SettleResponse> {
     let verified: Verified;
     try {
       verified = await this.check(body);
@@ -177,16 +216,21 @@ export class Facilitator {
     const signed = await partiallySignTransaction([this.feePayer.keyPair], verified.transaction);
     const signature = getSignatureFromTransaction(signed);
     const base = { transaction: signature, network: this.network, payer: verified.payer };
-    let outcome;
+    const pending: SettleResponse = { success: false, errorReason: Reason.settlementPending, ...base };
+    let outcome: unknown;
     try {
       outcome = await this.ledger.submit(signed);
     } catch {
-      return { success: false, errorReason: Reason.settlementPending, ...base };
+      return pending;
     }
-    if (outcome.status !== "succeeded") {
-      return { success: false, errorReason: Reason.transactionState, ...base };
+    // Only a finalized `succeeded` or `failed` is an outcome; anything else, including a
+    // malformed or mislabeled adapter result, stays pending with the broadcast signature.
+    if (!isObject(outcome) || outcome.commitment !== "finalized") return pending;
+    if (outcome.status === "succeeded") {
+      return { success: true, ...base, amount: verified.result.amount, extensions: { [RESULT_KEY]: verified.result } };
     }
-    return { success: true, ...base, amount: verified.result.amount, extensions: { [RESULT_KEY]: verified.result } };
+    if (outcome.status === "failed") return { success: false, errorReason: Reason.transactionState, ...base };
+    return pending;
   }
 
   private async check(body: unknown): Promise<Verified> {
@@ -198,7 +242,7 @@ export class Facilitator {
     if (payload.x402Version !== 2) reject(Reason.x402Version, "paymentPayload.x402Version must be 2");
     const request = body as FacilitatorRequest;
     const terms = this.checkRequirements(request.paymentRequirements);
-    this.checkAccepted(request.paymentPayload.accepted, request.paymentRequirements);
+    this.checkAccepted(request.paymentPayload.accepted, request.paymentRequirements, terms);
     const scheme = request.paymentPayload.payload;
     if (!isObject(scheme)) reject(Reason.invalidPayload, "payload must be an object");
 
@@ -219,6 +263,10 @@ export class Facilitator {
     if (r.network !== this.network) reject(Reason.networkMismatch, `network must be ${this.network}`);
     const extra = r.extra ?? {};
     if (!isObject(extra)) reject(Reason.invalidRequirements, "extra must be an object");
+    // Zero-fee, single-wallet, escrow-only profile: any other selector (fee bounds, operator,
+    // transfer method, capture mode, ...) is unsupported and rejected, never ignored.
+    const unsupported = Object.keys(extra).filter((k) => !EXTRA_KEYS.has(k));
+    if (unsupported.length > 0) reject(Reason.unsupportedExtra, `unsupported extra fields: ${unsupported.join(", ")}`);
     // Escrow is the scheme default; any other flow or an unknown value is unsupported.
     if (extra.paymentFlow !== undefined && extra.paymentFlow !== "escrow") reject(Reason.paymentFlow, "only paymentFlow=escrow is supported");
     if (extra.programId !== this.programId) reject(Reason.programMismatch, "extra.programId must equal the pinned program");
@@ -237,24 +285,28 @@ export class Facilitator {
     return { maximum, asset, payTo, captureDeadline, refundDeadline };
   }
 
-  /** The client's accepted requirements must be the verified requirements, field for field. */
-  private checkAccepted(accepted: unknown, r: PaymentRequirements): void {
+  /**
+   * The client's accepted requirements must pass the same profile checks and normalize to the
+   * verified requirements. Scheme, network, program, sponsor, and flow are pinned by those
+   * checks, so equal terms and timeout make them identical.
+   */
+  private checkAccepted(accepted: unknown, r: PaymentRequirements, terms: Terms): void {
     if (!isObject(accepted)) reject(Reason.invalidPayload, "paymentPayload.accepted is required");
     const a = accepted as PaymentRequirements;
-    const flow = (x: PaymentRequirements) => (isObject(x.extra) ? (x.extra.paymentFlow ?? "escrow") : undefined);
+    let t: Terms;
+    try {
+      t = this.checkRequirements(a);
+    } catch (e) {
+      if (e instanceof Rejection) reject(Reason.acceptedMismatch, `paymentPayload.accepted is not a supported profile: ${e.message}`);
+      throw e;
+    }
     const same =
-      a.scheme === r.scheme &&
-      a.network === r.network &&
-      a.amount === r.amount &&
-      a.asset === r.asset &&
-      a.payTo === r.payTo &&
       a.maxTimeoutSeconds === r.maxTimeoutSeconds &&
-      isObject(a.extra) &&
-      flow(a) === flow(r) &&
-      String(a.extra.captureDeadline) === String(r.extra?.captureDeadline) &&
-      String(a.extra.refundDeadline) === String(r.extra?.refundDeadline) &&
-      a.extra.programId === r.extra?.programId &&
-      a.extra.feePayer === r.extra?.feePayer;
+      t.maximum === terms.maximum &&
+      t.asset === terms.asset &&
+      t.payTo === terms.payTo &&
+      t.captureDeadline === terms.captureDeadline &&
+      t.refundDeadline === terms.refundDeadline;
     if (!same) reject(Reason.acceptedMismatch, "paymentPayload.accepted differs from paymentRequirements");
   }
 
@@ -358,9 +410,13 @@ export class Facilitator {
     return t;
   }
 
+  /**
+   * Simulates without the sponsor signature: the economic signature was verified locally, and
+   * bytes the backend sees must not be broadcastable. Only `/settle` sponsor-signs.
+   */
   private async simulate(transaction: Transaction, payer: string): Promise<void> {
-    const signed = await partiallySignTransaction([this.feePayer.keyPair], transaction);
-    const outcome = await this.ledger.simulate(signed);
+    const unsponsored: Transaction = { ...transaction, signatures: { ...transaction.signatures, [this.feePayer.address]: null } };
+    const outcome = await this.ledger.simulate(unsponsored);
     if (!outcome.ok) reject(Reason.simulationFailed, outcome.error, payer);
   }
 
@@ -478,7 +534,7 @@ export class Facilitator {
       if (now >= stored.captureDeadline) reject(Reason.captureExpired, "capture requires now < captureDeadline", payer);
       if (ix.amount === 0n || ix.amount > stored.held) reject(Reason.amount, "capture requires 0 < amount <= H", payer);
       const vaultState = await this.tokenAccount(vault, paymentKey, stored.mint, "vault");
-      if (vaultState.amount < stored.held) reject(Reason.insufficientFunds, "vault does not back the hold", payer);
+      if (vaultState.amount < stored.held) reject(Reason.vaultShortfall, "vault does not back the hold", payer);
       await this.tokenAccount(serverAta, stored.server, stored.mint, "server");
       const remainder = stored.held - ix.amount;
       if (ix.releaseRemainder && remainder > 0n) await this.tokenAccount(payerAta, stored.payer, stored.mint, "payer");
@@ -494,7 +550,7 @@ export class Facilitator {
     } else if (ix.op === "void") {
       if (stored.held === 0n) reject(Reason.emptyHold, "void requires a positive hold", payer);
       const vaultState = await this.tokenAccount(vault, paymentKey, stored.mint, "vault");
-      if (vaultState.amount < stored.held) reject(Reason.insufficientFunds, "vault does not back the hold", payer);
+      if (vaultState.amount < stored.held) reject(Reason.vaultShortfall, "vault does not back the hold", payer);
       await this.tokenAccount(payerAta, stored.payer, stored.mint, "payer");
       result = { operation: "void", payment: paymentKey, amount: stored.held.toString(), held: "0", refundable: stored.refundable.toString() };
     } else if (ix.op === "refund") {
@@ -502,7 +558,7 @@ export class Facilitator {
       if (ix.amount === 0n || ix.amount > stored.refundable) reject(Reason.amount, "refund requires 0 < amount <= F", payer);
       const source = await this.tokenAccount(serverAta, stored.server, stored.mint, "server");
       // Refunds are server-funded; a facilitator never becomes a fallback source of value.
-      if (source.amount < ix.amount) reject(Reason.insufficientFunds, "server ATA cannot fund the refund", payer);
+      if (source.amount < ix.amount) reject(Reason.serverInsufficientFunds, "server ATA cannot fund the refund", payer);
       await this.tokenAccount(payerAta, stored.payer, stored.mint, "payer");
       result = {
         operation: "refund",

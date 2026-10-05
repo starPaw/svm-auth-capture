@@ -79,8 +79,23 @@ export class LiteSvmLedger implements Ledger {
     return { owner: a.programAddress, data: new Uint8Array(a.data), lamports: a.lamports, executable: a.executable };
   }
 
+  /** Transactions handed to `simulate`, to prove verification never releases broadcastable bytes. */
+  readonly simulated: Transaction[] = [];
+  /** Commitment `submit` reports; a test lowers it to model an adapter that stops short of finalized. */
+  commitment: "finalized" | "confirmed" = "finalized";
+  /** Replaces what `submit` returns after landing, to model a malformed or unexpected adapter result. */
+  outcome?: unknown;
+
   async simulate(transaction: Transaction): Promise<SimulationOutcome> {
-    const r = this.svm.simulateTransaction(transaction);
+    this.simulated.push(transaction);
+    // Like RPC `sigVerify: false`: the sponsor has not signed yet. Restored for every other call.
+    this.svm.withSigverify(false);
+    let r;
+    try {
+      r = this.svm.simulateTransaction(transaction);
+    } finally {
+      this.svm.withSigverify(true);
+    }
     if (r instanceof FailedTransactionMetadata) return { ok: false, error: r.toString(), logs: r.meta().logs() };
     return { ok: true };
   }
@@ -93,11 +108,19 @@ export class LiteSvmLedger implements Ledger {
       throw new Error("RPC unavailable before broadcast confirmation");
     }
     const r = this.svm.sendTransaction(transaction);
+    // A refusal without execution is not this signature's finalized result: resolve or throw.
+    // TransactionErrorFieldless.AlreadyProcessed (6) and BlockhashNotFound (7); a const enum, so literals.
+    if (r instanceof FailedTransactionMetadata && [6, 7].includes(r.err() as number)) {
+      this.submissions.push({ signature, status: "unknown", transaction });
+      throw new Error("already processed: resolve the signature's recorded status");
+    }
     const failed = r instanceof FailedTransactionMetadata;
     this.submissions.push({ signature, status: this.failSubmit ? "unknown" : failed ? "failed" : "succeeded", transaction });
     if (this.failSubmit === "after-landing") throw new Error("confirmation response lost");
-    if (failed) return { status: "failed", error: r.toString(), logs: r.meta().logs() };
-    return { status: "succeeded" };
+    if (this.outcome !== undefined) return this.outcome as SubmitOutcome;
+    const commitment = this.commitment as "finalized";
+    if (failed) return { status: "failed", commitment, error: r.toString(), logs: r.meta().logs() };
+    return { status: "succeeded", commitment };
   }
 }
 
@@ -165,7 +188,7 @@ export async function createHarness() {
         getInitializeMint2Instruction({ mint, decimals: 6, mintAuthority: setup.address, freezeAuthority: setup.address }),
         getCreateAssociatedTokenIdempotentInstruction({ payer: setup, owner: payer.address, mint, ata: await ata(payer.address, mint) }),
         getCreateAssociatedTokenIdempotentInstruction({ payer: setup, owner: server.address, mint, ata: await ata(server.address, mint) }),
-        getMintToInstruction({ mint, token: await ata(payer.address, mint), mintAuthority: setup, amount: 1_000n }),
+        getMintToInstruction({ mint, token: await ata(payer.address, mint), mintAuthority: setup, amount: 10_000n }),
       ],
       [mintKey],
     ),

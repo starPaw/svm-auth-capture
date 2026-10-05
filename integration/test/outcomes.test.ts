@@ -1,5 +1,6 @@
 // Acceptance 3 and 4: settlement outcome reporting, no automatic retry, reclaim kept out of
 // /settle, and the HTTP surface limited to /verify and /settle.
+import type { Transaction } from "@solana/kit";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { FailedTransactionMetadata } from "litesvm";
 import { LOCAL_PROGRAM_ID, reclaimAccounts, toInstruction } from "../src/program.js";
@@ -16,11 +17,13 @@ afterAll(() => h.close());
 const reset = () => {
   h.ledger.beforeSubmit = undefined;
   h.ledger.failSubmit = undefined;
+  h.ledger.commitment = "finalized";
+  h.ledger.outcome = undefined;
   h.setTime(NOW);
 };
 
 describe("settlement outcomes", () => {
-  test("a confirmed failed transaction is reported as failure with its signature, once", async () => {
+  test("a finalized failed transaction is reported as failure with its signature, once", async () => {
     const payment = await h.authorized();
     // A competing server void, relayed concurrently (fully signed), lands between the
     // facilitator's preflight and its broadcast.
@@ -93,6 +96,94 @@ describe("settlement outcomes", () => {
     const again = await h.post("/settle", body);
     expect(again.json).toMatchObject({ success: false, errorReason: Reason.unexpectedState });
     expect(h.ledger.submissions.length).toBe(submitted);
+    expect(h.state(payment)).toMatchObject({ held: 70n, refundable: 30n });
+    reset();
+  });
+
+  test("verify never hands the simulation backend a broadcastable transaction", async () => {
+    // Authorize and capture: a backend that rebroadcasts what it simulates moves nothing.
+    const salt = h.newSalt();
+    const payment = await h.paymentFor(salt);
+    const authorize = h.body(authorizePayload(await h.signedAuthorize({ salt })));
+    const authorized = await h.authorized();
+    const capture = h.body(await h.capture(authorized, 30n, false, 100n, 0n));
+    for (const [body, target] of [
+      [authorize, payment],
+      [capture, authorized],
+    ] as const) {
+      const before = await h.snapshot(target);
+      const simulated = h.ledger.simulated.length;
+      expect((await h.post("/verify", body)).json).toMatchObject({ isValid: true });
+      const seen = h.ledger.simulated.slice(simulated);
+      expect(seen).toHaveLength(1);
+      expect(seen[0]!.signatures[h.facilitatorKey.address]).toBeNull();
+      // On the wire an absent signature is 64 zero bytes; broadcasting them fails sigverify.
+      const wire = { ...seen[0]!, signatures: { ...seen[0]!.signatures, [h.facilitatorKey.address]: new Uint8Array(64) } };
+      expect(h.svm.sendTransaction(wire as Transaction)).toBeInstanceOf(FailedTransactionMetadata);
+      expect(await h.snapshot(target)).toBe(before);
+    }
+    reset();
+  });
+
+  test("an outcome short of finalized is pending, never success", async () => {
+    const payment = await h.authorized();
+    h.ledger.commitment = "confirmed";
+    const s = await h.post("/settle", h.body(await h.capture(payment, 30n, false, 100n, 0n)));
+    expect(s.json).toMatchObject({ success: false, errorReason: Reason.settlementPending, network: NETWORK });
+    expect(s.json.transaction).toBe(h.ledger.submissions.at(-1)!.signature);
+    expect(s.json).not.toHaveProperty("extensions");
+    reset();
+  });
+
+  test("an unexpected or malformed adapter result after broadcast is pending with the signature", async () => {
+    for (const outcome of [{ status: "dropped", commitment: "finalized" }, null, "ok"]) {
+      const payment = await h.authorized();
+      h.ledger.outcome = outcome;
+      const s = await h.post("/settle", h.body(await h.capture(payment, 30n, false, 100n, 0n)));
+      expect(s.status).toBe(200);
+      expect(s.json).toMatchObject({ success: false, errorReason: Reason.settlementPending, network: NETWORK });
+      expect(s.json.transaction).toBe(h.ledger.submissions.at(-1)!.signature);
+      reset();
+    }
+  });
+
+  test("concurrent identical settles: one success, the duplicate is pending on the same signature", async () => {
+    // Widen the in-flight window so the duplicate arrives before the first lands.
+    const slow = () => new Promise<void>((resolve) => setTimeout(resolve, 50));
+    const salt = h.newSalt();
+    const payerAta = await h.payerAta();
+    const before = h.tokens(payerAta);
+    const authorize = h.body(authorizePayload(await h.signedAuthorize({ salt })));
+    const payment = await h.paymentFor(salt);
+    const capture = async () => h.body(await h.capture(payment, 30n, false, 100n, 0n));
+    for (const [body, after] of [
+      [authorize, { held: 100n, refundable: 0n }],
+      [await capture(), { held: 70n, refundable: 30n }],
+    ] as const) {
+      h.ledger.beforeSubmit = slow;
+      const submitted = h.ledger.submissions.length;
+      const results = await Promise.all([h.post("/settle", body), h.post("/settle", body)]);
+      const winners = results.filter((r) => r.json.success === true);
+      expect(winners).toHaveLength(1);
+      const duplicate = results.find((r) => r.json.success !== true)!;
+      expect(duplicate.json).toMatchObject({ success: false, errorReason: Reason.settlementPending, transaction: winners[0]!.json.transaction });
+      expect(h.ledger.submissions.length).toBe(submitted + 1);
+      expect(h.state(payment)).toMatchObject(after);
+      reset();
+    }
+    expect(h.tokens(payerAta)).toBe(before - 100n);
+  });
+
+  test("resending an already processed signature is pending, never a finalized failure", async () => {
+    const payment = await h.authorized();
+    const body = h.body(await h.capture(payment, 30n, false, 100n, 0n));
+    // The first broadcast lands but its response is lost; the duplicate bytes reach the cluster again.
+    h.ledger.failSubmit = "after-landing";
+    const first = await h.post("/settle", body);
+    expect(first.json).toMatchObject({ success: false, errorReason: Reason.settlementPending });
+    h.ledger.failSubmit = undefined;
+    const landed = h.ledger.submissions.at(-1)!;
+    await expect(h.ledger.submit(landed.transaction)).rejects.toThrow(/already processed/);
     expect(h.state(payment)).toMatchObject({ held: 70n, refundable: 30n });
     reset();
   });

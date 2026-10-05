@@ -72,6 +72,33 @@ describe("profile and requirements", () => {
     await rejected(h.body(payload, h.requirements({}, { captureDeadline: Number(DR) + 1 })), Reason.deadlineOrdering, payment);
   });
 
+  test("unsupported economic-profile fields are rejected, not ignored, in requirements and accepted", async () => {
+    const salt = h.newSalt();
+    const payload = authorizePayload(await h.signedAuthorize({ salt }));
+    const payment = await h.paymentFor(salt);
+    for (const extra of [
+      { assetTransferMethod: "permit2" },
+      { assetTransferMethod: "eip3009" },
+      { operatorType: "policy" },
+      { operatorType: "delegated" },
+      { minFeeBps: 100, maxFeeBps: 100 },
+      { minFeeBps: 0, maxFeeBps: 0 },
+      { feeRecipient: h.outsider.address },
+      { captureMode: "deferred" },
+    ]) {
+      await rejected(h.body(payload, h.requirements({}, extra)), Reason.unsupportedExtra, payment);
+    }
+    // Requirements clean, accepted selecting a different transfer method.
+    const drift = h.body(payload);
+    drift.paymentPayload.accepted = h.requirements({}, { assetTransferMethod: "permit2" });
+    await rejected(drift, Reason.acceptedMismatch, payment);
+    // The same profile written differently (string deadline, implicit escrow flow) is equal.
+    const normalized = h.body(payload);
+    const { paymentFlow: _, ...implicit } = h.requirements({}, { captureDeadline: DC.toString() }).extra!;
+    normalized.paymentPayload.accepted = { ...h.requirements(), extra: implicit };
+    expect((await h.post("/verify", normalized)).json).toMatchObject({ isValid: true });
+  });
+
   test("wrapped SOL and Token-2022 assets are unsupported", async () => {
     const native = "So11111111111111111111111111111111111111112" as Address;
     const salt = h.newSalt();
@@ -314,7 +341,7 @@ describe("lifecycle terms, consent, amounts, and deadlines", () => {
         [h.server],
       ),
     );
-    await rejected(h.body(await h.refund(payment, 10n, 60n, 40n)), Reason.insufficientFunds, payment);
+    await rejected(h.body(await h.refund(payment, 10n, 60n, 40n)), Reason.serverInsufficientFunds, payment);
     expect(h.state(payment)).toMatchObject({ held: 60n, refundable: 40n });
   });
 
