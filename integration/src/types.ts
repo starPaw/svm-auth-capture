@@ -102,7 +102,7 @@ export const Reason = {
   tokenAccount: "invalid_auth_capture_svm_token_account",
   /** The server wallet, not the client, cannot fund a refund (`insufficient_funds` is the client's). */
   serverInsufficientFunds: "invalid_auth_capture_svm_server_insufficient_funds",
-  /** The vault does not back the stored hold; unreachable while the program's invariants hold. */
+  /** The vault does not back a hold whose stored payment state is unchanged between preflight reads. */
   vaultShortfall: "invalid_auth_capture_svm_vault_shortfall",
   simulationFailed: "invalid_auth_capture_svm_simulation_failed",
 } as const;

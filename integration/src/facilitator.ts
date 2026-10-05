@@ -411,6 +411,23 @@ export class Facilitator {
   }
 
   /**
+   * The vault must back the hold the snapshot recorded. A competing capture/void can land
+   * between the payment-state read and this vault read: the program moves vault tokens only
+   * together with a payment-state change, so a short vault against a still-unchanged state is
+   * the only true shortfall. Re-read the stored payment and classify a stale preflight as
+   * `unexpectedState`; the onchain guards re-check the pair atomically at execution time.
+   */
+  private async vaultBacksHold(vault: Address, payment: Address, mint: Address, snapshot: Payment, payer: string): Promise<void> {
+    const vaultState = await this.tokenAccount(vault, payment, mint, "vault");
+    if (vaultState.amount >= snapshot.held) return;
+    const fresh = await this.storedPayment(payment);
+    if (fresh.held !== snapshot.held || fresh.refundable !== snapshot.refundable) {
+      reject(Reason.unexpectedState, "payment state changed between the preflight reads", payer);
+    }
+    reject(Reason.vaultShortfall, "vault does not back the hold", payer);
+  }
+
+  /**
    * Simulates without the sponsor signature: the economic signature was verified locally, and
    * bytes the backend sees must not be broadcastable. Only `/settle` sponsor-signs.
    */
@@ -533,8 +550,7 @@ export class Facilitator {
     if (ix.op === "capture") {
       if (now >= stored.captureDeadline) reject(Reason.captureExpired, "capture requires now < captureDeadline", payer);
       if (ix.amount === 0n || ix.amount > stored.held) reject(Reason.amount, "capture requires 0 < amount <= H", payer);
-      const vaultState = await this.tokenAccount(vault, paymentKey, stored.mint, "vault");
-      if (vaultState.amount < stored.held) reject(Reason.vaultShortfall, "vault does not back the hold", payer);
+      await this.vaultBacksHold(vault, paymentKey, stored.mint, stored, payer);
       await this.tokenAccount(serverAta, stored.server, stored.mint, "server");
       const remainder = stored.held - ix.amount;
       if (ix.releaseRemainder && remainder > 0n) await this.tokenAccount(payerAta, stored.payer, stored.mint, "payer");
@@ -549,8 +565,7 @@ export class Facilitator {
       };
     } else if (ix.op === "void") {
       if (stored.held === 0n) reject(Reason.emptyHold, "void requires a positive hold", payer);
-      const vaultState = await this.tokenAccount(vault, paymentKey, stored.mint, "vault");
-      if (vaultState.amount < stored.held) reject(Reason.vaultShortfall, "vault does not back the hold", payer);
+      await this.vaultBacksHold(vault, paymentKey, stored.mint, stored, payer);
       await this.tokenAccount(payerAta, stored.payer, stored.mint, "payer");
       result = { operation: "void", payment: paymentKey, amount: stored.held.toString(), held: "0", refundable: stored.refundable.toString() };
     } else if (ix.op === "refund") {

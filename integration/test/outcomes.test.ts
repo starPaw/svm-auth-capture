@@ -16,6 +16,7 @@ afterAll(() => h.close());
 
 const reset = () => {
   h.ledger.beforeSubmit = undefined;
+  h.ledger.beforeRead = undefined;
   h.ledger.failSubmit = undefined;
   h.ledger.commitment = "finalized";
   h.ledger.outcome = undefined;
@@ -199,6 +200,34 @@ describe("settlement outcomes", () => {
     expect([Reason.unexpectedState, Reason.transactionState]).toContain(loser.json.errorReason);
     const s = h.state(payment);
     expect([`${s.held},${s.refundable}`]).toContain(winners[0]!.json.extensions["auth-capture"].operation === "void" ? "0,0" : "70,30");
+    reset();
+  });
+
+  test("a competing capture landing between the payment and vault preflight reads is a stale preflight, not a shortfall", async () => {
+    // Reproduces the interleaving deterministically: the void reads stored payment (H=100),
+    // a fully signed competing capture lands while it reaches for the vault, and the vault
+    // read then sees 70 against the stale H=100. The facilitator re-reads the payment state,
+    // detects the change, and reports the stale preflight instead of a vault shortfall.
+    const payment = await h.authorized();
+    const voidOp = h.body(await h.voidOp(payment, 100n, 0n));
+    const competing = await h.signedCapture(payment, 30n, false, 100n, 0n, [h.server, h.facilitatorKey]);
+    const vault = await h.vault(payment);
+    let landed = false;
+    h.ledger.beforeRead = (address) => {
+      if (landed || address !== vault) return;
+      landed = true;
+      h.ledger.beforeRead = undefined;
+      const r = h.svm.sendTransaction(competing);
+      if (r instanceof FailedTransactionMetadata) throw new Error(r.toString());
+    };
+    const submitted = h.ledger.submissions.length;
+
+    const s = await h.post("/settle", voidOp);
+
+    expect(landed).toBe(true);
+    expect(h.ledger.submissions.length).toBe(submitted);
+    expect(s.json).toMatchObject({ success: false, errorReason: Reason.unexpectedState, transaction: "" });
+    expect(h.state(payment)).toMatchObject({ held: 70n, refundable: 30n });
     reset();
   });
 });

@@ -69,11 +69,15 @@ export class LiteSvmLedger implements Ledger {
 
   constructor(readonly svm: LiteSVM) {}
 
+  /** Test seam: runs before a `getAccount` read, so a test can land a competing transaction at an exact point in a preflight. */
+  beforeRead?: (address: Address) => void | Promise<void>;
+
   async now(): Promise<bigint> {
     return this.svm.getClock().unixTimestamp;
   }
 
   async getAccount(address: Address): Promise<LedgerAccount | null> {
+    await this.beforeRead?.(address);
     const a = this.svm.getAccount(address);
     if (!a.exists) return null;
     return { owner: a.programAddress, data: new Uint8Array(a.data), lamports: a.lamports, executable: a.executable };
