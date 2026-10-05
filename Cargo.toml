@@ -1,0 +1,32 @@
+[package]
+name = "svm-auth-capture"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+no-entrypoint = []
+
+[dependencies]
+solana-program = "=2.2.1"
+spl-token = { version = "=8.0.0", features = ["no-entrypoint"] }
+spl-associated-token-account-client = "=2.0.0"
+
+[dev-dependencies]
+litesvm = "=0.6.1"
+solana-sdk = "=2.2.1"
+# LiteSVM 0.6 uses the pre-Agave-split runtime APIs. Pin that runtime family.
+solana-builtins = "=2.2.4"
+solana-compute-budget-instruction = "=2.2.4"
+solana-fee = "=2.2.4"
+
+[profile.release]
+overflow-checks = true
+lto = "fat"
+codegen-units = 1
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(target_os, values("solana"))'] }
