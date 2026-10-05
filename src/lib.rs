@@ -1,4 +1,4 @@
-//! Persistent classic-SPL escrow: authorize, reclaim, capture, and void.
+//! Persistent classic-SPL escrow: authorize, reclaim, capture, void, and refund.
 use solana_program::{
     account_info::AccountInfo,
     clock::Clock,
@@ -124,6 +124,16 @@ pub fn void_data(expected_h: u64, expected_f: u64) -> Vec<u8> {
     data
 }
 
+/// Wire: refund=4, amount:u64, expectedH:u64, expectedF:u64.
+/// Accounts: server(s), payment(w), mint, server ATA(w), payer ATA(w), classic Token.
+pub fn refund_data(amount: u64, expected_h: u64, expected_f: u64) -> Vec<u8> {
+    let mut data = vec![4];
+    data.extend_from_slice(&amount.to_le_bytes());
+    data.extend_from_slice(&expected_h.to_le_bytes());
+    data.extend_from_slice(&expected_f.to_le_bytes());
+    data
+}
+
 fn require(ok: bool, error: ProgramError) -> ProgramResult {
     if ok {
         Ok(())
@@ -223,6 +233,7 @@ pub fn process_instruction(
         Some(1) if data.len() == 1 => reclaim(program_id, accounts),
         Some(2) if data.len() == 26 && data[9] <= 1 => capture(program_id, accounts, data),
         Some(3) if data.len() == 17 => void(program_id, accounts, data),
+        Some(4) if data.len() == 25 => refund(program_id, accounts, data),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -634,6 +645,92 @@ fn void(program_id: &Pubkey, a: &[AccountInfo], data: &[u8]) -> ProgramResult {
         state.held,
     )?;
     state.held = 0;
+    payment
+        .try_borrow_mut_data()?
+        .copy_from_slice(&state.encode());
+    Ok(())
+}
+
+fn refund(program_id: &Pubkey, a: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    let [server, payment, asset, source, destination, tokens] = a else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    signer(server)?;
+    for account in [payment, source, destination] {
+        writable(account)?;
+    }
+    program(tokens, &spl_token::id())?;
+    require(
+        payment.owner == program_id,
+        ProgramError::IncorrectProgramId,
+    )?;
+    let mut state = Payment::decode(&payment.try_borrow_data()?)?;
+    require(
+        server.key == &state.server && asset.key == &state.mint,
+        ProgramError::InvalidArgument,
+    )?;
+    require(
+        payment.key == &payment_address(program_id, &state.payer, &state.salt).0,
+        ProgramError::InvalidSeeds,
+    )?;
+    distinct(&[
+        server.key,
+        payment.key,
+        asset.key,
+        source.key,
+        destination.key,
+    ])?;
+    let amount = u64::from_le_bytes(data[1..9].try_into().unwrap());
+    let expected_h = u64::from_le_bytes(data[9..17].try_into().unwrap());
+    let expected_f = u64::from_le_bytes(data[17..25].try_into().unwrap());
+    require(
+        state.held == expected_h
+            && state.refundable == expected_f
+            && Clock::get()?.unix_timestamp < state.refund_deadline
+            && amount > 0
+            && amount <= state.refundable,
+        ProgramError::InvalidArgument,
+    )?;
+    let next_f = state
+        .refundable
+        .checked_sub(amount)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    let decimals = mint(asset)?.decimals;
+    // A frozen canonical account retains its identity; the Token CPI rejects it.
+    let before_source = transfer_token(source, server.key, asset.key, false, true)?.amount;
+    let before_destination =
+        transfer_token(destination, &state.payer, asset.key, false, true)?.amount;
+    let expected_destination = before_destination
+        .checked_add(amount)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    invoke(
+        &spl_token::instruction::transfer_checked(
+            &spl_token::id(),
+            source.key,
+            asset.key,
+            destination.key,
+            server.key,
+            &[],
+            amount,
+            decimals,
+        )?,
+        &[
+            source.clone(),
+            asset.clone(),
+            destination.clone(),
+            server.clone(),
+            tokens.clone(),
+        ],
+    )?;
+    let expected_source = before_source
+        .checked_sub(amount)
+        .ok_or(ProgramError::InsufficientFunds)?;
+    require(
+        token(source, server.key, asset.key, false)?.amount == expected_source
+            && token(destination, &state.payer, asset.key, false)?.amount == expected_destination,
+        ProgramError::InvalidAccountData,
+    )?;
+    state.refundable = next_f;
     payment
         .try_borrow_mut_data()?
         .copy_from_slice(&state.encode());
