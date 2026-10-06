@@ -3,9 +3,9 @@
 // marks anything resolved on its own: an unresolved outcome stays `pending`, and only an
 // operator decides, from the printed evidence, what the real outcome was and whether/how to
 // update the record.
-import { loadDeploymentRecord } from "./deployment-record.js";
-import { OperationStore, reconcileEntry } from "./operation-store.js";
-import { RpcLedger } from "./rpc-ledger.js";
+import { loadDeploymentRecord } from "./deployment-record.ts";
+import { OperationStore, reconcileEntry } from "./operation-store.ts";
+import { RpcLedger } from "./rpc-ledger.ts";
 
 function requireEnv(name: string): string {
   const value = process.env[name];

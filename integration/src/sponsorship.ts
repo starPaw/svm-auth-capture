@@ -15,7 +15,7 @@
 // never reaches sponsor signing or submission.
 import type { Address } from "@solana/kit";
 import type { MiddlewareHandler } from "hono";
-import type { Ledger } from "./ledger.js";
+import type { Ledger } from "./ledger.ts";
 
 export type SponsorshipGuardConfig = {
   ledger: Ledger;
@@ -28,8 +28,13 @@ export type SponsorshipGuardConfig = {
 
 export class SponsorshipGuard {
   private attempts = 0;
+  private readonly config: SponsorshipGuardConfig;
 
-  constructor(private readonly config: SponsorshipGuardConfig) {}
+  // Plain-field assignment, not a TS constructor parameter property: this file must stay runnable
+  // under Node's `--experimental-strip-types`, which does not support parameter properties.
+  constructor(config: SponsorshipGuardConfig) {
+    this.config = config;
+  }
 
   get attemptCount(): number {
     return this.attempts;

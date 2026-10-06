@@ -3,8 +3,8 @@
 // is payer-direct. Discovery advertises only what this facilitator implements: the bounded
 // auth-capture profile, no extensions, and the sponsor as the sole signer.
 import { Hono } from "hono";
-import type { Facilitator } from "./facilitator.js";
-import { Reason, SCHEME } from "./types.js";
+import type { Facilitator } from "./facilitator.ts";
+import { Reason, SCHEME } from "./types.ts";
 
 export function createApp(facilitator: Facilitator): Hono {
   const app = new Hono();

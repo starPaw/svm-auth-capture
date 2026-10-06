@@ -6,11 +6,11 @@
 import { readFileSync } from "node:fs";
 import { createKeyPairSignerFromBytes, type Address, type KeyPairSigner } from "@solana/kit";
 import { createSolanaRpc } from "@solana/kit";
-import { loadDeploymentRecord } from "./deployment-record.js";
-import type { Ledger, SubmitResult } from "./ledger.js";
-import { decodePayment } from "./program.js";
-import { RpcLedger } from "./rpc-ledger.js";
-import { buildTransaction, type Lifetime, reclaimInstruction } from "./transactions.js";
+import { loadDeploymentRecord } from "./deployment-record.ts";
+import type { Ledger, SubmitResult } from "./ledger.ts";
+import { decodePayment } from "./program.ts";
+import { RpcLedger } from "./rpc-ledger.ts";
+import { buildTransaction, type Lifetime, reclaimInstruction } from "./transactions.ts";
 
 export async function submitReclaim(a: { ledger: Ledger; programId: Address; payer: KeyPairSigner; payment: Address; lifetime: Lifetime }): Promise<SubmitResult> {
   const account = await a.ledger.getAccount(a.payment);

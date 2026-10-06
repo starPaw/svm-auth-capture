@@ -22,10 +22,10 @@ import {
   type Transaction,
 } from "@solana/kit";
 import { Hono } from "hono";
-import { fingerprint, OperationStore, type PreSubmission, ReservationConflict } from "./operation-store.js";
-import { decodeInstructionData, paymentAddress } from "./program.js";
-import { buildTransaction, captureInstruction, capturePayload, type Lifetime, voidInstruction, voidPayload } from "./transactions.js";
-import type { PaymentRequirements, SettleResponse } from "./types.js";
+import { fingerprint, OperationStore, type PreSubmission, ReservationConflict } from "./operation-store.ts";
+import { decodeInstructionData, paymentAddress } from "./program.ts";
+import { buildTransaction, captureInstruction, capturePayload, type Lifetime, voidInstruction, voidPayload } from "./transactions.ts";
+import type { PaymentRequirements, SettleResponse } from "./types.ts";
 
 const base64 = getBase64Encoder();
 const transactionDecoder = getTransactionDecoder();
@@ -106,8 +106,11 @@ function decode(transactionBase64: string): { transaction: Transaction; blockhas
   return { transaction, blockhash: message.lifetimeToken };
 }
 
-/** Derives the payer and authorize salt from the client's own signed transaction. */
-function peekAuthorize(programId: Address, transaction: Transaction): { payer: Address; salt: Uint8Array } {
+/** Derives the payer, salt, and the client's own signed deadlines from its authorize transaction. */
+function peekAuthorize(
+  programId: Address,
+  transaction: Transaction,
+): { payer: Address; salt: Uint8Array; captureDeadline: bigint; refundDeadline: bigint } {
   const message = messageDecoder.decode(transaction.messageBytes);
   if (message.version !== "legacy") throw new Error("only legacy transactions are accepted");
   const payer = message.staticAccounts[1];
@@ -116,7 +119,32 @@ function peekAuthorize(programId: Address, transaction: Transaction): { payer: A
   if (!ix) throw new Error("no auth-capture instruction");
   const decoded = decodeInstructionData(new Uint8Array(ix.data ?? []));
   if (!decoded || decoded.op !== "authorize") throw new Error("payload must carry exactly the authorize instruction");
-  return { payer, salt: decoded.salt };
+  return { payer, salt: decoded.salt, captureDeadline: decoded.captureDeadline, refundDeadline: decoded.refundDeadline };
+}
+
+/**
+ * Requirements for an already-signed authorize, pinned to the exact deadlines the client signed
+ * rather than a fresh `config.now()` reading. `requirementsFor` offers a fresh window on the
+ * initial 402 challenge; recomputing it again here would drift from what the client actually
+ * signed by however long the client took to build and return its transaction, and the facilitator
+ * would then reject a perfectly valid authorize as a terms mismatch.
+ */
+function requirementsForSigned(config: ResourceServerConfig, captureDeadline: bigint, refundDeadline: bigint): PaymentRequirements {
+  return {
+    scheme: "auth-capture",
+    network: config.network,
+    amount: config.amount.toString(),
+    asset: config.asset,
+    payTo: config.server.address,
+    maxTimeoutSeconds: config.maxTimeoutSeconds ?? 60,
+    extra: {
+      paymentFlow: "escrow",
+      captureDeadline: Number(captureDeadline),
+      refundDeadline: Number(refundDeadline),
+      programId: config.programId,
+      feePayer: config.feePayer,
+    },
+  };
 }
 
 export function createResourceApp(config: ResourceServerConfig): Hono {
@@ -142,11 +170,17 @@ export function createResourceApp(config: ResourceServerConfig): Hono {
     const { transaction, blockhash: authorizeBlockhash } = decode(transactionBase64);
     let payer: Address;
     let salt: Uint8Array;
+    let captureDeadline: bigint;
+    let refundDeadline: bigint;
     try {
-      ({ payer, salt } = peekAuthorize(config.programId, transaction));
+      ({ payer, salt, captureDeadline, refundDeadline } = peekAuthorize(config.programId, transaction));
     } catch (e) {
       return c.json({ error: e instanceof Error ? e.message : "could not decode the authorize transaction" }, 400);
     }
+    // Pinned to the deadlines the client actually signed, not a fresh `now()` reading: real time
+    // elapses between this request and the terminal settle below, so recomputing would drift from
+    // what was signed and the facilitator would reject a valid authorize as a terms mismatch.
+    const signedRequirements = requirementsForSigned(config, captureDeadline, refundDeadline);
     const payment = await paymentAddress(config.programId, payer, salt);
     const fp = fingerprint(payer, resourcePath, salt);
 
@@ -174,7 +208,7 @@ export function createResourceApp(config: ResourceServerConfig): Hono {
     };
     config.store.update(fp, { status: "authorizing", authorize: authorizeRecord });
 
-    const settleAuthorize = await callFacilitator(config, facilitatorBody(payload, requirements, `${config.facilitatorUrl}${resourcePath}`));
+    const settleAuthorize = await callFacilitator(config, facilitatorBody(payload, signedRequirements, `${config.facilitatorUrl}${resourcePath}`));
     if (!settleAuthorize.success) {
       // A rejected or ambiguous authorize never starts the handler.
       const status = settleAuthorize.errorReason === "settlement_pending" ? "authorize-pending" : "authorize-rejected";
@@ -222,7 +256,7 @@ export function createResourceApp(config: ResourceServerConfig): Hono {
     };
     config.store.update(fp, { status: "terminal-settling", terminal: terminalRecord });
 
-    const settleTerminal = await callFacilitator(config, facilitatorBody(terminalPayload, requirements, `${config.facilitatorUrl}${resourcePath}`));
+    const settleTerminal = await callFacilitator(config, facilitatorBody(terminalPayload, signedRequirements, `${config.facilitatorUrl}${resourcePath}`));
     if (!settleTerminal.success) {
       const status = settleTerminal.errorReason === "settlement_pending" ? "terminal-pending" : "pending";
       config.store.update(fp, { status, note: settleTerminal.errorReason });

@@ -7,9 +7,9 @@
 import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createKeyPairSignerFromBytes, createSolanaRpc, type Address, type KeyPairSigner } from "@solana/kit";
-import { decodeHeaderPayload, encodeHeaderPayload } from "./resource-server.js";
-import { authorizeInstruction, authorizePayload, buildTransaction } from "./transactions.js";
-import type { PaymentRequirements } from "./types.js";
+import { decodeHeaderPayload, encodeHeaderPayload } from "./resource-server.ts";
+import { authorizeInstruction, authorizePayload, buildTransaction } from "./transactions.ts";
+import type { PaymentRequirements } from "./types.ts";
 
 function requireEnv(name: string): string {
   const value = process.env[name];

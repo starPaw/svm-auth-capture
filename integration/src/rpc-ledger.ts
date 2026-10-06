@@ -16,7 +16,7 @@ import {
   type SolanaRpcApi,
   type Transaction,
 } from "@solana/kit";
-import type { FinalizedOutcome, Ledger, LedgerAccount, SimulationOutcome, SubmitResult } from "./ledger.js";
+import type { FinalizedOutcome, Ledger, LedgerAccount, SimulationOutcome, SubmitResult } from "./ledger.ts";
 
 const CLOCK_SYSVAR = "SysvarC1ock11111111111111111111111111111111" as Address;
 const base64Encoder = getBase64Encoder();

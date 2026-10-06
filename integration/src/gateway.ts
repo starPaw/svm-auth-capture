@@ -9,10 +9,10 @@
 // submission.
 import type { Address } from "@solana/kit";
 import { Hono, type MiddlewareHandler } from "hono";
-import { createApp } from "./app.js";
-import { requireBearerToken } from "./auth.js";
-import type { Facilitator } from "./facilitator.js";
-import { requireSponsorshipBudget, SponsorshipGuard } from "./sponsorship.js";
+import { createApp } from "./app.ts";
+import { requireBearerToken } from "./auth.ts";
+import type { Facilitator } from "./facilitator.ts";
+import { requireSponsorshipBudget, SponsorshipGuard } from "./sponsorship.ts";
 
 export type GatewayConfig = {
   bearerToken: string;

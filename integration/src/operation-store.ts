@@ -20,8 +20,8 @@ import { createHash } from "node:crypto";
 import { mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Address } from "@solana/kit";
-import type { Ledger } from "./ledger.js";
-import { decodePayment } from "./program.js";
+import type { Ledger } from "./ledger.ts";
+import { decodePayment } from "./program.ts";
 
 export type OperationStatus =
   | "reserved" // fingerprint claimed; settle(authorize) not yet attempted
@@ -66,8 +66,13 @@ export type OperationRecord = {
 };
 
 export class ReservationConflict extends Error {
-  constructor(readonly fingerprint: string) {
+  readonly fingerprint: string;
+
+  // Plain-field assignment, not a TS constructor parameter property: this file must stay runnable
+  // under Node's `--experimental-strip-types`, which does not support parameter properties.
+  constructor(fingerprint: string) {
     super(`fingerprint ${fingerprint} is already reserved`);
+    this.fingerprint = fingerprint;
   }
 }
 
@@ -83,7 +88,12 @@ export function fingerprint(caller: string, resource: string, salt: Uint8Array):
 }
 
 export class OperationStore {
-  constructor(private readonly dir: string) {
+  private readonly dir: string;
+
+  // Plain-field assignment, not a TS constructor parameter property: this file must stay runnable
+  // under Node's `--experimental-strip-types`, which does not support parameter properties.
+  constructor(dir: string) {
+    this.dir = dir;
     mkdirSync(dir, { recursive: true });
   }
 

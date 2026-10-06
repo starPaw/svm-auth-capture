@@ -5,8 +5,8 @@
 import { readFileSync } from "node:fs";
 import { serve } from "@hono/node-server";
 import { type Address, createKeyPairSignerFromBytes, createSolanaRpc, type KeyPairSigner } from "@solana/kit";
-import { OperationStore } from "./operation-store.js";
-import { createResourceApp, type HandlerResult } from "./resource-server.js";
+import { OperationStore } from "./operation-store.ts";
+import { createResourceApp, type HandlerResult } from "./resource-server.ts";
 
 function requireEnv(name: string): string {
   const value = process.env[name];

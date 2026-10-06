@@ -8,11 +8,11 @@
 import { readFileSync } from "node:fs";
 import { serve } from "@hono/node-server";
 import { type Address, createKeyPairSignerFromBytes, type KeyPairSigner } from "@solana/kit";
-import { loadDeploymentRecord } from "./deployment-record.js";
-import { Facilitator } from "./facilitator.js";
-import { createGatewayApp } from "./gateway.js";
-import { RpcLedger } from "./rpc-ledger.js";
-import { SponsorshipGuard } from "./sponsorship.js";
+import { loadDeploymentRecord } from "./deployment-record.ts";
+import { Facilitator } from "./facilitator.ts";
+import { createGatewayApp } from "./gateway.ts";
+import { RpcLedger } from "./rpc-ledger.ts";
+import { SponsorshipGuard } from "./sponsorship.ts";
 
 function requireEnv(name: string): string {
   const value = process.env[name];

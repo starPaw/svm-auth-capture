@@ -1,9 +1,9 @@
-export { createApp } from "./app.js";
-export { callerIdentity, requireBearerToken } from "./auth.js";
-export { type DeploymentRecord, loadDeploymentRecord } from "./deployment-record.js";
-export { COMPUTE_BUDGET_PROGRAM_ADDRESS, Facilitator, type FacilitatorConfig } from "./facilitator.js";
-export { createGatewayApp, type GatewayConfig } from "./gateway.js";
-export type { FinalizedOutcome, Ledger, LedgerAccount, SimulationOutcome, SubmitResult } from "./ledger.js";
+export { createApp } from "./app.ts";
+export { callerIdentity, requireBearerToken } from "./auth.ts";
+export { type DeploymentRecord, loadDeploymentRecord } from "./deployment-record.ts";
+export { COMPUTE_BUDGET_PROGRAM_ADDRESS, Facilitator, type FacilitatorConfig } from "./facilitator.ts";
+export { createGatewayApp, type GatewayConfig } from "./gateway.ts";
+export type { FinalizedOutcome, Ledger, LedgerAccount, SimulationOutcome, SubmitResult } from "./ledger.ts";
 export {
   fingerprint,
   OperationStore,
@@ -12,17 +12,17 @@ export {
   type PreSubmission,
   reconcileEntry,
   ReservationConflict,
-} from "./operation-store.js";
-export * from "./program.js";
-export { submitReclaim } from "./reclaim.js";
+} from "./operation-store.ts";
+export * from "./program.ts";
+export { submitReclaim } from "./reclaim.ts";
 export {
   createResourceApp,
   decodeHeaderPayload,
   encodeHeaderPayload,
   type HandlerResult,
   type ResourceServerConfig,
-} from "./resource-server.js";
-export { RpcLedger, type RpcLedgerConfig } from "./rpc-ledger.js";
-export { requireSponsorshipBudget, SponsorshipGuard, type SponsorshipGuardConfig } from "./sponsorship.js";
-export * from "./transactions.js";
-export * from "./types.js";
+} from "./resource-server.ts";
+export { RpcLedger, type RpcLedgerConfig } from "./rpc-ledger.ts";
+export { requireSponsorshipBudget, SponsorshipGuard, type SponsorshipGuardConfig } from "./sponsorship.ts";
+export * from "./transactions.ts";
+export * from "./types.ts";

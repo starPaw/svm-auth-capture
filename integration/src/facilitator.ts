@@ -20,7 +20,7 @@ import {
   verifySignature,
 } from "@solana/kit";
 import { AccountState, getMintDecoder, getTokenDecoder } from "@solana-program/token";
-import type { Ledger } from "./ledger.js";
+import type { Ledger } from "./ledger.ts";
 import {
   type AccountSlot,
   ata,
@@ -38,7 +38,7 @@ import {
   TOKEN_PROGRAM_ADDRESS,
   U64_MAX,
   voidAccounts,
-} from "./program.js";
+} from "./program.ts";
 import {
   type FacilitatorRequest,
   type OperationResult,
@@ -49,7 +49,7 @@ import {
   SCHEME,
   type SettleResponse,
   type VerifyResponse,
-} from "./types.js";
+} from "./types.ts";
 
 export const COMPUTE_BUDGET_PROGRAM_ADDRESS = "ComputeBudget111111111111111111111111111111" as Address;
 
@@ -67,12 +67,15 @@ export type FacilitatorConfig = {
 };
 
 class Rejection extends Error {
-  constructor(
-    readonly reason: ReasonCode,
-    detail: string,
-    readonly payer?: string,
-  ) {
+  readonly reason: ReasonCode;
+  readonly payer?: string;
+
+  // Plain-field assignment, not a TS constructor parameter property: this file must stay runnable
+  // under Node's `--experimental-strip-types`, which does not support parameter properties.
+  constructor(reason: ReasonCode, detail: string, payer?: string) {
     super(detail);
+    this.reason = reason;
+    this.payer = payer;
   }
 }
 

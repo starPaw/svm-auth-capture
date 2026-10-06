@@ -30,7 +30,7 @@ import {
   toInstruction,
   voidAccounts,
   voidData,
-} from "./program.js";
+} from "./program.ts";
 
 export type Lifetime = { blockhash: Blockhash; lastValidBlockHeight: bigint };
 
