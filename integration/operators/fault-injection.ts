@@ -37,6 +37,9 @@ class FaultyLedger implements Ledger {
   arm(fault: Fault, skip = 0): void {
     this.armed = { fault, skip };
   }
+  disarm(): void {
+    this.armed = undefined;
+  }
   now(): Promise<bigint> {
     return this.real.now();
   }
@@ -208,16 +211,31 @@ async function main(): Promise<void> {
   {
     const store = new OperationStore(storeDir("6-lost-capture"));
     const app = await startApp(resourceApp(store));
-    const { header, salt } = await signedHeader(app.url);
+    // The fault targets the capture, so the authorize must finalize naturally first. A natural
+    // unresolved authorize (slow finalization) is itself recorded, its hold reclaimed in cleanup,
+    // and the scenario retried with a new payment.
+    let res: Response | undefined;
+    let salt: Uint8Array = new Uint8Array();
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const signed = await signedHeader(app.url);
+      salt = signed.salt;
+      faulty.arm("lost", 1);
+      res = await send(app.url, signed.header);
+      if (res.status !== 402) break;
+      faulty.disarm();
+      const rec = store.read(fingerprint(payer.address, "/resource", salt))!;
+      emit("NATURAL authorize unresolved before the injected capture fault; retrying with a new payment", { attempt, status: rec.status, receipt: rec.authorizeReceipt });
+      check(rec.status === "authorize-pending" && rec.handlerResult === undefined, "the naturally unresolved authorize stayed authorize-pending; the handler did not run for it");
+      holds.push({ payment: rec.authorize!.payment as Address, captureDeadline: signed.captureDeadline });
+    }
     const calls = handlerCalls;
-    faulty.arm("lost", 1);
-    const res = await send(app.url, header);
-    const receipt = receiptOf(res);
-    const body = (await res.json()) as { ok?: boolean };
-    emit("response", { status: res.status, paymentResponse: receipt, body });
-    check(res.status === 500 && receipt?.success === false && receipt.errorReason === "settlement_pending" && body.ok === undefined, "500 with a pending PAYMENT-RESPONSE and no resource body");
-    check(handlerCalls === calls + 1, "handler ran once, before the terminal settle");
+    const receipt = receiptOf(res!);
+    const body = (await res!.json()) as { ok?: boolean };
+    emit("response", { status: res!.status, paymentResponse: receipt, body });
+    check(res!.status === 500 && receipt?.success === false && receipt.errorReason === "settlement_pending" && body.ok === undefined, "500 with a pending PAYMENT-RESPONSE and no resource body");
+    check(handlerCalls === calls, "no further handler run after the response");
     const rec = store.read(fingerprint(payer.address, "/resource", salt))!;
+    check(rec.handlerResult?.ok === true, "the handler ran once, before the terminal settle");
     check(rec.status === "terminal-pending" && rec.terminal!.signature === receipt!.transaction, "terminal-pending with the capture signature journaled");
     check(store.unresolved().some((r) => r.fingerprint === rec.fingerprint), "listed by unresolved()");
     const report = await reconcileEntry(store, real, record.programId, rec.fingerprint);
@@ -259,6 +277,10 @@ async function main(): Promise<void> {
   for (const { payment, captureDeadline } of holds) {
     await waitForClock(c, captureDeadline, `Dc of ${payment}`);
     const before = await snapshot(c, "before reclaim", payment);
+    if (!before.payment?.exists || before.payment.held === "0") {
+      emit("no hold to reclaim", { payment, state: before.payment });
+      continue;
+    }
     const result = await submitReclaim({ ledger: real, programId: record.programId, payer, payment, lifetime: await real.latestBlockhash() });
     emit("payer reclaim", { payment, result });
     const after = await snapshot(c, "after reclaim", payment, BigInt(before.payment!.slot));

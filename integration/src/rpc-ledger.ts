@@ -47,7 +47,8 @@ export type RpcLedgerConfig = {
   /**
    * Settlement deadline for `submit`, in milliseconds from the moment it is called: it bounds the
    * `sendTransaction` call (itself also limited to `requestTimeoutMs`) and every status request
-   * after it. A finalized failure's log fetch gets one further `requestTimeoutMs`. Default 30s.
+   * after it. A finalized failure's log fetch gets one further `requestTimeoutMs`. Default 60s:
+   * Devnet finalization has been observed to exceed 30s.
    */
   confirmTimeoutMs?: number;
   pollIntervalMs?: number;
@@ -155,7 +156,7 @@ export class RpcLedger implements Ledger, ChainReader {
     this.rpcUrl = config.rpcUrl;
     this.genesisHash = config.genesisHash;
     this.rpc = config.rpc ?? createSolanaRpc(config.rpcUrl);
-    this.confirmTimeoutMs = config.confirmTimeoutMs ?? 30_000;
+    this.confirmTimeoutMs = config.confirmTimeoutMs ?? 60_000;
     this.pollIntervalMs = config.pollIntervalMs ?? 1_000;
     this.requestTimeoutMs = config.requestTimeoutMs ?? 10_000;
     if (!(this.confirmTimeoutMs > 0) || !(this.requestTimeoutMs > 0)) throw new Error("RpcLedger timeouts must be positive");

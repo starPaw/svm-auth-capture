@@ -123,14 +123,14 @@ export async function payForResource(o: {
   fetchImpl?: typeof fetch;
   /**
    * Bound on each HTTP request, body included. The paid request spans two facilitator settles
-   * (each bounded by the resource server at 150s by default), a blockhash read, and the handler,
-   * so the default is 400s. On expiry this throws; the payment may still complete, and the
+   * (each bounded by the resource server at 180s by default), a blockhash read, and the handler,
+   * so the default is 450s. On expiry this throws; the payment may still complete, and the
    * resource server's journal and `PAYMENT-RESPONSE` on a retry are not available to the client.
    */
   requestTimeoutMs?: number;
 }): Promise<PaidResponse> {
   const fetchImpl = o.fetchImpl ?? fetch;
-  const timeoutMs = o.requestTimeoutMs ?? 400_000;
+  const timeoutMs = o.requestTimeoutMs ?? 450_000;
   const challenge = await fetchImpl(o.resourceUrl, { signal: AbortSignal.timeout(timeoutMs) });
   if (challenge.status !== 402) throw new Error(`expected 402 Payment Required, got ${challenge.status}`);
   const header = challenge.headers.get(PAYMENT_REQUIRED_HEADER);

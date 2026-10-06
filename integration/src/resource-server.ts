@@ -72,9 +72,9 @@ export type ResourceServerConfig = {
   /**
    * Bound on one `/settle` call, response body included. Expiry is safe — the outcome is recorded
    * unresolved for reconciliation, never treated as not executed or retried — but an expiry
-   * before the facilitator finishes turns a settlement into manual work. The default (150s) sits
+   * before the facilitator finishes turns a settlement into manual work. The default (180s) sits
    * above the facilitator's worst case with default `RpcLedger` bounds: about nine 10s preflight
-   * reads plus the 30s settlement deadline and one 10s log fetch.
+   * reads plus the 60s settlement deadline and one 10s log fetch.
    */
   facilitatorTimeoutMs?: number;
 };
@@ -261,7 +261,7 @@ async function settle(config: ResourceServerConfig, body: unknown): Promise<Sett
     receipt: { success: false, errorReason: Reason.settlementPending, transaction: "", network: config.network },
     detail,
   });
-  const signal = AbortSignal.timeout(config.facilitatorTimeoutMs ?? 150_000);
+  const signal = AbortSignal.timeout(config.facilitatorTimeoutMs ?? 180_000);
   let res: Response;
   try {
     res = await (config.fetchImpl ?? fetch)(`${config.facilitatorUrl}/settle`, {
