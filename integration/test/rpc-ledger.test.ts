@@ -1,14 +1,18 @@
 // Unit tests for `RpcLedger` (SAC-006) against an injected fake RPC client — no network access.
-// Exercises genesis verification, Clock decoding, account mapping, simulation mapping, and the
+// Exercises genesis verification, Clock decoding, account mapping, simulation mapping, the
 // three-way `submit` classification (not-submitted / ambiguous submitted / finalized succeeded
-// or failed), including the bounded-timeout and signature-mismatch edge cases.
+// or failed), including the bounded-timeout, signature-mismatch, and already-processed edge
+// cases (the latter through the installed SDK's own JSON-RPC error conversion), and the
+// read-only `ChainReader` evidence used by reconciliation.
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   type Address,
   generateKeyPairSigner,
+  getBase64EncodedWireTransaction,
   getSignatureFromTransaction,
+  getSolanaErrorFromJsonRpcError,
   lamports,
   type Rpc,
   SolanaError,
@@ -19,7 +23,7 @@ import {
 import { getTransferSolInstruction } from "@solana-program/system";
 import { describe, expect, test } from "vitest";
 import { loadDeploymentRecord } from "../src/deployment-record.js";
-import { RpcLedger } from "../src/rpc-ledger.js";
+import { cachedClusterClock, redactRpcUrl, RpcLedger } from "../src/rpc-ledger.js";
 import { buildTransaction } from "../src/transactions.js";
 
 const GENESIS = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG";
@@ -62,6 +66,20 @@ describe("RpcLedger.verifyGenesis", () => {
       rpc: fakeRpc({ getGenesisHash: () => sendable(GENESIS) }),
     });
     await expect(ledger.verifyGenesis()).resolves.toBeUndefined();
+  });
+
+  test("never puts RPC credentials in the mismatch error", async () => {
+    const ledger = new RpcLedger({
+      network: NETWORK,
+      genesisHash: GENESIS,
+      rpcUrl: "https://devnet.example-rpc.com/?api-key=secret-key-value",
+      rpc: fakeRpc({ getGenesisHash: () => sendable("Wrong1111111111111111111111111111111111111") }),
+    });
+    const error = await ledger.verifyGenesis().catch((e: Error) => e);
+    expect(String(error)).toMatch(/https:\/\/devnet\.example-rpc\.com \(credentials redacted\)/);
+    expect(String(error)).not.toContain("secret-key-value");
+    expect(redactRpcUrl("https://user:pw@rpc.example/v1?x=1")).toBe("https://rpc.example/v1 (credentials redacted)");
+    expect(redactRpcUrl("https://api.devnet.solana.com")).toBe("https://api.devnet.solana.com");
   });
 
   test("rejects a mismatched genesis", async () => {
@@ -165,8 +183,80 @@ describe("RpcLedger.simulate", () => {
   });
 });
 
+/** The exact error `@solana/kit` produces for a JSON-RPC sendTransaction preflight failure carrying `err`. */
+function preflightFailure(err: unknown): unknown {
+  return getSolanaErrorFromJsonRpcError({
+    code: -32002,
+    message: "Transaction simulation failed",
+    data: { err, logs: [], accounts: null, unitsConsumed: 0, returnData: null },
+  });
+}
+
 describe("RpcLedger.submit", () => {
-  test("classifies a preflight rejection as not-submitted", async () => {
+  test("classifies a preflight execution error as not-submitted", async () => {
+    const ledger = new RpcLedger({
+      network: NETWORK,
+      genesisHash: GENESIS,
+      rpcUrl: "http://unused.invalid",
+      rpc: fakeRpc({ sendTransaction: () => ({ send: () => Promise.reject(preflightFailure({ InstructionError: [0, { Custom: 6 }] })) }) }),
+    });
+    const result = await ledger.submit(await sampleTransaction());
+    expect(result.kind).toBe("not-submitted");
+  });
+
+  test("keeps an AlreadyProcessed preflight refusal submitted and resolves the original signature", async () => {
+    const transaction = await sampleTransaction();
+    const signature = getSignatureFromTransaction(transaction);
+    const looked: string[] = [];
+    const ledger = new RpcLedger({
+      network: NETWORK,
+      genesisHash: GENESIS,
+      rpcUrl: "http://unused.invalid",
+      pollIntervalMs: 1,
+      rpc: fakeRpc({
+        sendTransaction: () => ({ send: () => Promise.reject(preflightFailure("AlreadyProcessed")) }),
+        getSignatureStatuses: (sigs: string[]) => {
+          looked.push(...sigs);
+          return sendable({ value: [{ confirmationStatus: "finalized", err: null, slot: 7n }] });
+        },
+      }),
+    });
+    const result = await ledger.submit(transaction);
+    expect(result).toEqual({ kind: "submitted", outcome: { status: "succeeded", commitment: "finalized" } });
+    expect(looked).toEqual([signature]);
+  });
+
+  test("keeps an AlreadyProcessed refusal unresolved while the original signature is not finalized", async () => {
+    const ledger = new RpcLedger({
+      network: NETWORK,
+      genesisHash: GENESIS,
+      rpcUrl: "http://unused.invalid",
+      confirmTimeoutMs: 5,
+      pollIntervalMs: 1,
+      rpc: fakeRpc({
+        sendTransaction: () => ({ send: () => Promise.reject(preflightFailure("AlreadyProcessed")) }),
+        getSignatureStatuses: () => sendable({ value: [null] }),
+      }),
+    });
+    expect(await ledger.submit(await sampleTransaction())).toEqual({ kind: "submitted", outcome: undefined });
+  });
+
+  test("keeps a BlockhashNotFound preflight refusal submitted: an earlier broadcast of these bytes may have landed", async () => {
+    const ledger = new RpcLedger({
+      network: NETWORK,
+      genesisHash: GENESIS,
+      rpcUrl: "http://unused.invalid",
+      confirmTimeoutMs: 5,
+      pollIntervalMs: 1,
+      rpc: fakeRpc({
+        sendTransaction: () => ({ send: () => Promise.reject(preflightFailure("BlockhashNotFound")) }),
+        getSignatureStatuses: () => sendable({ value: [null] }),
+      }),
+    });
+    expect(await ledger.submit(await sampleTransaction())).toEqual({ kind: "submitted", outcome: undefined });
+  });
+
+  test("never classifies a preflight refusal without a transaction error as not-submitted", async () => {
     const preflightError = new SolanaError(SOLANA_ERROR__JSON_RPC__SERVER_ERROR_SEND_TRANSACTION_PREFLIGHT_FAILURE, {
       accounts: null,
       fee: null,
@@ -193,7 +283,7 @@ describe("RpcLedger.submit", () => {
       }),
     });
     const result = await ledger.submit(await sampleTransaction());
-    expect(result.kind).toBe("not-submitted");
+    expect(result).toEqual({ kind: "submitted" });
   });
 
   test("classifies a generic send failure as ambiguous submitted", async () => {
@@ -275,6 +365,117 @@ describe("RpcLedger.submit", () => {
     });
     const result = await ledger.submit(transaction);
     expect(result).toEqual({ kind: "submitted", outcome: undefined });
+  });
+});
+
+describe("RpcLedger ChainReader", () => {
+  const ledgerWith = (rpc: Partial<Record<keyof SolanaRpcApi, unknown>>) =>
+    new RpcLedger({ network: NETWORK, genesisHash: GENESIS, rpcUrl: "http://unused.invalid", rpc: fakeRpc(rpc) });
+
+  test("reports a signature's slot, commitment, and error", async () => {
+    const ledger = ledgerWith({
+      getSignatureStatuses: () => sendable({ value: [{ confirmationStatus: "confirmed", err: { InstructionError: [0, "Custom"] }, slot: 42n }] }),
+    });
+    const sig = getSignatureFromTransaction(await sampleTransaction());
+    expect(await ledger.getSignatureStatus(sig)).toEqual({ kind: "found", slot: 42n, commitment: "confirmed", err: '{"InstructionError":[0,"Custom"]}' });
+  });
+
+  test("reports missing history as not-found and an RPC failure as unavailable, never as absence", async () => {
+    const sig = getSignatureFromTransaction(await sampleTransaction());
+    expect(await ledgerWith({ getSignatureStatuses: () => sendable({ value: [null] }) }).getSignatureStatus(sig)).toEqual({ kind: "not-found" });
+    const failing = ledgerWith({ getSignatureStatuses: () => ({ send: () => Promise.reject(new Error("429")) }) });
+    expect((await failing.getSignatureStatus(sig)).kind).toBe("unavailable");
+  });
+
+  test("finds the original signature by its exact message bytes", async () => {
+    const original = await sampleTransaction();
+    const other = await sampleTransaction();
+    const byWire: Record<string, string> = {
+      orig: getBase64EncodedWireTransaction(original),
+      other: getBase64EncodedWireTransaction(other),
+    };
+    const ledger = ledgerWith({
+      getSignaturesForAddress: () => sendable([{ signature: "other" }, { signature: "orig" }]),
+      getTransaction: (sig: string) => sendable({ transaction: [byWire[sig], "base64"] }),
+    });
+    const search = await ledger.findSignaturesByMessage(PROGRAM_ID, new Uint8Array(original.messageBytes));
+    expect(search).toEqual({ kind: "ok", signatures: ["orig"], truncated: false });
+  });
+
+  test("reports listed-but-unretrievable history as unavailable", async () => {
+    const ledger = ledgerWith({
+      getSignaturesForAddress: () => sendable([{ signature: "orig" }]),
+      getTransaction: () => sendable(null),
+    });
+    expect((await ledger.findSignaturesByMessage(PROGRAM_ID, new Uint8Array([1]))).kind).toBe("unavailable");
+  });
+
+  test("checks blockhash validity at the latest bank and reads accounts no older than a slot", async () => {
+    const seen: unknown[] = [];
+    const ledger = ledgerWith({
+      isBlockhashValid: (_b: string, config: unknown) => {
+        seen.push(config);
+        return sendable({ context: { slot: 90n }, value: false });
+      },
+      getAccountInfo: (_a: string, config: unknown) => {
+        seen.push(config);
+        return sendable({ context: { slot: 95n }, value: null });
+      },
+    });
+    expect(await ledger.isBlockhashValid("bh")).toEqual({ kind: "ok", valid: false, slot: 90n });
+    expect(await ledger.getAccountAtLeast(PROGRAM_ID, 90n)).toEqual({ kind: "ok", slot: 95n, account: null });
+    expect(seen).toEqual([{ commitment: "processed" }, { encoding: "base64", commitment: "finalized", minContextSlot: 90n }]);
+  });
+
+  test("waits for the finalized bank to reach the minimum slot, then reports unavailable when it never does", async () => {
+    let calls = 0;
+    const catchingUp = new RpcLedger({
+      network: NETWORK,
+      genesisHash: GENESIS,
+      rpcUrl: "http://unused.invalid",
+      pollIntervalMs: 1,
+      rpc: fakeRpc({
+        getAccountInfo: () => {
+          calls += 1;
+          return calls < 3 ? { send: () => Promise.reject(new Error("Minimum context slot has not been reached")) } : sendable({ context: { slot: 91n }, value: null });
+        },
+      }),
+    });
+    expect(await catchingUp.getAccountAtLeast(PROGRAM_ID, 90n)).toEqual({ kind: "ok", slot: 91n, account: null });
+    const stuck = new RpcLedger({
+      network: NETWORK,
+      genesisHash: GENESIS,
+      rpcUrl: "http://unused.invalid",
+      confirmTimeoutMs: 5,
+      pollIntervalMs: 1,
+      rpc: fakeRpc({ getAccountInfo: () => ({ send: () => Promise.reject(new Error("Minimum context slot has not been reached")) }) }),
+    });
+    expect(await stuck.getAccountAtLeast(PROGRAM_ID, 90n)).toEqual({ kind: "unavailable", detail: "Minimum context slot has not been reached" });
+  });
+});
+
+describe("cachedClusterClock", () => {
+  test("reads the cluster clock once per window, even under concurrent calls, and never steps back", async () => {
+    let reads = 0;
+    const values = [1_000n, 990n];
+    const clock = cachedClusterClock(async () => values[reads++]!, 0);
+    const first = await Promise.all([clock(), clock(), clock()]);
+    expect(first).toEqual([1_000n, 1_000n, 1_000n]);
+    expect(reads).toBe(1);
+    await new Promise((r) => setTimeout(r, 2));
+    expect(await clock()).toBe(1_000n); // the refreshed read (990) is behind: no backward step
+    expect(reads).toBe(2);
+  });
+
+  test("serves cached time without another read inside the window", async () => {
+    let reads = 0;
+    const clock = cachedClusterClock(async () => {
+      reads += 1;
+      return 5_000n;
+    }, 60_000);
+    await clock();
+    await clock();
+    expect(reads).toBe(1);
   });
 });
 

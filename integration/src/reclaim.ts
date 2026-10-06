@@ -5,7 +5,6 @@
 // needs are a `Ledger`, the payer's own keypair, and the payment PDA.
 import { readFileSync } from "node:fs";
 import { createKeyPairSignerFromBytes, type Address, type KeyPairSigner } from "@solana/kit";
-import { createSolanaRpc } from "@solana/kit";
 import { loadDeploymentRecord } from "./deployment-record.ts";
 import type { Ledger, SubmitResult } from "./ledger.ts";
 import { decodePayment } from "./program.ts";
@@ -43,15 +42,7 @@ async function main(): Promise<void> {
   const payer = await loadKeypair(requireEnv("SAC006_PAYER_KEYPAIR_PATH"));
   const ledger = new RpcLedger({ network: record.network.caip2, genesisHash: record.network.genesisHash, rpcUrl });
   await ledger.verifyGenesis();
-  const rpc = createSolanaRpc(rpcUrl);
-  const { value } = await rpc.getLatestBlockhash().send();
-  const result = await submitReclaim({
-    ledger,
-    programId: record.programId,
-    payer,
-    payment,
-    lifetime: { blockhash: value.blockhash, lastValidBlockHeight: value.lastValidBlockHeight },
-  });
+  const result = await submitReclaim({ ledger, programId: record.programId, payer, payment, lifetime: await ledger.latestBlockhash() });
   console.log(JSON.stringify(result, (_k, v) => (typeof v === "bigint" ? v.toString() : v), 2));
 }
 

@@ -2,25 +2,41 @@
 // sponsor signature absent (`sigVerify: false`, `replaceRecentBlockhash: false`), and submits
 // the exact co-signed bytes once, classifying the result into the three-way outcome the
 // facilitator requires (see `ledger.ts`). The program's onchain guards remain authoritative;
-// this adapter never replaces a blockhash, re-signs, or retries an ambiguous submission.
+// this adapter never replaces a blockhash, re-signs, or retries an ambiguous submission. It also
+// serves the read-only `ChainReader` evidence manual reconciliation uses (`reconciliation.ts`).
 import {
   type Address,
   createSolanaRpc,
   getBase64Encoder,
+  type Blockhash,
   getBase64EncodedWireTransaction,
   getSignatureFromTransaction,
+  getTransactionDecoder,
   isSolanaError,
   type Rpc,
   signature as asSignature,
   SOLANA_ERROR__JSON_RPC__SERVER_ERROR_SEND_TRANSACTION_PREFLIGHT_FAILURE,
+  SOLANA_ERROR__TRANSACTION_ERROR__ALREADY_PROCESSED,
+  SOLANA_ERROR__TRANSACTION_ERROR__BLOCKHASH_NOT_FOUND,
   type SolanaRpcApi,
   type Transaction,
 } from "@solana/kit";
 import type { FinalizedOutcome, Ledger, LedgerAccount, SimulationOutcome, SubmitResult } from "./ledger.ts";
+import type { BlockhashCheck, ChainReader, MessageSearch, SignatureLookup, SlotAccount } from "./reconciliation.ts";
+import type { Lifetime } from "./transactions.ts";
 
 const CLOCK_SYSVAR = "SysvarC1ock11111111111111111111111111111111" as Address;
 const base64Encoder = getBase64Encoder();
 const decodeBase64 = (data: string): Uint8Array => new Uint8Array(base64Encoder.encode(data));
+const transactionDecoder = getTransactionDecoder();
+const describe = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+/** Bounded history scan for `findSignaturesByMessage`; a demo payment PDA sees a handful of transactions. */
+const MESSAGE_SEARCH_LIMIT = 50;
+
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  return a.length === b.length && a.every((v, i) => v === b[i]);
+}
 
 export type RpcLedgerConfig = {
   /** CAIP-2 identity this ledger reports; the facilitator rejects a configuration mismatch against it. */
@@ -42,11 +58,50 @@ function decodeClockUnixTimestamp(data: Uint8Array): bigint {
   return new DataView(data.buffer, data.byteOffset, data.byteLength).getBigInt64(32, true);
 }
 
+/**
+ * An RPC URL safe to log or put in an error: scheme, host, and path only. Provider API keys
+ * travel in the query string or userinfo, and every message here can end up in evidence.
+ */
+export function redactRpcUrl(url: string): string {
+  try {
+    const u = new URL(url);
+    return `${u.protocol}//${u.host}${u.pathname === "/" ? "" : u.pathname}${u.search || u.username ? " (credentials redacted)" : ""}`;
+  } catch {
+    return "<unparseable RPC URL>";
+  }
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-export class RpcLedger implements Ledger {
+/**
+ * A cluster clock for request paths that must not cost one RPC read per anonymous request (the
+ * 402 challenge): reads the Clock sysvar at most once per `maxAgeMs` (one read in flight at a
+ * time), advances it by local elapsed time in between, and never steps backwards.
+ */
+export function cachedClusterClock(read: () => Promise<bigint>, maxAgeMs = 10_000): () => Promise<bigint> {
+  let base: { cluster: bigint; at: number } | undefined;
+  let refreshing: Promise<void> | undefined;
+  let last = 0n;
+  return async () => {
+    if (!base || Date.now() - base.at > maxAgeMs) {
+      refreshing ??= read()
+        .then((cluster) => {
+          base = { cluster, at: Date.now() };
+        })
+        .finally(() => {
+          refreshing = undefined;
+        });
+      await refreshing;
+    }
+    const now = base!.cluster + BigInt(Math.floor((Date.now() - base!.at) / 1000));
+    if (now > last) last = now;
+    return last;
+  };
+}
+
+export class RpcLedger implements Ledger, ChainReader {
   readonly network: string;
   private readonly rpcUrl: string;
   private readonly genesisHash: string;
@@ -72,7 +127,7 @@ export class RpcLedger implements Ledger {
   async verifyGenesis(): Promise<void> {
     const observed = await this.rpc.getGenesisHash().send();
     if (observed !== this.genesisHash) {
-      throw new Error(`RpcLedger genesis mismatch at ${this.rpcUrl}: configured ${this.genesisHash}, observed ${observed}`);
+      throw new Error(`RpcLedger genesis mismatch at ${redactRpcUrl(this.rpcUrl)}: configured ${this.genesisHash}, observed ${observed}`);
     }
   }
 
@@ -80,6 +135,12 @@ export class RpcLedger implements Ledger {
     const { value } = await this.rpc.getAccountInfo(CLOCK_SYSVAR, { encoding: "base64" }).send();
     if (!value) throw new Error("RpcLedger.now: Clock sysvar account not found");
     return decodeClockUnixTimestamp(decodeBase64(value.data[0]));
+  }
+
+  /** A finalized blockhash and its last valid block height, for building a new transaction. */
+  async latestBlockhash(): Promise<Lifetime> {
+    const { value } = await this.rpc.getLatestBlockhash({ commitment: "finalized" }).send();
+    return { blockhash: value.blockhash, lastValidBlockHeight: value.lastValidBlockHeight };
   }
 
   async getAccount(address: Address): Promise<LedgerAccount | null> {
@@ -108,9 +169,25 @@ export class RpcLedger implements Ledger {
         .send();
     } catch (error) {
       if (isSolanaError(error, SOLANA_ERROR__JSON_RPC__SERVER_ERROR_SEND_TRANSACTION_PREFLIGHT_FAILURE)) {
-        // The node's own preflight simulation rejected these bytes before ever broadcasting
-        // them: nothing reached the cluster, so a retry of the same bytes is fresh.
-        return { kind: "not-submitted", reason: error.message };
+        const cause = (error as { cause?: unknown }).cause;
+        if (
+          isSolanaError(cause, SOLANA_ERROR__TRANSACTION_ERROR__ALREADY_PROCESSED) ||
+          isSolanaError(cause, SOLANA_ERROR__TRANSACTION_ERROR__BLOCKHASH_NOT_FOUND)
+        ) {
+          // A refusal without execution is not proof these bytes never landed: `AlreadyProcessed`
+          // says this exact signature is in the status cache, and `BlockhashNotFound` can follow
+          // an earlier broadcast of the same bytes whose blockhash has since aged out. Resolve the
+          // original signature's own outcome; until it is finalized it stays unresolved.
+          return { kind: "submitted", outcome: await this.pollForFinalized(expectedSignature) };
+        }
+        if (cause === undefined) {
+          // A preflight refusal with no transaction error attached is a malformed response: it
+          // proves nothing about these bytes, so it cannot become `not-submitted`.
+          return { kind: "submitted" };
+        }
+        // The node's own preflight simulation rejected these bytes with an execution error
+        // before broadcasting them: this call put nothing on the cluster.
+        return { kind: "not-submitted", reason: `${error.message}: ${describe(cause)}` };
       }
       // Any other failure (transport error, timeout, malformed response) cannot prove the exact
       // bytes were never broadcast: stay in the ambiguous `submitted` branch, never guess
@@ -148,6 +225,77 @@ export class RpcLedger implements Ledger {
     }
     // Bounded wait exhausted without a finalized status: stays ambiguous, never guessed.
     return undefined;
+  }
+
+  // --- ChainReader: read-only evidence for manual reconciliation (`reconciliation.ts`). Every
+  // RPC failure is reported as `unavailable`, never as absence.
+
+  async getSignatureStatus(signature: string): Promise<SignatureLookup> {
+    try {
+      const { value } = await this.rpc.getSignatureStatuses([asSignature(signature)], { searchTransactionHistory: true }).send();
+      const status = value[0];
+      if (!status) return { kind: "not-found" };
+      const commitment = status.confirmationStatus;
+      if (commitment !== "processed" && commitment !== "confirmed" && commitment !== "finalized") {
+        return { kind: "unavailable", detail: `malformed confirmationStatus ${JSON.stringify(commitment)}` };
+      }
+      return { kind: "found", slot: BigInt(status.slot), commitment, err: status.err === null ? null : JSON.stringify(status.err) };
+    } catch (error) {
+      return { kind: "unavailable", detail: describe(error) };
+    }
+  }
+
+  async findSignaturesByMessage(address: Address, messageBytes: Uint8Array): Promise<MessageSearch> {
+    try {
+      const entries = await this.rpc.getSignaturesForAddress(address, { limit: MESSAGE_SEARCH_LIMIT, commitment: "confirmed" }).send();
+      for (const entry of entries) {
+        const tx = await this.rpc
+          .getTransaction(entry.signature, { encoding: "base64", commitment: "confirmed", maxSupportedTransactionVersion: 0 })
+          .send();
+        if (!tx) return { kind: "unavailable", detail: `history for ${entry.signature} is listed but not retrievable` };
+        const decoded = transactionDecoder.decode(decodeBase64(tx.transaction[0]));
+        // Identical message bytes always carry the identical sponsor signature: one match is all.
+        if (sameBytes(new Uint8Array(decoded.messageBytes), messageBytes)) return { kind: "ok", signatures: [entry.signature], truncated: false };
+      }
+      return { kind: "ok", signatures: [], truncated: entries.length >= MESSAGE_SEARCH_LIMIT };
+    } catch (error) {
+      return { kind: "unavailable", detail: describe(error) };
+    }
+  }
+
+  async isBlockhashValid(blockhash: string): Promise<BlockhashCheck> {
+    try {
+      // Latest (processed) bank: a blockhash newer than the finalized bank is still unknown
+      // there and would look expired, so finalized cannot be used. A blockhash invalid at the
+      // latest bank is invalid for every later bank. The returned slot is where any landing must
+      // already be visible, so callers read state at a finalized slot no older than it.
+      const { context, value } = await this.rpc.isBlockhashValid(blockhash as Blockhash, { commitment: "processed" }).send();
+      return { kind: "ok", valid: value, slot: BigInt(context.slot) };
+    } catch (error) {
+      return { kind: "unavailable", detail: describe(error) };
+    }
+  }
+
+  async getAccountAtLeast(address: Address, minContextSlot: bigint): Promise<SlotAccount> {
+    // Finalization trails the latest slot by ~32 slots: wait, within the bounded window, for the
+    // finalized bank to reach `minContextSlot` instead of reporting older state.
+    const deadline = Date.now() + this.confirmTimeoutMs;
+    let detail = "finalized bank did not reach the required slot";
+    do {
+      try {
+        const { context, value } = await this.rpc
+          .getAccountInfo(address, { encoding: "base64", commitment: "finalized", minContextSlot })
+          .send();
+        const account = value
+          ? { owner: value.owner, data: decodeBase64(value.data[0]), lamports: value.lamports, executable: value.executable }
+          : null;
+        return { kind: "ok", slot: BigInt(context.slot), account };
+      } catch (error) {
+        detail = describe(error);
+      }
+      await sleep(this.pollIntervalMs);
+    } while (Date.now() < deadline);
+    return { kind: "unavailable", detail };
   }
 
   private async fetchFinalizedLogs(signature: string): Promise<string[]> {

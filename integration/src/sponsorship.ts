@@ -7,7 +7,8 @@
 //    caller cannot loop indefinitely even within the sponsor's balance;
 //  - a floor on the sponsor's live lamport balance, read fresh from the ledger before every
 //    attempt, so the guard never authorizes an attempt once the sponsor is close to unable to
-//    pay for it.
+//    pay for it. Concurrent admissions read the same balance, so the floor is a stop signal; the
+//    attempt cap, reserved atomically, is the hard bound on how many attempts are ever signed.
 //
 // Both bounds are process-local and not durable (the same limitation as the facilitator's
 // in-process duplicate guard; ARCHITECTURE, "Relay, recovery, and separation from application
@@ -40,17 +41,28 @@ export class SponsorshipGuard {
     return this.attempts;
   }
 
-  /** Returns a rejection reason, or `undefined` if another settle attempt is authorized. */
+  /**
+   * Returns a rejection reason, or `undefined` if another settle attempt is authorized. The
+   * attempt slot is reserved synchronously, before the balance read yields: concurrent requests
+   * can never all observe the same count and exceed the cap. A slot is released only when the
+   * balance floor denies the attempt, which never reaches the facilitator.
+   */
   async check(): Promise<string | undefined> {
     if (this.attempts >= this.config.maxAttempts) {
       return `sponsorship attempt cap reached (${this.config.maxAttempts})`;
     }
-    const account = await this.config.ledger.getAccount(this.config.feePayer);
-    const balance = account?.lamports ?? 0n;
+    this.attempts += 1;
+    let balance: bigint;
+    try {
+      balance = (await this.config.ledger.getAccount(this.config.feePayer))?.lamports ?? 0n;
+    } catch (e) {
+      this.attempts -= 1;
+      return `sponsor balance unavailable: ${e instanceof Error ? e.message : String(e)}`;
+    }
     if (balance < this.config.minLamportsBalance) {
+      this.attempts -= 1;
       return `sponsor balance ${balance} is below the configured floor ${this.config.minLamportsBalance}`;
     }
-    this.attempts += 1;
     return undefined;
   }
 }

@@ -13,6 +13,7 @@ import { createApp } from "./app.ts";
 import { requireBearerToken } from "./auth.ts";
 import type { Facilitator } from "./facilitator.ts";
 import { requireSponsorshipBudget, SponsorshipGuard } from "./sponsorship.ts";
+import { isObject } from "./types.ts";
 
 export type GatewayConfig = {
   bearerToken: string;
@@ -20,8 +21,6 @@ export type GatewayConfig = {
   /** The demo's one allowed merchant wallet (`payTo`) and asset mint; anything else is rejected. */
   allowlist: { merchant: Address; mint: Address };
 };
-
-const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 
 /** Rejects a `paymentRequirements.payTo`/`asset` outside the demo's fixed allowlist. */
 function requireAllowlisted(allowlist: GatewayConfig["allowlist"]): MiddlewareHandler {

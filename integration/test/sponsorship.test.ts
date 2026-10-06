@@ -55,6 +55,60 @@ describe("SponsorshipGuard.check", () => {
   });
 });
 
+describe("SponsorshipGuard.check under concurrency", () => {
+  /** A ledger whose balance read yields to the event loop, so concurrent checks interleave. */
+  function slowLedger(balance: bigint): Ledger {
+    return {
+      ...fakeLedger(balance),
+      getAccount: () =>
+        new Promise((resolve) => setTimeout(() => resolve({ owner: FEE_PAYER, data: new Uint8Array(0), lamports: balance, executable: false }), 5)),
+    };
+  }
+
+  test("admits at most maxAttempts of many concurrent checks", async () => {
+    const guard = new SponsorshipGuard({ ledger: slowLedger(10_000n), feePayer: FEE_PAYER, maxAttempts: 1, minLamportsBalance: 1_000n });
+    const results = await Promise.all(Array.from({ length: 20 }, () => guard.check()));
+    expect(results.filter((r) => r === undefined)).toHaveLength(1);
+    expect(guard.attemptCount).toBe(1);
+  });
+
+  test("admits exactly the cap through the HTTP middleware when requests race", async () => {
+    const guard = new SponsorshipGuard({ ledger: slowLedger(10_000n), feePayer: FEE_PAYER, maxAttempts: 3, minLamportsBalance: 1_000n });
+    const app = new Hono();
+    let reached = 0;
+    app.use("/settle", requireSponsorshipBudget(guard));
+    app.post("/settle", (c) => {
+      reached += 1;
+      return c.json({ ok: true });
+    });
+    const statuses = await Promise.all(Array.from({ length: 20 }, async () => (await app.request("/settle", { method: "POST" })).status));
+    expect(statuses.filter((s) => s === 200)).toHaveLength(3);
+    expect(statuses.filter((s) => s === 429)).toHaveLength(17);
+    expect(reached).toBe(3);
+  });
+
+  test("releases a slot the balance floor denies, without exceeding the cap", async () => {
+    let balance = 500n;
+    const ledger: Ledger = {
+      ...fakeLedger(0n),
+      getAccount: async () => ({ owner: FEE_PAYER, data: new Uint8Array(0), lamports: balance, executable: false }),
+    };
+    const guard = new SponsorshipGuard({ ledger, feePayer: FEE_PAYER, maxAttempts: 1, minLamportsBalance: 1_000n });
+    expect(await guard.check()).toMatch(/below the configured floor/);
+    expect(guard.attemptCount).toBe(0);
+    balance = 10_000n;
+    expect(await guard.check()).toBeUndefined();
+    expect(await guard.check()).toMatch(/attempt cap reached/);
+  });
+
+  test("denies, and releases the slot, when the balance cannot be read", async () => {
+    const ledger: Ledger = { ...fakeLedger(0n), getAccount: () => Promise.reject(new Error("rpc down")) };
+    const guard = new SponsorshipGuard({ ledger, feePayer: FEE_PAYER, maxAttempts: 1, minLamportsBalance: 1n });
+    expect(await guard.check()).toMatch(/balance unavailable/);
+    expect(guard.attemptCount).toBe(0);
+  });
+});
+
 describe("requireSponsorshipBudget", () => {
   function appWith(guard: SponsorshipGuard): Hono {
     const app = new Hono();

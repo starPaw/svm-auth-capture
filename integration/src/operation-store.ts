@@ -12,16 +12,21 @@
 // One JSON file per fingerprint, written with the exclusive `wx` flag so a concurrent duplicate
 // request can never win a second reservation, and updated via write-to-temp-then-rename so a
 // crash mid-write cannot corrupt a record. No new service: this is a local file store the
-// resource-server process reads and writes directly. On an unresolved outcome the record stays
-// in a non-terminal status; `reconcileEntry` inspects live chain state and reports what it
-// found, but never resubmits, re-signs, or invents a result — only an operator decides how to
-// close the entry out.
+// resource-server process reads and writes directly. On an unresolved outcome — including a
+// crash or lost response at any intermediate status — the record stays non-terminal and is
+// listed by `unresolved()`; `reconcileEntry` (`reconciliation.ts`) inspects the original
+// transaction and live chain state and reports what it found, but never resubmits, re-signs,
+// or invents a result — only an operator decides how to close the entry out.
+//
+// The sponsor's signature (which is the transaction's Solana signature) is added inside the
+// facilitator, so this server-side journal holds the exact message bytes it consented to, and
+// the signature only once a facilitator receipt — success, failure, or pending — reports it.
+// The facilitator's own `SubmissionJournal` holds the fully co-signed bytes and signature,
+// written before broadcast; both share the same message bytes.
 import { createHash } from "node:crypto";
 import { mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { Address } from "@solana/kit";
-import type { Ledger } from "./ledger.ts";
-import { decodePayment } from "./program.ts";
+import type { SettleResponse } from "./types.ts";
 
 export type OperationStatus =
   | "reserved" // fingerprint claimed; settle(authorize) not yet attempted
@@ -33,20 +38,25 @@ export type OperationStatus =
   | "handler-succeeded"
   | "handler-failed"
   | "terminal-settling" // settle(capture|void) in flight for the handler's outcome
-  | "terminal-pending" // the terminal settle was broadcast but its outcome could not be established
-  | "completed" // the terminal settle observed a finalized result (success or classified failure)
-  | "pending"; // execution stopped for explicit manual reconciliation (see `reconcileEntry`)
+  | "terminal-pending" // the terminal settle may have been broadcast but its outcome could not be established
+  | "terminal-rejected" // the terminal settle was refused or failed finalized; the hold remains for manual handling
+  | "completed"; // the terminal settle observed a finalized success
+
+/** Statuses that need no reconciliation: nothing is in flight and no hold is left behind by this server. */
+const SETTLED_STATUSES: ReadonlySet<OperationStatus> = new Set(["authorize-rejected", "completed"]);
 
 /**
- * Facts persisted before a `/settle` call is ever made: the exact signed bytes, their locally
- * derived signature, the blockhash the message was built against (its lifetime anchor; this
- * demo does not separately track a last-valid-block-height expiry), the payment identity, and
- * the expected `(H,F)` pair the signed instruction carries.
+ * Facts persisted before a `/settle` call is ever made: the exact signed bytes this server
+ * consented to (message bytes identical to what the facilitator broadcasts), the blockhash the
+ * message was built against (its lifetime anchor) and, when this server fetched it, its
+ * last-valid block height, the payment identity, and the expected `(H,F)` pair the signed
+ * instruction carries. `signature` is empty until a facilitator receipt reports it.
  */
 export type PreSubmission = {
   transactionBase64: string;
   signature: string;
   blockhash: string;
+  lastValidBlockHeight?: string;
   payment: string;
   expectedHeld: string;
   expectedRefundable: string;
@@ -60,8 +70,11 @@ export type OperationRecord = {
   updatedAt: string;
   status: OperationStatus;
   authorize?: PreSubmission;
+  /** The facilitator's settle response for the authorize, including a pending or failed one. */
+  authorizeReceipt?: SettleResponse;
   handlerResult?: { ok: boolean; detail?: string };
   terminal?: PreSubmission & { op: "capture" | "void" };
+  terminalReceipt?: SettleResponse;
   note?: string;
 };
 
@@ -139,30 +152,12 @@ export class OperationStore {
       .map((f) => JSON.parse(readFileSync(join(this.dir, f), "utf8")) as OperationRecord);
   }
 
-  /** Every record stopped for manual reconciliation (never auto-retried). */
-  pending(): OperationRecord[] {
-    return this.list().filter((r) => r.status === "pending" || r.status === "authorize-pending" || r.status === "terminal-pending");
+  /**
+   * Every record that is not settled: unresolved outcomes, refused terminal settles, and any
+   * intermediate status a crash or lost response left behind (`reserved`, `authorizing`,
+   * `handler-*`, `terminal-settling`, ...). Never auto-retried; listed for manual reconciliation.
+   */
+  unresolved(): OperationRecord[] {
+    return this.list().filter((r) => !SETTLED_STATUSES.has(r.status));
   }
-}
-
-/**
- * Inspects live chain state for a non-terminal record and reports what it finds. Never
- * resubmits, re-signs, or marks anything completed on its own — reconciliation is a read-only
- * diagnostic; an operator uses `OperationStore.update` to close the entry out only after
- * deciding what the real outcome was.
- */
-export async function reconcileEntry(
-  store: OperationStore,
-  ledger: Ledger,
-  programId: Address,
-  fp: string,
-): Promise<{ record: OperationRecord; onchainPayment?: { exists: boolean; held?: string; refundable?: string } }> {
-  const record = store.read(fp);
-  if (!record) throw new Error(`no reservation for fingerprint ${fp}`);
-  if (!record.authorize) return { record };
-  const account = await ledger.getAccount(record.authorize.payment as Address);
-  if (!account || account.owner !== programId) return { record, onchainPayment: { exists: false } };
-  const decoded = decodePayment(account.data);
-  if (!decoded) return { record, onchainPayment: { exists: false } };
-  return { record, onchainPayment: { exists: true, held: decoded.held.toString(), refundable: decoded.refundable.toString() } };
 }

@@ -11,8 +11,9 @@ import { type Address, createKeyPairSignerFromBytes, type KeyPairSigner } from "
 import { loadDeploymentRecord } from "./deployment-record.ts";
 import { Facilitator } from "./facilitator.ts";
 import { createGatewayApp } from "./gateway.ts";
-import { RpcLedger } from "./rpc-ledger.ts";
+import { redactRpcUrl, RpcLedger } from "./rpc-ledger.ts";
 import { SponsorshipGuard } from "./sponsorship.ts";
+import { FileSubmissionJournal } from "./submission-journal.ts";
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -36,7 +37,9 @@ async function main(): Promise<void> {
   const ledger = new RpcLedger({ network: record.network.caip2, genesisHash: record.network.genesisHash, rpcUrl });
   await ledger.verifyGenesis();
 
-  const facilitator = new Facilitator({ network: record.network.caip2, programId: record.programId, feePayer, ledger });
+  // The exact co-signed bytes, signature, and blockhash of every broadcast are written here first.
+  const journal = new FileSubmissionJournal(requireEnv("SAC006_FACILITATOR_JOURNAL_DIR"));
+  const facilitator = new Facilitator({ network: record.network.caip2, programId: record.programId, feePayer, ledger, journal });
   const sponsorship = new SponsorshipGuard({
     ledger,
     feePayer: feePayer.address,
@@ -56,7 +59,7 @@ async function main(): Promise<void> {
   const hostname = process.env.SAC006_HOST ?? "127.0.0.1";
   serve({ fetch: app.fetch, port, hostname }, (info) => {
     console.log(`SAC-006 facilitator listening on http://${hostname}:${info.port}`);
-    console.log(`network=${facilitator.network} program=${record.programId} rpc=${rpcUrl}`);
+    console.log(`network=${facilitator.network} program=${record.programId} rpc=${redactRpcUrl(rpcUrl)}`);
   });
 }
 

@@ -6,6 +6,7 @@
 import {
   type Address,
   type CompiledTransactionMessage,
+  getBase64EncodedWireTransaction,
   getBase64Encoder,
   getCompiledTransactionMessageDecoder,
   getPublicKeyFromAddress,
@@ -20,7 +21,7 @@ import {
   verifySignature,
 } from "@solana/kit";
 import { AccountState, getMintDecoder, getTokenDecoder } from "@solana-program/token";
-import type { Ledger } from "./ledger.ts";
+import type { Ledger, SubmitResult } from "./ledger.ts";
 import {
   type AccountSlot,
   ata,
@@ -39,8 +40,11 @@ import {
   U64_MAX,
   voidAccounts,
 } from "./program.ts";
+import { messageHash, type SubmissionJournal, type SubmissionOutcome } from "./submission-journal.ts";
 import {
+  EXTRA_KEYS,
   type FacilitatorRequest,
+  isObject,
   type OperationResult,
   type PaymentRequirements,
   Reason,
@@ -64,6 +68,12 @@ export type FacilitatorConfig = {
   /** Bounds on the optional compute-budget instructions the sponsor pays for. */
   maxComputeUnitLimit?: number;
   maxComputeUnitPriceMicroLamports?: bigint;
+  /**
+   * Durable record of the exact co-signed bytes, signature, and blockhash lifetime, written
+   * before every broadcast (`submission-journal.ts`). Required by the Devnet runtime; optional
+   * for the bounded SAC-004 endpoint exercise, which claims no recovery behavior.
+   */
+  journal?: SubmissionJournal;
 };
 
 class Rejection extends Error {
@@ -88,6 +98,8 @@ type Verified = {
   transaction: Transaction;
   payer: Address;
   result: OperationResult;
+  /** The stored `(H,F)` pair the signed instruction expects (authorize: the empty `(0,0)`). */
+  expected: { held: bigint; refundable: bigint };
 };
 
 type Terms = {
@@ -104,10 +116,6 @@ const tokenDecoder = getTokenDecoder();
 const mintDecoder = getMintDecoder();
 const base64 = getBase64Encoder();
 
-/** The only `extra` fields of the supported profile; see integration/README.md. */
-const EXTRA_KEYS = new Set(["paymentFlow", "captureDeadline", "refundDeadline", "programId", "feePayer"]);
-
-const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 
 /** The exact message bytes a `/settle` body would broadcast, or undefined if it carries none. */
 function messageKey(body: unknown): string | undefined {
@@ -143,6 +151,20 @@ function parseAddress(value: unknown, reason: ReasonCode, field: string): Addres
   return value;
 }
 
+/**
+ * The one classification of an adapter result, used for both the journal and the response. A
+ * malformed or mislabeled result (no finalized commitment, unknown status) is unresolved: never
+ * reclassified as not-submitted, because an earlier broadcast may land.
+ */
+function classify(outcome: SubmitResult): { result: SubmissionOutcome; detail?: string } {
+  if (outcome.kind === "not-submitted") return { result: "not-submitted", detail: outcome.reason };
+  const r = outcome.outcome;
+  if (!r || r.commitment !== "finalized") return { result: "unresolved" };
+  if (r.status === "succeeded") return { result: "finalized-succeeded" };
+  if (r.status === "failed") return { result: "finalized-failed", detail: r.error };
+  return { result: "unresolved" };
+}
+
 export class Facilitator {
   readonly network: string;
   readonly programId: Address;
@@ -150,6 +172,7 @@ export class Facilitator {
   private readonly ledger: Ledger;
   private readonly maxUnitLimit: number;
   private readonly maxUnitPrice: bigint;
+  private readonly journal?: SubmissionJournal;
   /**
    * Settlements in flight in this process, keyed by the exact message bytes of the validated
    * transaction. A concurrent identical `/settle` must not submit twice for one economic event;
@@ -168,6 +191,7 @@ export class Facilitator {
     this.ledger = config.ledger;
     this.maxUnitLimit = config.maxComputeUnitLimit ?? 400_000;
     this.maxUnitPrice = config.maxComputeUnitPriceMicroLamports ?? 10_000n;
+    this.journal = config.journal;
   }
 
   get feePayerAddress(): Address {
@@ -245,24 +269,40 @@ export class Facilitator {
     const signed = await partiallySignTransaction([this.feePayer.keyPair], verified.transaction);
     const signature = getSignatureFromTransaction(signed);
     const base = { transaction: signature, network: this.network, payer: verified.payer };
-    let outcome;
+    if (this.journal) {
+      try {
+        this.journal.prepare({
+          signature,
+          messageHash: messageHash(signed.messageBytes),
+          transactionBase64: getBase64EncodedWireTransaction(signed),
+          blockhash: messageDecoder.decode(signed.messageBytes).lifetimeToken,
+          operation: verified.result.operation,
+          payment: verified.result.payment,
+          payer: verified.payer,
+          expectedHeld: verified.expected.held.toString(),
+          expectedRefundable: verified.expected.refundable.toString(),
+        });
+      } catch (e) {
+        // Nothing was broadcast: without a durable pre-broadcast record the bytes never leave.
+        console.error(`submission journal write failed for ${signature}; not broadcasting:`, e);
+        return { success: false, errorReason: Reason.settlementNotSubmitted, transaction: "", network: this.network, payer: verified.payer };
+      }
+    }
+    let outcome: SubmitResult;
     try {
       outcome = await this.ledger.submit(signed);
-    } catch {
+    } catch (e) {
+      this.recordOutcome(signature, "submit-threw", e instanceof Error ? e.message : String(e));
       return { success: false, errorReason: Reason.settlementPending, ...base };
     }
+    const { result, detail } = classify(outcome);
+    this.recordOutcome(signature, result, detail);
     // The adapter established the exact bytes were never broadcast: a non-pending failure with
     // an empty transaction. A retry of the same bytes is fresh, not a second movement.
-    if (outcome.kind === "not-submitted") {
+    if (result === "not-submitted") {
       return { success: false, errorReason: Reason.settlementNotSubmitted, transaction: "", network: this.network, ...(verified.payer ? { payer: verified.payer } : {}) };
     }
-    // Broadcast but unresolved, or a malformed/mislabeled adapter result: stay pending with the
-    // broadcast signature. Never reclassified as not-submitted; an earlier broadcast may land.
-    const result = outcome.outcome;
-    if (!result || result.commitment !== "finalized") {
-      return { success: false, errorReason: Reason.settlementPending, ...base };
-    }
-    if (result.status === "succeeded") {
+    if (result === "finalized-succeeded") {
       // A void settles nothing to the server: omit the generic `amount` and keep the released
       // hold only in the extension result, so generic consumers never read it as revenue.
       return {
@@ -272,8 +312,19 @@ export class Facilitator {
         extensions: { [RESULT_KEY]: verified.result },
       };
     }
-    if (result.status === "failed") return { success: false, errorReason: Reason.transactionState, ...base };
+    if (result === "finalized-failed") return { success: false, errorReason: Reason.transactionState, ...base };
+    // Broadcast but unresolved: stay pending with the broadcast signature.
     return { success: false, errorReason: Reason.settlementPending, ...base };
+  }
+
+  /** Evidence only: a failure to record the outcome never changes the settlement response. */
+  private recordOutcome(signature: string, result: SubmissionOutcome, detail?: string): void {
+    if (!this.journal) return;
+    try {
+      this.journal.resolve(signature, { result, recordedAt: new Date().toISOString(), ...(detail ? { detail } : {}) });
+    } catch (e) {
+      console.error(`submission journal outcome write failed for ${signature} (${result}):`, e);
+    }
   }
 
   private async check(body: unknown): Promise<Verified> {
@@ -308,7 +359,7 @@ export class Facilitator {
     if (!isObject(extra)) reject(Reason.invalidRequirements, "extra must be an object");
     // Zero-fee, single-wallet, escrow-only profile: any other selector (fee bounds, operator,
     // transfer method, capture mode, ...) is unsupported and rejected, never ignored.
-    const unsupported = Object.keys(extra).filter((k) => !EXTRA_KEYS.has(k));
+    const unsupported = Object.keys(extra).filter((k) => !EXTRA_KEYS.includes(k));
     if (unsupported.length > 0) reject(Reason.unsupportedExtra, `unsupported extra fields: ${unsupported.join(", ")}`);
     // Escrow is the scheme default; any other flow or an unknown value is unsupported.
     if (extra.paymentFlow !== undefined && extra.paymentFlow !== "escrow") reject(Reason.paymentFlow, "only paymentFlow=escrow is supported");
@@ -520,6 +571,7 @@ export class Facilitator {
       transaction,
       payer,
       result: { operation: "authorize", payment, amount: terms.maximum.toString(), held: terms.maximum.toString(), refundable: "0" },
+      expected: { held: 0n, refundable: 0n },
     };
   }
 
@@ -629,7 +681,7 @@ export class Facilitator {
       return reject(Reason.instructionData, "unsupported instruction", payer);
     }
     await this.simulate(transaction, payer);
-    return { transaction, payer, result };
+    return { transaction, payer, result, expected: { held: stored.held, refundable: stored.refundable } };
   }
 
   /** Explicit payload fields must equal the signed instruction; the signed bytes are what executes. */
