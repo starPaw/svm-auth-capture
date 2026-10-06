@@ -10,7 +10,11 @@
   "scripts": {
     "typecheck": "tsc -p .",
     "test": "vitest run",
-    "devnet": "node --experimental-strip-types src/devnet-server.ts"
+    "devnet": "node --experimental-strip-types src/devnet-server.ts",
+    "devnet:resource": "node --experimental-strip-types src/devnet-resource-server.ts",
+    "devnet:client": "node --experimental-strip-types src/client.ts",
+    "devnet:reclaim": "node --experimental-strip-types src/reclaim.ts",
+    "devnet:reconcile": "node --experimental-strip-types src/reconcile.ts"
   },
   "dependencies": {
     "@hono/node-server": "2.1.3",
