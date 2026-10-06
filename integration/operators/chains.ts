@@ -205,8 +205,8 @@ async function main(): Promise<void> {
   // ---- Payer-direct reclaim of the remaining holds (D: uncaptured; E: after a partial capture).
   for (const [label, p] of [["D", pD], ["E", pE]] as const) {
     const before = await snapshot(c, `${label} before payer reclaim`, p);
-    const result = await submitReclaim({ ledger, programId: record.programId, payer, payment: p, lifetime: await lifetime() });
-    emit(`${label} payer reclaim`, { result });
+    const { signature, result } = await submitReclaim({ ledger, programId: record.programId, payer, payment: p, lifetime: await lifetime() });
+    emit(`${label} payer reclaim`, { signature, slot: await slotOf(c, signature), result });
     check(result.kind === "submitted" && result.outcome?.status === "succeeded", `${label} reclaim finalized`);
     const after = await snapshot(c, `${label} after payer reclaim`, p, BigInt(before.payment!.slot));
     check(

@@ -133,8 +133,9 @@ run 20-chains "${NODE[@]}" evidence/chains.ts
 step "6. fault injection around the real adapter (criterion 3)"
 run 30-fault-injection "${NODE[@]}" evidence/fault-injection.ts
 
-step "final state"
+step "final state and per-payment transaction history"
 run 99-final "${NODE[@]}" evidence/snapshot.ts final
+run 99-history "${NODE[@]}" evidence/history.ts
 
 step "secret scan"
 query="${SOLANA_RPC_URL#*\?}"

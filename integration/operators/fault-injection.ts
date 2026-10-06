@@ -20,7 +20,7 @@ import { reconcileEntry } from "../src/reconciliation.ts";
 import { createResourceApp, type HandlerResult } from "../src/resource-server.ts";
 import { SponsorshipGuard } from "../src/sponsorship.ts";
 import { FileSubmissionJournal } from "../src/submission-journal.ts";
-import { check, context, emit, snapshot, waitForClock } from "./lib.ts";
+import { check, context, emit, slotOf, snapshot, waitForClock } from "./lib.ts";
 
 type Fault = "lost" | "weak";
 
@@ -281,8 +281,8 @@ async function main(): Promise<void> {
       emit("no hold to reclaim", { payment, state: before.payment });
       continue;
     }
-    const result = await submitReclaim({ ledger: real, programId: record.programId, payer, payment, lifetime: await real.latestBlockhash() });
-    emit("payer reclaim", { payment, result });
+    const { signature, result } = await submitReclaim({ ledger: real, programId: record.programId, payer, payment, lifetime: await real.latestBlockhash() });
+    emit("payer reclaim", { payment, signature, slot: await slotOf(c, signature), result });
     const after = await snapshot(c, "after reclaim", payment, BigInt(before.payment!.slot));
     check(after.payment?.held === "0" && BigInt(after.payerAta) === BigInt(before.payerAta) + BigInt(before.payment!.held!), "payer recovered exactly the hold");
   }
