@@ -8,7 +8,7 @@
 import { readFileSync } from "node:fs";
 import { serve } from "@hono/node-server";
 import { type Address, createKeyPairSignerFromBytes, type KeyPairSigner } from "@solana/kit";
-import { loadDeploymentRecord } from "./deployment-record.ts";
+import { ACCEPTED_DEPLOYMENT_RECORD, loadDeploymentRecord } from "./deployment-record.ts";
 import { Facilitator } from "./facilitator.ts";
 import { createGatewayApp } from "./gateway.ts";
 import { redactRpcUrl, RpcLedger } from "./rpc-ledger.ts";
@@ -60,6 +60,7 @@ async function main(): Promise<void> {
   serve({ fetch: app.fetch, port, hostname }, (info) => {
     console.log(`SAC-006 facilitator listening on http://${hostname}:${info.port}`);
     console.log(`network=${facilitator.network} program=${record.programId} rpc=${redactRpcUrl(rpcUrl)}`);
+    console.log(`deployment record sha256=${record.sha256} (${ACCEPTED_DEPLOYMENT_RECORD.path} at ${ACCEPTED_DEPLOYMENT_RECORD.revision})`);
   });
 }
 

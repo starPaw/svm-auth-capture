@@ -121,9 +121,17 @@ export async function payForResource(o: {
   latestBlockhash: () => Promise<Lifetime>;
   salt?: Uint8Array;
   fetchImpl?: typeof fetch;
+  /**
+   * Bound on each HTTP request, body included. The paid request spans two facilitator settles
+   * (each bounded by the resource server at 150s by default), a blockhash read, and the handler,
+   * so the default is 400s. On expiry this throws; the payment may still complete, and the
+   * resource server's journal and `PAYMENT-RESPONSE` on a retry are not available to the client.
+   */
+  requestTimeoutMs?: number;
 }): Promise<PaidResponse> {
   const fetchImpl = o.fetchImpl ?? fetch;
-  const challenge = await fetchImpl(o.resourceUrl);
+  const timeoutMs = o.requestTimeoutMs ?? 400_000;
+  const challenge = await fetchImpl(o.resourceUrl, { signal: AbortSignal.timeout(timeoutMs) });
   if (challenge.status !== 402) throw new Error(`expected 402 Payment Required, got ${challenge.status}`);
   const header = challenge.headers.get(PAYMENT_REQUIRED_HEADER);
   if (!header) throw new Error(`402 carried no ${PAYMENT_REQUIRED_HEADER} header`);
@@ -133,6 +141,7 @@ export async function payForResource(o: {
   const tx = await signAuthorize(o.payer, offer, o.policy, o.salt ?? new Uint8Array(randomBytes(32)), await o.latestBlockhash());
   const res = await fetchImpl(o.resourceUrl, {
     headers: { [PAYMENT_SIGNATURE_HEADER]: encodeHeader(authorizePaymentPayload(paymentRequired, offer.requirements, tx)) },
+    signal: AbortSignal.timeout(timeoutMs),
   });
   const responseHeader = res.headers.get(PAYMENT_RESPONSE_HEADER);
   return { status: res.status, body: await res.json(), ...(responseHeader ? { paymentResponse: decodeHeader(responseHeader) } : {}), offer };

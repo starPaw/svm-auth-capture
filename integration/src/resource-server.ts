@@ -69,6 +69,14 @@ export type ResourceServerConfig = {
   now: () => bigint | Promise<bigint>;
   handler: (ctx: { payer: Address; payment: Address }) => Promise<HandlerResult>;
   fetchImpl?: typeof fetch;
+  /**
+   * Bound on one `/settle` call, response body included. Expiry is safe — the outcome is recorded
+   * unresolved for reconciliation, never treated as not executed or retried — but an expiry
+   * before the facilitator finishes turns a settlement into manual work. The default (150s) sits
+   * above the facilitator's worst case with default `RpcLedger` bounds: about nine 10s preflight
+   * reads plus the 30s settlement deadline and one 10s log fetch.
+   */
+  facilitatorTimeoutMs?: number;
 };
 
 const RESOURCE_PATH = "/resource";
@@ -253,12 +261,14 @@ async function settle(config: ResourceServerConfig, body: unknown): Promise<Sett
     receipt: { success: false, errorReason: Reason.settlementPending, transaction: "", network: config.network },
     detail,
   });
+  const signal = AbortSignal.timeout(config.facilitatorTimeoutMs ?? 150_000);
   let res: Response;
   try {
     res = await (config.fetchImpl ?? fetch)(`${config.facilitatorUrl}/settle`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${config.bearerToken}` },
       body: JSON.stringify(body),
+      signal,
     });
   } catch (e) {
     return pending(`facilitator response lost: ${e instanceof Error ? e.message : String(e)}`);
@@ -266,8 +276,8 @@ async function settle(config: ResourceServerConfig, body: unknown): Promise<Sett
   let json: unknown;
   try {
     json = await res.json();
-  } catch {
-    return pending(`facilitator answered HTTP ${res.status} without a readable JSON body`);
+  } catch (e) {
+    return pending(`facilitator answered HTTP ${res.status} without a readable JSON body: ${e instanceof Error ? e.message : String(e)}`);
   }
   if (!isSettleResponse(json)) {
     if (GATEWAY_REFUSALS.has(res.status)) {

@@ -44,9 +44,15 @@ export type RpcLedgerConfig = {
   /** Full base58 genesis hash the configured RPC endpoint must observe; checked by `verifyGenesis`. */
   genesisHash: string;
   rpcUrl: string;
-  /** Bounded wait for `submit` to observe a finalized result, in milliseconds. Default 30s. */
+  /**
+   * Settlement deadline for `submit`, in milliseconds from the moment it is called: it bounds the
+   * `sendTransaction` call (itself also limited to `requestTimeoutMs`) and every status request
+   * after it. A finalized failure's log fetch gets one further `requestTimeoutMs`. Default 30s.
+   */
   confirmTimeoutMs?: number;
   pollIntervalMs?: number;
+  /** Bound on every other single RPC request (reads, simulation, genesis). Default 10s. */
+  requestTimeoutMs?: number;
   /** Test seam: injects an RPC client instead of creating one from `rpcUrl`. Unused in production. */
   rpc?: Rpc<SolanaRpcApi>;
 };
@@ -73,6 +79,38 @@ export function redactRpcUrl(url: string): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** A network await that did not finish by its deadline; what it would have returned is unknown. */
+export class RpcDeadlineExceeded extends Error {
+  constructor() {
+    super("RPC request did not complete before its deadline");
+  }
+}
+
+/**
+ * Runs one RPC request that must finish by `deadline` (epoch ms). The request receives an abort
+ * signal, and the wait is raced against the deadline too, so a transport that ignores aborts
+ * still cannot hold the caller past it.
+ */
+async function byDeadline<T>(deadline: number, request: (abortSignal: AbortSignal) => Promise<T>): Promise<T> {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) throw new RpcDeadlineExceeded();
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      // Reject first, so a transport that rejects synchronously on abort cannot win the race
+      // with its own error.
+      reject(new RpcDeadlineExceeded());
+      controller.abort();
+    }, remaining);
+  });
+  try {
+    return await Promise.race([request(controller.signal), expired]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**
@@ -108,6 +146,7 @@ export class RpcLedger implements Ledger, ChainReader {
   private readonly rpc: Rpc<SolanaRpcApi>;
   private readonly confirmTimeoutMs: number;
   private readonly pollIntervalMs: number;
+  private readonly requestTimeoutMs: number;
 
   // Plain-field assignment, not a TS constructor parameter property: this file must stay runnable
   // under Node's `--experimental-strip-types`, which does not support parameter properties.
@@ -118,6 +157,13 @@ export class RpcLedger implements Ledger, ChainReader {
     this.rpc = config.rpc ?? createSolanaRpc(config.rpcUrl);
     this.confirmTimeoutMs = config.confirmTimeoutMs ?? 30_000;
     this.pollIntervalMs = config.pollIntervalMs ?? 1_000;
+    this.requestTimeoutMs = config.requestTimeoutMs ?? 10_000;
+    if (!(this.confirmTimeoutMs > 0) || !(this.requestTimeoutMs > 0)) throw new Error("RpcLedger timeouts must be positive");
+  }
+
+  /** One bounded RPC request outside the settlement path. */
+  private request<T>(send: (abortSignal: AbortSignal) => Promise<T>): Promise<T> {
+    return byDeadline(Date.now() + this.requestTimeoutMs, send);
   }
 
   /**
@@ -125,35 +171,35 @@ export class RpcLedger implements Ledger, ChainReader {
    * configured RPC endpoint whose genesis does not match the pinned deployment record.
    */
   async verifyGenesis(): Promise<void> {
-    const observed = await this.rpc.getGenesisHash().send();
+    const observed = await this.request((abortSignal) => this.rpc.getGenesisHash().send({ abortSignal }));
     if (observed !== this.genesisHash) {
       throw new Error(`RpcLedger genesis mismatch at ${redactRpcUrl(this.rpcUrl)}: configured ${this.genesisHash}, observed ${observed}`);
     }
   }
 
   async now(): Promise<bigint> {
-    const { value } = await this.rpc.getAccountInfo(CLOCK_SYSVAR, { encoding: "base64" }).send();
+    const { value } = await this.request((abortSignal) => this.rpc.getAccountInfo(CLOCK_SYSVAR, { encoding: "base64" }).send({ abortSignal }));
     if (!value) throw new Error("RpcLedger.now: Clock sysvar account not found");
     return decodeClockUnixTimestamp(decodeBase64(value.data[0]));
   }
 
   /** A finalized blockhash and its last valid block height, for building a new transaction. */
   async latestBlockhash(): Promise<Lifetime> {
-    const { value } = await this.rpc.getLatestBlockhash({ commitment: "finalized" }).send();
+    const { value } = await this.request((abortSignal) => this.rpc.getLatestBlockhash({ commitment: "finalized" }).send({ abortSignal }));
     return { blockhash: value.blockhash, lastValidBlockHeight: value.lastValidBlockHeight };
   }
 
   async getAccount(address: Address): Promise<LedgerAccount | null> {
-    const { value } = await this.rpc.getAccountInfo(address, { encoding: "base64" }).send();
+    const { value } = await this.request((abortSignal) => this.rpc.getAccountInfo(address, { encoding: "base64" }).send({ abortSignal }));
     if (!value) return null;
     return { owner: value.owner, data: decodeBase64(value.data[0]), lamports: value.lamports, executable: value.executable };
   }
 
   async simulate(transaction: Transaction): Promise<SimulationOutcome> {
     const wire = getBase64EncodedWireTransaction(transaction);
-    const { value } = await this.rpc
-      .simulateTransaction(wire, { encoding: "base64", sigVerify: false, replaceRecentBlockhash: false })
-      .send();
+    const { value } = await this.request((abortSignal) =>
+      this.rpc.simulateTransaction(wire, { encoding: "base64", sigVerify: false, replaceRecentBlockhash: false }).send({ abortSignal }),
+    );
     if (value.err === null) return { ok: true };
     return { ok: false, error: JSON.stringify(value.err), logs: [...(value.logs ?? [])] };
   }
@@ -161,12 +207,19 @@ export class RpcLedger implements Ledger, ChainReader {
   async submit(transaction: Transaction): Promise<SubmitResult> {
     const wire = getBase64EncodedWireTransaction(transaction);
     const expectedSignature = getSignatureFromTransaction(transaction);
+    // The settlement deadline starts before the broadcast: it bounds the send itself and every
+    // status/log request after it.
+    const deadline = Date.now() + this.confirmTimeoutMs;
 
     let signature: string;
     try {
-      signature = await this.rpc
-        .sendTransaction(wire, { encoding: "base64", skipPreflight: false, preflightCommitment: "processed", maxRetries: 0n })
-        .send();
+      // The send gets its own bound inside the settlement deadline, so a slow send cannot use up
+      // the whole polling budget.
+      signature = await byDeadline(Math.min(deadline, Date.now() + this.requestTimeoutMs), (abortSignal) =>
+        this.rpc
+          .sendTransaction(wire, { encoding: "base64", skipPreflight: false, preflightCommitment: "processed", maxRetries: 0n })
+          .send({ abortSignal }),
+      );
     } catch (error) {
       if (isSolanaError(error, SOLANA_ERROR__JSON_RPC__SERVER_ERROR_SEND_TRANSACTION_PREFLIGHT_FAILURE)) {
         const cause = (error as { cause?: unknown }).cause;
@@ -178,7 +231,7 @@ export class RpcLedger implements Ledger, ChainReader {
           // says this exact signature is in the status cache, and `BlockhashNotFound` can follow
           // an earlier broadcast of the same bytes whose blockhash has since aged out. Resolve the
           // original signature's own outcome; until it is finalized it stays unresolved.
-          return { kind: "submitted", outcome: await this.pollForFinalized(expectedSignature) };
+          return { kind: "submitted", outcome: await this.pollForFinalized(expectedSignature, deadline) };
         }
         if (cause === undefined) {
           // A preflight refusal with no transaction error attached is a malformed response: it
@@ -189,9 +242,9 @@ export class RpcLedger implements Ledger, ChainReader {
         // before broadcasting them: this call put nothing on the cluster.
         return { kind: "not-submitted", reason: `${error.message}: ${describe(cause)}` };
       }
-      // Any other failure (transport error, timeout, malformed response) cannot prove the exact
-      // bytes were never broadcast: stay in the ambiguous `submitted` branch, never guess
-      // `not-submitted`.
+      // Any other failure (transport error, an expired deadline, a malformed response) cannot
+      // prove the exact bytes were never broadcast: stay in the ambiguous `submitted` branch,
+      // never guess `not-submitted`, and never send again.
       return { kind: "submitted" };
     }
 
@@ -201,16 +254,16 @@ export class RpcLedger implements Ledger, ChainReader {
       return { kind: "submitted" };
     }
 
-    return { kind: "submitted", outcome: await this.pollForFinalized(signature) };
+    return { kind: "submitted", outcome: await this.pollForFinalized(signature, deadline) };
   }
 
-  private async pollForFinalized(signature: string): Promise<FinalizedOutcome | undefined> {
-    const deadline = Date.now() + this.confirmTimeoutMs;
+  /** Polls the exact signature until `deadline`; every request, sleep, and log fetch ends by then. */
+  private async pollForFinalized(signature: string, deadline: number): Promise<FinalizedOutcome | undefined> {
     while (Date.now() < deadline) {
       try {
-        const { value } = await this.rpc
-          .getSignatureStatuses([asSignature(signature)], { searchTransactionHistory: true })
-          .send();
+        const { value } = await byDeadline(deadline, (abortSignal) =>
+          this.rpc.getSignatureStatuses([asSignature(signature)], { searchTransactionHistory: true }).send({ abortSignal }),
+        );
         const status = value[0];
         if (status && status.confirmationStatus === "finalized") {
           if (status.err === null) return { status: "succeeded", commitment: "finalized" };
@@ -219,11 +272,11 @@ export class RpcLedger implements Ledger, ChainReader {
         // `null` (missing history) or a weaker commitment is missing evidence, not proof of
         // non-finality: keep polling within the bounded wait.
       } catch {
-        // A transport/lookup failure here is also missing evidence, not proof of anything.
+        // A transport/lookup failure or expired request is also missing evidence, not proof.
       }
-      await sleep(this.pollIntervalMs);
+      await sleep(Math.min(this.pollIntervalMs, Math.max(0, deadline - Date.now())));
     }
-    // Bounded wait exhausted without a finalized status: stays ambiguous, never guessed.
+    // Deadline reached without a finalized status: stays ambiguous, never guessed or resent.
     return undefined;
   }
 
@@ -232,7 +285,9 @@ export class RpcLedger implements Ledger, ChainReader {
 
   async getSignatureStatus(signature: string): Promise<SignatureLookup> {
     try {
-      const { value } = await this.rpc.getSignatureStatuses([asSignature(signature)], { searchTransactionHistory: true }).send();
+      const { value } = await this.request((abortSignal) =>
+        this.rpc.getSignatureStatuses([asSignature(signature)], { searchTransactionHistory: true }).send({ abortSignal }),
+      );
       const status = value[0];
       if (!status) return { kind: "not-found" };
       const commitment = status.confirmationStatus;
@@ -246,12 +301,17 @@ export class RpcLedger implements Ledger, ChainReader {
   }
 
   async findSignaturesByMessage(address: Address, messageBytes: Uint8Array): Promise<MessageSearch> {
+    // One deadline for the whole search, not per request: a slow RPC cannot stretch it to
+    // `MESSAGE_SEARCH_LIMIT` request timeouts.
+    const deadline = Date.now() + this.confirmTimeoutMs;
     try {
-      const entries = await this.rpc.getSignaturesForAddress(address, { limit: MESSAGE_SEARCH_LIMIT, commitment: "confirmed" }).send();
+      const entries = await byDeadline(deadline, (abortSignal) =>
+        this.rpc.getSignaturesForAddress(address, { limit: MESSAGE_SEARCH_LIMIT, commitment: "confirmed" }).send({ abortSignal }),
+      );
       for (const entry of entries) {
-        const tx = await this.rpc
-          .getTransaction(entry.signature, { encoding: "base64", commitment: "confirmed", maxSupportedTransactionVersion: 0 })
-          .send();
+        const tx = await byDeadline(deadline, (abortSignal) =>
+          this.rpc.getTransaction(entry.signature, { encoding: "base64", commitment: "confirmed", maxSupportedTransactionVersion: 0 }).send({ abortSignal }),
+        );
         if (!tx) return { kind: "unavailable", detail: `history for ${entry.signature} is listed but not retrievable` };
         const decoded = transactionDecoder.decode(decodeBase64(tx.transaction[0]));
         // Identical message bytes always carry the identical sponsor signature: one match is all.
@@ -269,7 +329,9 @@ export class RpcLedger implements Ledger, ChainReader {
       // there and would look expired, so finalized cannot be used. A blockhash invalid at the
       // latest bank is invalid for every later bank. The returned slot is where any landing must
       // already be visible, so callers read state at a finalized slot no older than it.
-      const { context, value } = await this.rpc.isBlockhashValid(blockhash as Blockhash, { commitment: "processed" }).send();
+      const { context, value } = await this.request((abortSignal) =>
+        this.rpc.isBlockhashValid(blockhash as Blockhash, { commitment: "processed" }).send({ abortSignal }),
+      );
       return { kind: "ok", valid: value, slot: BigInt(context.slot) };
     } catch (error) {
       return { kind: "unavailable", detail: describe(error) };
@@ -283,9 +345,9 @@ export class RpcLedger implements Ledger, ChainReader {
     let detail = "finalized bank did not reach the required slot";
     do {
       try {
-        const { context, value } = await this.rpc
-          .getAccountInfo(address, { encoding: "base64", commitment: "finalized", minContextSlot })
-          .send();
+        const { context, value } = await byDeadline(deadline, (abortSignal) =>
+          this.rpc.getAccountInfo(address, { encoding: "base64", commitment: "finalized", minContextSlot }).send({ abortSignal }),
+        );
         const account = value
           ? { owner: value.owner, data: decodeBase64(value.data[0]), lamports: value.lamports, executable: value.executable }
           : null;
@@ -293,16 +355,21 @@ export class RpcLedger implements Ledger, ChainReader {
       } catch (error) {
         detail = describe(error);
       }
-      await sleep(this.pollIntervalMs);
+      await sleep(Math.min(this.pollIntervalMs, Math.max(0, deadline - Date.now())));
     } while (Date.now() < deadline);
     return { kind: "unavailable", detail };
   }
 
+  /**
+   * Logs are auxiliary to an already-established finalized failure: one request with its own
+   * bound (so a failure seen at the end of the settlement window still gets a chance at its
+   * diagnostics), and an empty list when they cannot be fetched.
+   */
   private async fetchFinalizedLogs(signature: string): Promise<string[]> {
     try {
-      const tx = await this.rpc
-        .getTransaction(asSignature(signature), { commitment: "finalized", encoding: "json" })
-        .send();
+      const tx = await this.request((abortSignal) =>
+        this.rpc.getTransaction(asSignature(signature), { commitment: "finalized", encoding: "json" }).send({ abortSignal }),
+      );
       return [...(tx?.meta?.logMessages ?? [])];
     } catch {
       return [];

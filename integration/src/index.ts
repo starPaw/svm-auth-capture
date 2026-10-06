@@ -1,6 +1,6 @@
 export { createApp } from "./app.ts";
 export { callerIdentity, requireBearerToken } from "./auth.ts";
-export { type DeploymentRecord, loadDeploymentRecord } from "./deployment-record.ts";
+export { ACCEPTED_DEPLOYMENT_RECORD, type DeploymentRecord, loadDeploymentRecord, parseDeploymentRecord } from "./deployment-record.ts";
 export { COMPUTE_BUDGET_PROGRAM_ADDRESS, Facilitator, type FacilitatorConfig } from "./facilitator.ts";
 export { createGatewayApp, type GatewayConfig } from "./gateway.ts";
 export type { FinalizedOutcome, Ledger, LedgerAccount, SimulationOutcome, SubmitResult } from "./ledger.ts";

@@ -323,6 +323,24 @@ describe("unresolved and refused settlements keep their evidence and never compl
     expect(record.handlerResult).toEqual({ ok: true });
   });
 
+  test("a facilitator that never answers is cut off at facilitatorTimeoutMs and stays unresolved", async () => {
+    const hanging: typeof fetch = (_input, init) =>
+      new Promise((_, reject) => init?.signal?.addEventListener("abort", () => reject(init.signal!.reason)));
+    const app = await startServer(createResourceApp(resourceConfig({ fetchImpl: hanging, facilitatorTimeoutMs: 50 })));
+    try {
+      const calledBefore = handlerCalls;
+      const start = Date.now();
+      const res = await pay(app.url);
+      expect(Date.now() - start).toBeLessThan(2_000);
+      expect(res.status).toBe(402);
+      expect(handlerCalls).toBe(calledBefore);
+      const record = store.list().find((r) => r.status === "authorize-pending" && /timeout|abort/i.test(r.note ?? ""))!;
+      expect(record.note).toMatch(/facilitator response lost/);
+    } finally {
+      await app.close();
+    }
+  });
+
   test("an unrecognized facilitator reason is unresolved, never a definitive rejection", async () => {
     const unknown: typeof fetch = async () =>
       new Response(JSON.stringify({ success: false, errorReason: "some_future_reason", transaction: "FutureSig", network: h.ledger.network }), { status: 200 });

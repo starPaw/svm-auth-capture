@@ -4,9 +4,6 @@
 // or failed), including the bounded-timeout, signature-mismatch, and already-processed edge
 // cases (the latter through the installed SDK's own JSON-RPC error conversion), and the
 // read-only `ChainReader` evidence used by reconciliation.
-import { mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import {
   type Address,
   generateKeyPairSigner,
@@ -22,8 +19,7 @@ import {
 } from "@solana/kit";
 import { getTransferSolInstruction } from "@solana-program/system";
 import { describe, expect, test } from "vitest";
-import { loadDeploymentRecord } from "../src/deployment-record.js";
-import { cachedClusterClock, redactRpcUrl, RpcLedger } from "../src/rpc-ledger.js";
+import { cachedClusterClock, redactRpcUrl, RpcDeadlineExceeded, RpcLedger } from "../src/rpc-ledger.js";
 import { buildTransaction } from "../src/transactions.js";
 
 const GENESIS = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG";
@@ -368,6 +364,242 @@ describe("RpcLedger.submit", () => {
   });
 });
 
+describe("RpcLedger network awaits are bounded", () => {
+  /** An RPC request that never answers, recording the abort signal it was given. */
+  function stalled(signals: AbortSignal[]) {
+    return {
+      send: (config?: { abortSignal?: AbortSignal }) => {
+        if (config?.abortSignal) signals.push(config.abortSignal);
+        return new Promise<never>(() => {});
+      },
+    };
+  }
+  const elapsed = async <T>(run: () => Promise<T>): Promise<[T, number]> => {
+    const start = Date.now();
+    const value = await run();
+    return [value, Date.now() - start];
+  };
+
+  test("a stalled sendTransaction ends at the settlement deadline as unresolved, sent once", async () => {
+    const signals: AbortSignal[] = [];
+    let sends = 0;
+    const ledger = new RpcLedger({
+      network: NETWORK,
+      genesisHash: GENESIS,
+      rpcUrl: "http://unused.invalid",
+      confirmTimeoutMs: 30,
+      pollIntervalMs: 1,
+      rpc: fakeRpc({
+        sendTransaction: () => {
+          sends += 1;
+          return stalled(signals);
+        },
+      }),
+    });
+    const transaction = await sampleTransaction();
+    const [result, ms] = await elapsed(() => ledger.submit(transaction));
+    expect(result).toEqual({ kind: "submitted" });
+    expect(ms).toBeLessThan(500);
+    expect(sends).toBe(1);
+    expect(signals[0]?.aborted).toBe(true);
+  });
+
+  test("stalled status requests end at the same deadline, never resending", async () => {
+    const transaction = await sampleTransaction();
+    const signals: AbortSignal[] = [];
+    let sends = 0;
+    const ledger = new RpcLedger({
+      network: NETWORK,
+      genesisHash: GENESIS,
+      rpcUrl: "http://unused.invalid",
+      confirmTimeoutMs: 30,
+      pollIntervalMs: 1,
+      rpc: fakeRpc({
+        sendTransaction: () => {
+          sends += 1;
+          return sendable(getSignatureFromTransaction(transaction));
+        },
+        getSignatureStatuses: () => stalled(signals),
+      }),
+    });
+    const [result, ms] = await elapsed(() => ledger.submit(transaction));
+    expect(result).toEqual({ kind: "submitted", outcome: undefined });
+    expect(ms).toBeLessThan(500);
+    expect(sends).toBe(1);
+    expect(signals.every((s) => s.aborted)).toBe(true);
+  });
+
+  test("a stalled log fetch keeps the established finalized failure, with empty logs, within its own bound", async () => {
+    const transaction = await sampleTransaction();
+    const signals: AbortSignal[] = [];
+    const ledger = new RpcLedger({
+      network: NETWORK,
+      genesisHash: GENESIS,
+      rpcUrl: "http://unused.invalid",
+      confirmTimeoutMs: 30,
+      requestTimeoutMs: 20,
+      pollIntervalMs: 1,
+      rpc: fakeRpc({
+        sendTransaction: () => sendable(getSignatureFromTransaction(transaction)),
+        getSignatureStatuses: () => sendable({ value: [{ confirmationStatus: "finalized", err: { InstructionError: [0, "Custom"] }, slot: 1n }] }),
+        getTransaction: () => stalled(signals),
+      }),
+    });
+    const [result, ms] = await elapsed(() => ledger.submit(transaction));
+    expect(result).toMatchObject({ kind: "submitted", outcome: { status: "failed", commitment: "finalized", logs: [] } });
+    expect(ms).toBeLessThan(500);
+    expect(signals[0]?.aborted).toBe(true);
+  });
+
+  test("an AlreadyProcessed poll shares the deadline that started before the send", async () => {
+    const ledger = new RpcLedger({
+      network: NETWORK,
+      genesisHash: GENESIS,
+      rpcUrl: "http://unused.invalid",
+      confirmTimeoutMs: 30,
+      pollIntervalMs: 1,
+      rpc: fakeRpc({
+        sendTransaction: () => ({ send: () => new Promise((_, reject) => setTimeout(() => reject(preflightFailure("AlreadyProcessed")), 20)) }),
+        getSignatureStatuses: () => stalled([]),
+      }),
+    });
+    const [result, ms] = await elapsed(async () => ledger.submit(await sampleTransaction()));
+    expect(result).toEqual({ kind: "submitted", outcome: undefined });
+    expect(ms).toBeLessThan(500);
+  });
+
+  test("stalled reads, simulation, and genesis checks fail with RpcDeadlineExceeded", async () => {
+    const signals: AbortSignal[] = [];
+    const ledger = new RpcLedger({
+      network: NETWORK,
+      genesisHash: GENESIS,
+      rpcUrl: "http://unused.invalid",
+      requestTimeoutMs: 20,
+      rpc: fakeRpc({
+        getGenesisHash: () => stalled(signals),
+        getAccountInfo: () => stalled(signals),
+        getLatestBlockhash: () => stalled(signals),
+        simulateTransaction: () => stalled(signals),
+      }),
+    });
+    await expect(ledger.verifyGenesis()).rejects.toBeInstanceOf(RpcDeadlineExceeded);
+    await expect(ledger.now()).rejects.toBeInstanceOf(RpcDeadlineExceeded);
+    await expect(ledger.getAccount(PROGRAM_ID)).rejects.toBeInstanceOf(RpcDeadlineExceeded);
+    await expect(ledger.latestBlockhash()).rejects.toBeInstanceOf(RpcDeadlineExceeded);
+    await expect(ledger.simulate(await sampleTransaction())).rejects.toBeInstanceOf(RpcDeadlineExceeded);
+    expect(signals).toHaveLength(5);
+    expect(signals.every((s) => s.aborted)).toBe(true);
+  });
+
+  test("a transport that rejects as soon as it is aborted still yields RpcDeadlineExceeded", async () => {
+    const ledger = new RpcLedger({
+      network: NETWORK,
+      genesisHash: GENESIS,
+      rpcUrl: "http://unused.invalid",
+      requestTimeoutMs: 20,
+      rpc: fakeRpc({
+        getGenesisHash: () => ({
+          send: ({ abortSignal }: { abortSignal: AbortSignal }) =>
+            new Promise((_, reject) => abortSignal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")))),
+        }),
+      }),
+    });
+    await expect(ledger.verifyGenesis()).rejects.toBeInstanceOf(RpcDeadlineExceeded);
+  });
+
+  test("non-positive timeouts are refused at construction", () => {
+    expect(() => new RpcLedger({ network: NETWORK, genesisHash: GENESIS, rpcUrl: "http://unused.invalid", confirmTimeoutMs: 0, rpc: fakeRpc({}) })).toThrow(/positive/);
+  });
+
+  test("a slow send is cut at requestTimeoutMs, leaving the rest of the settlement window for polling", async () => {
+    const transaction = await sampleTransaction();
+    let statusCalls = 0;
+    const ledger = new RpcLedger({
+      network: NETWORK,
+      genesisHash: GENESIS,
+      rpcUrl: "http://unused.invalid",
+      confirmTimeoutMs: 200,
+      requestTimeoutMs: 20,
+      pollIntervalMs: 1,
+      rpc: fakeRpc({
+        sendTransaction: () => stalled([]),
+        getSignatureStatuses: () => {
+          statusCalls += 1;
+          return sendable({ value: [null] });
+        },
+      }),
+    });
+    const [result, ms] = await elapsed(() => ledger.submit(transaction));
+    expect(result).toEqual({ kind: "submitted" });
+    expect(ms).toBeLessThan(150);
+    expect(statusCalls).toBe(0); // an unconfirmed send never polls a signature it cannot trust
+  });
+
+  test("a finalized failure seen at the end of the window still gets its own log fetch", async () => {
+    const transaction = await sampleTransaction();
+    const ledger = new RpcLedger({
+      network: NETWORK,
+      genesisHash: GENESIS,
+      rpcUrl: "http://unused.invalid",
+      confirmTimeoutMs: 30,
+      pollIntervalMs: 1,
+      rpc: fakeRpc({
+        sendTransaction: () => sendable(getSignatureFromTransaction(transaction)),
+        getSignatureStatuses: () => ({
+          send: () => new Promise((r) => setTimeout(() => r({ value: [{ confirmationStatus: "finalized", err: { InstructionError: [0, "Custom"] }, slot: 1n }] }), 25)),
+        }),
+        getTransaction: () => ({ send: () => new Promise((r) => setTimeout(() => r({ meta: { logMessages: ["late log"] } }), 15)) }),
+      }),
+    });
+    const result = await ledger.submit(transaction);
+    expect(result).toMatchObject({ outcome: { status: "failed", logs: ["late log"] } });
+  });
+
+  test("the history search shares one deadline across all its requests", async () => {
+    let fetched = 0;
+    const ledger = new RpcLedger({
+      network: NETWORK,
+      genesisHash: GENESIS,
+      rpcUrl: "http://unused.invalid",
+      confirmTimeoutMs: 50,
+      requestTimeoutMs: 40,
+      rpc: fakeRpc({
+        getSignaturesForAddress: () => sendable(Array.from({ length: 50 }, (_, i) => ({ signature: `s${i}` }))),
+        getTransaction: () => {
+          fetched += 1;
+          return { send: () => new Promise((r) => setTimeout(() => r({ transaction: [Buffer.from([1]).toString("base64"), "base64"] }), 15)) };
+        },
+      }),
+    });
+    const [result, ms] = await elapsed(() => ledger.findSignaturesByMessage(PROGRAM_ID, new Uint8Array([9])));
+    expect(result.kind).toBe("unavailable");
+    expect(ms).toBeLessThan(300);
+    expect(fetched).toBeLessThan(10);
+  });
+
+  test("stalled reconciliation reads report unavailable, never absence", async () => {
+    const ledger = new RpcLedger({
+      network: NETWORK,
+      genesisHash: GENESIS,
+      rpcUrl: "http://unused.invalid",
+      requestTimeoutMs: 20,
+      confirmTimeoutMs: 30,
+      pollIntervalMs: 1,
+      rpc: fakeRpc({
+        getSignatureStatuses: () => stalled([]),
+        getSignaturesForAddress: () => stalled([]),
+        isBlockhashValid: () => stalled([]),
+        getAccountInfo: () => stalled([]),
+      }),
+    });
+    const sig = getSignatureFromTransaction(await sampleTransaction());
+    expect((await ledger.getSignatureStatus(sig)).kind).toBe("unavailable");
+    expect((await ledger.findSignaturesByMessage(PROGRAM_ID, new Uint8Array([1]))).kind).toBe("unavailable");
+    expect((await ledger.isBlockhashValid("bh")).kind).toBe("unavailable");
+    expect((await ledger.getAccountAtLeast(PROGRAM_ID, 1n)).kind).toBe("unavailable");
+  });
+});
+
 describe("RpcLedger ChainReader", () => {
   const ledgerWith = (rpc: Partial<Record<keyof SolanaRpcApi, unknown>>) =>
     new RpcLedger({ network: NETWORK, genesisHash: GENESIS, rpcUrl: "http://unused.invalid", rpc: fakeRpc(rpc) });
@@ -476,45 +708,5 @@ describe("cachedClusterClock", () => {
     await clock();
     await clock();
     expect(reads).toBe(1);
-  });
-});
-
-describe("loadDeploymentRecord", () => {
-  test("accepts a verified v1 record", () => {
-    const dir = mkdtempSync(join(tmpdir(), "sac006-record-"));
-    const path = join(dir, "deployment-identity.v1.json");
-    writeFileSync(
-      path,
-      JSON.stringify({
-        schema_version: 1,
-        record_status: "verified",
-        network: { cluster: "devnet", genesis_hash: GENESIS, caip2: NETWORK },
-        program: { program_id: PROGRAM_ID, executable: true },
-      }),
-    );
-    const record = loadDeploymentRecord(path);
-    expect(record).toEqual({ network: { cluster: "devnet", genesisHash: GENESIS, caip2: NETWORK }, programId: PROGRAM_ID });
-  });
-
-  test("rejects an unpopulated template", () => {
-    const dir = mkdtempSync(join(tmpdir(), "sac006-record-"));
-    const path = join(dir, "deployment-identity.v1.json");
-    writeFileSync(path, JSON.stringify({ schema_version: 1, record_status: "template" }));
-    expect(() => loadDeploymentRecord(path)).toThrow(/record_status is "template"/);
-  });
-
-  test("rejects a CAIP-2 mismatch", () => {
-    const dir = mkdtempSync(join(tmpdir(), "sac006-record-"));
-    const path = join(dir, "deployment-identity.v1.json");
-    writeFileSync(
-      path,
-      JSON.stringify({
-        schema_version: 1,
-        record_status: "verified",
-        network: { cluster: "devnet", genesis_hash: GENESIS, caip2: "solana:wrong" },
-        program: { program_id: PROGRAM_ID, executable: true },
-      }),
-    );
-    expect(() => loadDeploymentRecord(path)).toThrow(/does not equal/);
   });
 });

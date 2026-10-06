@@ -8,7 +8,7 @@
 import { readFileSync } from "node:fs";
 import { serve } from "@hono/node-server";
 import { type Address, createKeyPairSignerFromBytes, type KeyPairSigner } from "@solana/kit";
-import { loadDeploymentRecord } from "./deployment-record.ts";
+import { ACCEPTED_DEPLOYMENT_RECORD, loadDeploymentRecord } from "./deployment-record.ts";
 import { OperationStore } from "./operation-store.ts";
 import { createResourceApp, type HandlerResult } from "./resource-server.ts";
 import { cachedClusterClock, redactRpcUrl, RpcLedger } from "./rpc-ledger.ts";
@@ -27,7 +27,7 @@ async function loadKeypair(path: string): Promise<KeyPairSigner> {
 
 /** Refuses to start against a facilitator that serves another network or sponsor. */
 async function checkFacilitator(url: string, network: string, feePayer: Address): Promise<void> {
-  const res = await fetch(`${url}/supported`);
+  const res = await fetch(`${url}/supported`, { signal: AbortSignal.timeout(10_000) });
   if (!res.ok) throw new Error(`facilitator /supported answered HTTP ${res.status}`);
   const supported = (await res.json()) as { kinds?: { scheme?: string; network?: string; extra?: { feePayer?: string } }[] };
   const kind = supported.kinds?.find((k) => k.scheme === "auth-capture" && k.network === network);
@@ -90,6 +90,7 @@ async function main(): Promise<void> {
   serve({ fetch: app.fetch, port, hostname }, (info) => {
     console.log(`SAC-006 resource server listening on http://${hostname}:${info.port}`);
     console.log(`network=${record.network.caip2} program=${record.programId} rpc=${redactRpcUrl(rpcUrl)}`);
+    console.log(`deployment record sha256=${record.sha256} (${ACCEPTED_DEPLOYMENT_RECORD.path} at ${ACCEPTED_DEPLOYMENT_RECORD.revision})`);
   });
 }
 
