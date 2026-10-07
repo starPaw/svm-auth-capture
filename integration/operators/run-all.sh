@@ -10,10 +10,17 @@
 #               SAC006_SERVER_KEYPAIR_PATH, SAC006_ASSET_MINT (classic SPL test mint; the payer
 #               and server ATAs must exist and the payer must hold >= 300 units).
 # Optional:     SAC006_DEPLOYMENT_RECORD_PATH (defaults to the accepted SAC-007 record),
-#               SAC006_PORT (8787), SAC006_RESOURCE_PORT (8788).
+#               SAC006_PORT (8787), SAC006_RESOURCE_PORT (8788),
+#               SAC006_RPC_PROVIDER=quicknode selects QUICKNODE_RPC_URL instead of SOLANA_RPC_URL.
 # Usage, from integration/:  evidence/run-all.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+case "${SAC006_RPC_PROVIDER:-configured}" in
+  configured) ;;
+  quicknode) export SOLANA_RPC_URL="${QUICKNODE_RPC_URL:?QuickNode Devnet endpoint is required}" ;;
+  *) echo "unsupported SAC006_RPC_PROVIDER; use configured or quicknode" >&2; exit 1 ;;
+esac
 
 : "${SOLANA_RPC_URL:?}" "${SAC006_FACILITATOR_KEYPAIR_PATH:?}" "${SAC006_PAYER_KEYPAIR_PATH:?}" "${SAC006_SERVER_KEYPAIR_PATH:?}" "${SAC006_ASSET_MINT:?}"
 export SAC006_DEPLOYMENT_RECORD_PATH="${SAC006_DEPLOYMENT_RECORD_PATH:-../docs/evidence/sac-007/deployment-identity.v1.json}"
