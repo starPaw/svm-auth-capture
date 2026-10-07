@@ -3,6 +3,7 @@
 // "Relay, recovery, and separation from application state". Preflight only: the program's
 // onchain guards remain authoritative, and no economic term is ever taken from the request
 // when the signed transaction or stored payment state defines it.
+import { isDeepStrictEqual } from "node:util";
 import {
   type Address,
   type CompiledTransactionMessage,
@@ -40,7 +41,7 @@ import {
   U64_MAX,
   voidAccounts,
 } from "./program.ts";
-import { messageHash, SubmissionAlreadyReserved, type SubmissionJournal, type SubmissionOutcome } from "./submission-journal.ts";
+import { messageHash, submissionOutcome, SubmissionAlreadyReserved, type SubmissionJournal, type SubmissionOutcome } from "./submission-journal.ts";
 import {
   EXTRA_KEYS,
   type FacilitatorRequest,
@@ -110,6 +111,9 @@ type Terms = {
   refundDeadline: bigint;
 };
 
+type RequestProfile = { scheme: Record<string, unknown>; terms: Terms };
+type InFlightSettlement = { response: Promise<SettleResponse>; profile: RequestProfile };
+
 const transactionDecoder = getTransactionDecoder();
 const messageDecoder = getCompiledTransactionMessageDecoder();
 const tokenDecoder = getTokenDecoder();
@@ -151,20 +155,6 @@ function parseAddress(value: unknown, reason: ReasonCode, field: string): Addres
   return value;
 }
 
-/**
- * The one classification of an adapter result, used for both the journal and the response. A
- * malformed or mislabeled result (no finalized commitment, unknown status) is unresolved: never
- * reclassified as not-submitted, because an earlier broadcast may land.
- */
-function classify(outcome: SubmitResult): { result: SubmissionOutcome; detail?: string } {
-  if (outcome.kind === "not-submitted") return { result: "not-submitted", detail: outcome.reason };
-  const r = outcome.outcome;
-  if (!r || r.commitment !== "finalized") return { result: "unresolved" };
-  if (r.status === "succeeded") return { result: "finalized-succeeded" };
-  if (r.status === "failed") return { result: "finalized-failed", detail: r.error };
-  return { result: "unresolved" };
-}
-
 export class Facilitator {
   readonly network: string;
   readonly programId: Address;
@@ -176,10 +166,10 @@ export class Facilitator {
   /**
    * Settlements in flight in this process, keyed by the exact message bytes of the validated
    * transaction. A concurrent identical `/settle` must not submit twice for one economic event;
-   * it receives the first operation's outcome with `duplicate: true`. Not durable: no journal
-   * or idempotency store.
+   * it receives a non-success response retaining an unresolved original's signature. This
+   * map is process-local; the separate submission journal protects broadcasts after restart.
    */
-  private readonly inFlight = new Map<string, Promise<SettleResponse>>();
+  private readonly inFlight = new Map<string, InFlightSettlement>();
 
   constructor(config: FacilitatorConfig) {
     if (config.ledger.network !== config.network) {
@@ -215,35 +205,50 @@ export class Facilitator {
    * set synchronously from the raw message bytes, so a concurrent identical `/settle` always
    * joins it; the joiner validates its own request before joining, so a modified or corrupted
    * duplicate is rejected instead of joining the in-flight operation. A joined duplicate is
-   * never a second success: it reports `duplicate_settlement`, a non-success with an empty
-   * transaction, and broadcasts nothing. The first request's own response remains the
-   * operation's terminal receipt.
+   * never a second success and broadcasts nothing. It retains an unresolved original's
+   * signature; otherwise it reports `duplicate_settlement` without another success receipt.
    */
   async settle(body: unknown): Promise<SettleResponse> {
+    let profile: RequestProfile;
+    try {
+      profile = this.checkRequest(body);
+    } catch (e) {
+      return this.rejectionResponse(e);
+    }
     const key = messageKey(body);
     const first = key === undefined ? undefined : this.inFlight.get(key);
     if (first) {
-      // Validate before joining: an invalid variant of the same message bytes is rejected,
-      // never confused with the valid in-flight operation.
-      let payer: string | undefined;
+      // Validate only immutable request data and the economic signature. Re-reading mutable
+      // state or simulating could reject bytes that the original has already broadcast.
       try {
-        payer = (await this.check(body)).payer;
+        await this.checkDuplicate(profile, first.profile);
       } catch (e) {
         return this.rejectionResponse(e);
       }
-      await first;
+      const original = await first.response;
+      if (original.errorReason === Reason.settlementPending) return original;
       // Same message bytes and a validated profile: one economic event, one submission. The
       // standard SettleResponse has no duplicate marker, so a second success would let a
       // standard caller execute the resource twice; report a stable non-success instead.
-      return { success: false, errorReason: Reason.duplicateSettlement, transaction: "", network: this.network, ...(payer ? { payer } : {}) };
+      return { success: false, errorReason: Reason.duplicateSettlement, transaction: "", network: this.network, ...(original.payer ? { payer: original.payer } : {}) };
     }
     const settling = this.checkAndBroadcast(body);
-    if (key !== undefined) this.inFlight.set(key, settling);
+    if (key !== undefined) this.inFlight.set(key, { response: settling, profile: { terms: profile.terms, scheme: { ...profile.scheme } } });
     try {
       return await settling;
     } finally {
       if (key !== undefined) this.inFlight.delete(key);
     }
+  }
+
+  /** A duplicate's message key already equals the original; validate its unsigned metadata too. */
+  private async checkDuplicate(actual: RequestProfile, original: RequestProfile): Promise<void> {
+    if (!isDeepStrictEqual(actual.terms, original.terms)) reject(Reason.termsMismatch, "duplicate requirements differ from the original terms");
+    const { transaction: _actualTransaction, ...actualFields } = actual.scheme;
+    const { transaction: _originalTransaction, ...originalFields } = original.scheme;
+    if (!isDeepStrictEqual(actualFields, originalFields)) reject(Reason.payloadMismatch, "duplicate payload differs from the original operation");
+    const signer = await this.peekSecondSigner(actual.scheme.transaction);
+    await this.decodeTransaction(actual.scheme.transaction, signer);
   }
 
   private rejectionResponse(e: unknown): SettleResponse {
@@ -307,7 +312,7 @@ export class Facilitator {
       this.recordOutcome(signature, "submit-threw", e instanceof Error ? e.message : String(e));
       return { success: false, errorReason: Reason.settlementPending, ...base };
     }
-    const { result, detail } = classify(outcome);
+    const { result, detail } = submissionOutcome(outcome);
     this.recordOutcome(signature, result, detail);
     // The adapter established the exact bytes were never broadcast: a non-pending failure with
     // an empty transaction. A retry of the same bytes is fresh, not a second movement.
@@ -339,7 +344,7 @@ export class Facilitator {
     }
   }
 
-  private async check(body: unknown): Promise<Verified> {
+  private checkRequest(body: unknown): RequestProfile {
     if (!isObject(body)) reject(Reason.invalidPayload, "request body must be an object");
     if (body.x402Version !== 2) reject(Reason.x402Version, "x402Version must be 2");
     const payload = body.paymentPayload;
@@ -351,6 +356,11 @@ export class Facilitator {
     this.checkAccepted(request.paymentPayload.accepted, request.paymentRequirements, terms);
     const scheme = request.paymentPayload.payload;
     if (!isObject(scheme)) reject(Reason.invalidPayload, "payload must be an object");
+    return { scheme, terms };
+  }
+
+  private async check(body: unknown): Promise<Verified> {
+    const { scheme, terms } = this.checkRequest(body);
 
     if (scheme.type === undefined) return this.checkAuthorize(scheme, terms);
     if (scheme.type === "reclaim") reject(Reason.reclaimNotRelayed, "reclaim is payer-direct and never relayed through /settle");

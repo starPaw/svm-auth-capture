@@ -8,6 +8,7 @@ import {
   type Address,
   generateKeyPairSigner,
   getBase64EncodedWireTransaction,
+  getCompiledTransactionMessageDecoder,
   getSignatureFromTransaction,
   getSolanaErrorFromJsonRpcError,
   lamports,
@@ -678,16 +679,41 @@ describe("RpcLedger ChainReader", () => {
   test("finds the original signature by its exact message bytes", async () => {
     const original = await sampleTransaction();
     const other = await sampleTransaction();
+    const originalSignature = getSignatureFromTransaction(original);
+    const otherSignature = getSignatureFromTransaction(other);
     const byWire: Record<string, string> = {
-      orig: getBase64EncodedWireTransaction(original),
-      other: getBase64EncodedWireTransaction(other),
+      [originalSignature]: getBase64EncodedWireTransaction(original),
+      [otherSignature]: getBase64EncodedWireTransaction(other),
     };
     const ledger = ledgerWith({
-      getSignaturesForAddress: () => sendable([{ signature: "other" }, { signature: "orig" }]),
+      getSignaturesForAddress: () => sendable([{ signature: otherSignature }, { signature: originalSignature }]),
       getTransaction: (sig: string) => sendable({ transaction: [byWire[sig], "base64"] }),
     });
     const search = await ledger.findSignaturesByMessage(PROGRAM_ID, new Uint8Array(original.messageBytes));
-    expect(search).toEqual({ kind: "ok", signatures: ["orig"], truncated: false });
+    expect(search).toEqual({ kind: "ok", signatures: [originalSignature], truncated: false });
+  });
+
+  test("inconsistent history cannot attribute matching bytes to another signature", async () => {
+    const original = await sampleTransaction();
+    const unrelated = getSignatureFromTransaction(await sampleTransaction());
+    const ledger = ledgerWith({
+      getSignaturesForAddress: () => sendable([{ signature: unrelated }]),
+      getTransaction: () => sendable({ transaction: [getBase64EncodedWireTransaction(original), "base64"] }),
+    });
+    expect(await ledger.findSignaturesByMessage(PROGRAM_ID, new Uint8Array(original.messageBytes))).toMatchObject({ kind: "unavailable" });
+  });
+
+  test("a grafted wire signature cannot bind an unrelated finalized transaction to the original message", async () => {
+    const original = await sampleTransaction();
+    const unrelated = await sampleTransaction();
+    const unrelatedSignature = getSignatureFromTransaction(unrelated);
+    const payer = getCompiledTransactionMessageDecoder().decode(original.messageBytes).staticAccounts[0]!;
+    const forged = { ...original, signatures: { ...original.signatures, [payer]: Object.values(unrelated.signatures)[0]! } };
+    const ledger = ledgerWith({
+      getSignaturesForAddress: () => sendable([{ signature: unrelatedSignature }]),
+      getTransaction: () => sendable({ transaction: [getBase64EncodedWireTransaction(forged), "base64"] }),
+    });
+    expect(await ledger.findSignaturesByMessage(PROGRAM_ID, new Uint8Array(original.messageBytes))).toMatchObject({ kind: "unavailable" });
   });
 
   test("reports listed-but-unretrievable history as unavailable", async () => {

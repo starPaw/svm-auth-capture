@@ -121,9 +121,38 @@ describe("FileSubmissionJournal through Facilitator.settle", () => {
     expect(() => new FileSubmissionJournal(join(tmpdir(), "sac006-no-such-journal-dir"), { create: false })).toThrow(/does not exist/);
   });
 
+  test("reclaim continuation cannot reuse an old approval once a successor is reserved", () => {
+    const dir = mkdtempSync(join(tmpdir(), "sac006-reclaim-successor-"));
+    const journal = new FileSubmissionJournal(dir);
+    const entry = { signature: "first", messageHash: "hash", transactionBase64: "tx", blockhash: "bh", operation: "reclaim" as const, payment: "payment", payer: "payer", expectedHeld: "100", expectedRefundable: "0" };
+    journal.prepare(entry);
+    journal.resolve("first", { result: "finalized-failed", recordedAt: "t1" });
+    journal.prepare({ ...entry, signature: "second", retryAfter: "first" });
+    expect(() => new FileSubmissionJournal(dir).prepare({ ...entry, signature: "third", retryAfter: "first" })).toThrow(/second/);
+    expect(journal.read("third")).toBeUndefined();
+    expect(journal.read("first")?.attempts[0]?.outcome?.result).toBe("finalized-failed");
+    expect(journal.read("second")?.retryAfter).toBe("first");
+  });
+
+  test("refused reuse of any reclaim signature leaves a fresh continuation usable", () => {
+    const journal = new FileSubmissionJournal(mkdtempSync(join(tmpdir(), "sac006-reclaim-reused-signature-")));
+    const entry = { signature: "first", messageHash: "hash", transactionBase64: "tx", blockhash: "bh", operation: "reclaim" as const, payment: "payment", payer: "payer", expectedHeld: "100", expectedRefundable: "0" };
+    journal.prepare(entry);
+    journal.resolve("first", { result: "finalized-failed", recordedAt: "t1" });
+    expect(() => journal.prepare({ ...entry, retryAfter: "first" })).toThrow(/reconciliation/);
+    journal.prepare({ ...entry, signature: "second", retryAfter: "first" });
+    journal.resolve("second", { result: "finalized-failed", recordedAt: "t2" });
+    expect(() => journal.prepare({ ...entry, retryAfter: "second" })).toThrow(/reconciliation/);
+    journal.prepare({ ...entry, signature: "third", retryAfter: "second" });
+    expect(journal.read("second")?.retryAfter).toBe("first");
+    expect(journal.read("third")?.retryAfter).toBe("second");
+    expect(journal.read("first")?.attempts[0]?.outcome?.result).toBe("finalized-failed");
+  });
+
   test("a journal write failure prevents the broadcast", async () => {
     const failing: SubmissionJournal = {
       findByMessageHash: () => [],
+      read: () => undefined,
       prepare: () => {
         throw new Error("disk full");
       },

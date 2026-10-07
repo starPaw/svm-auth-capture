@@ -14,8 +14,19 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createDurableFile, ensureDurableDirectory, replaceDurableFile } from "./durable-file.ts";
 import type { Operation } from "./types.ts";
+import type { SubmitResult } from "./ledger.ts";
 
 export type SubmissionOutcome = "not-submitted" | "unresolved" | "finalized-succeeded" | "finalized-failed" | "submit-threw";
+
+/** One classification for relay/reclaim responses and their durable outcome evidence. */
+export function submissionOutcome(outcome: SubmitResult): { result: SubmissionOutcome; detail?: string } {
+  if (outcome.kind === "not-submitted") return { result: "not-submitted", detail: outcome.reason };
+  const r = outcome.outcome;
+  if (!r || r.commitment !== "finalized") return { result: "unresolved" };
+  if (r.status === "succeeded") return { result: "finalized-succeeded" };
+  if (r.status === "failed") return { result: "finalized-failed", detail: r.error };
+  return { result: "unresolved" };
+}
 
 export type SubmissionAttempt = { preparedAt: string; outcome?: { result: SubmissionOutcome; recordedAt: string; detail?: string } };
 
@@ -33,6 +44,8 @@ export type PreparedSubmission = {
   payer: string;
   expectedHeld: string;
   expectedRefundable: string;
+  /** Explicit payer continuation after this exact reclaim was proved finalized-failed. */
+  retryAfter?: string;
 };
 
 /**
@@ -44,6 +57,7 @@ export type SubmissionEntry = PreparedSubmission & { attempts: SubmissionAttempt
 
 export interface SubmissionJournal {
   findByMessageHash(hash: string): SubmissionEntry[];
+  read(signature: string): SubmissionEntry | undefined;
   /** Must exclusively reserve `entry` durably before returning; a throw prevents broadcast. */
   prepare(entry: PreparedSubmission): void;
   /** Records the adapter's classification of the latest attempt; evidence only. */
@@ -80,23 +94,50 @@ export class FileSubmissionJournal implements SubmissionJournal {
   }
 
   prepare(entry: PreparedSubmission): void {
+    // Refuse reused signatures before creating a successor: an identical or older reclaim
+    // must not add a cycle that would block a later continuation with fresh signed bytes.
+    if (existsSync(this.path(entry.signature))) throw new SubmissionAlreadyReserved("original submission requires reconciliation; never rebroadcast");
+    if (entry.operation === "reclaim") this.reserveReclaim(entry);
     try {
       createDurableFile(this.path(entry.signature), JSON.stringify({ ...entry, attempts: [{ preparedAt: new Date().toISOString() }] }, null, 2));
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new SubmissionAlreadyReserved("original submission requires reconciliation; never rebroadcast");
       throw error;
     }
-    // Reclaim is a single payer action per payment. A second CLI invocation with a new
-    // blockhash must not hide an unresolved original, even across concurrent processes.
-    if (entry.operation === "reclaim") {
-      const lock = join(this.dir, `reclaim-${entry.payment}.lock`);
-      try {
-        createDurableFile(lock, entry.signature);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new SubmissionAlreadyReserved(`reclaim requires reconciliation of original signature ${readFileSync(lock, "utf8")}`);
-        throw error;
+  }
+
+  private reserveReclaim(entry: PreparedSubmission): void {
+    // Reclaim reservations form an append-only chain. An explicit continuation after proven
+    // failure reserves one successor exclusively; old locks/evidence are never deleted.
+    const root = join(this.dir, `reclaim-${entry.payment}.lock`);
+    let lock = root;
+    if (entry.retryAfter !== undefined) {
+      const previous = this.read(entry.retryAfter);
+      if (!previous || previous.operation !== "reclaim" || previous.payment !== entry.payment || previous.payer !== entry.payer || previous.attempts.at(-1)?.outcome?.result !== "finalized-failed") {
+        throw new SubmissionAlreadyReserved("reclaim continuation requires the original payment's finalized failure");
       }
+      let current = readFileSync(root, "utf8");
+      const seen = new Set<string>();
+      for (;;) {
+        if (seen.has(current)) throw new Error("invalid reclaim reservation chain");
+        seen.add(current);
+        const successor = this.reclaimSuccessor(entry.payment, current);
+        if (!existsSync(successor)) break;
+        current = readFileSync(successor, "utf8");
+      }
+      if (current !== entry.retryAfter) throw new SubmissionAlreadyReserved(`reclaim requires reconciliation of original signature ${current}`);
+      lock = this.reclaimSuccessor(entry.payment, entry.retryAfter);
     }
+    try {
+      createDurableFile(lock, entry.signature);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new SubmissionAlreadyReserved(`reclaim requires reconciliation of original signature ${readFileSync(lock, "utf8")}`);
+      throw error;
+    }
+  }
+
+  private reclaimSuccessor(payment: string, signature: string): string {
+    return join(this.dir, `reclaim-${payment}-after-${signature}.lock`);
   }
 
   resolve(signature: string, outcome: NonNullable<SubmissionAttempt["outcome"]>): void {

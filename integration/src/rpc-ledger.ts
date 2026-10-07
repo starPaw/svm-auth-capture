@@ -12,18 +12,22 @@ import {
   getBase64Encoder,
   type Blockhash,
   getBase64EncodedWireTransaction,
+  getCompiledTransactionMessageDecoder,
+  getPublicKeyFromAddress,
   getSignatureFromTransaction,
   getSolanaErrorFromTransactionError,
   getTransactionDecoder,
   isSolanaError,
   type Rpc,
   signature as asSignature,
+  type SignatureBytes,
   SOLANA_ERROR__JSON_RPC__SERVER_ERROR_SEND_TRANSACTION_PREFLIGHT_FAILURE,
   SOLANA_ERROR__TRANSACTION_ERROR__UNKNOWN,
   SOLANA_ERROR__INSTRUCTION_ERROR__UNKNOWN,
   type SolanaRpcApi,
   type Transaction,
   type TransactionError,
+  verifySignature,
 } from "@solana/kit";
 import type { FinalizedOutcome, Ledger, LedgerAccount, SimulationOutcome, SubmitResult } from "./ledger.ts";
 import type { BlockhashCheck, ChainReader, MessageSearch, SignatureLookup, SlotAccount } from "./reconciliation.ts";
@@ -373,8 +377,19 @@ export class RpcLedger implements Ledger, ChainReader {
         );
         if (!tx) return { kind: "unavailable", detail: `history for ${entry.signature} is listed but not retrievable` };
         const decoded = transactionDecoder.decode(decodeBase64(tx.transaction[0]));
-        // Identical message bytes always carry the identical sponsor signature: one match is all.
-        if (sameBytes(new Uint8Array(decoded.messageBytes), messageBytes)) return { kind: "ok", signatures: [entry.signature], truncated: false };
+        if (getSignatureFromTransaction(decoded) !== entry.signature) {
+          return { kind: "unavailable", detail: "transaction history signature does not match its wire bytes" };
+        }
+        if (sameBytes(new Uint8Array(decoded.messageBytes), messageBytes)) {
+          // Wire decoding only extracts signatures. Prove the listed signature binds this
+          // exact message to its fee payer before using another RPC result as finality evidence.
+          const payer = getCompiledTransactionMessageDecoder().decode(decoded.messageBytes).staticAccounts[0]!;
+          const signature = decoded.signatures[payer];
+          if (!signature || !(await verifySignature(await getPublicKeyFromAddress(payer), signature as SignatureBytes, decoded.messageBytes))) {
+            return { kind: "unavailable", detail: "transaction history signature does not authenticate its message" };
+          }
+          return { kind: "ok", signatures: [entry.signature], truncated: false };
+        }
       }
       return { kind: "ok", signatures: [], truncated: entries.length >= MESSAGE_SEARCH_LIMIT };
     } catch (error) {
