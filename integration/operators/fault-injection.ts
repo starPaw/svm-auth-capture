@@ -24,7 +24,7 @@ import { check, context, emit, finalizedSlot, slotOf, snapshot, waitForClock } f
 
 type Fault = "lost" | "weak";
 
-class FaultyLedger implements Ledger {
+export class FaultyLedger implements Ledger {
   readonly network: string;
   private readonly real: Ledger;
   private armed?: { fault: Fault; skip: number };
@@ -58,6 +58,9 @@ class FaultyLedger implements Ledger {
     }
     this.armed = undefined;
     const real = await this.real.submit(transaction);
+    // A controlled downgrade requires proved natural finality. Never relabel unknown/failure
+    // as confirmed success or continue this campaign past an ambiguous original submission.
+    check(real.kind === "submitted" && real.outcome?.status === "succeeded" && real.outcome.commitment === "finalized", "fault injection requires a real finalized success; otherwise stop for original-signature reconciliation", { realResult: real });
     if (armed.fault === "lost") {
       emit("[FAULT INJECTED] result stripped", { realResult: real, returned: { kind: "submitted" } });
       return { kind: "submitted" };
@@ -269,10 +272,7 @@ async function main(): Promise<void> {
   for (const { payment, captureDeadline } of holds) {
     await waitForClock(c, captureDeadline, `Dc of ${payment}`);
     const before = await snapshot(c, "before reclaim", payment);
-    if (!before.payment?.exists || before.payment.held === "0") {
-      emit("no hold to reclaim", { payment, state: before.payment });
-      continue;
-    }
+    check(before.payment?.exists === true && BigInt(before.payment.held ?? "0") > 0n, "the proven authorization hold must exist before cleanup; missing state is incomplete evidence");
     const { signature, result } = await submitReclaim({ ledger: real, programId: record.programId, payer, payment, lifetime: await real.latestBlockhash(), journal });
     emit("payer reclaim", { payment, signature, slot: await slotOf(c, signature), result });
     const after = await snapshot(c, "after reclaim", payment, await finalizedSlot(c, signature));
@@ -281,7 +281,7 @@ async function main(): Promise<void> {
   emit("fault injection: all checks passed");
 }
 
-main().catch((error) => {
+if (process.argv[1]?.endsWith("fault-injection.ts")) main().catch((error) => {
   console.error(error instanceof Error ? (error.stack ?? error.message) : String(error));
   process.exitCode = 1;
 });
