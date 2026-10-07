@@ -5,6 +5,7 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync, readFileSync, unlinkSync, openSync, fsyncSync, closeSync } from "node:fs";
 import { join } from "node:path";
 import { Hono } from "hono";
+import { requireBearerToken } from "./auth.ts";
 import { bodyLimit } from "hono/body-limit";
 import { getCookie, setCookie } from "hono/cookie";
 import { type Address, getBase64Encoder, getTransactionDecoder, getCompiledTransactionMessageDecoder, getSignatureFromTransaction, getPublicKeyFromAddress, verifySignature, isAddress, type SignatureBytes, type Transaction } from "@solana/kit";
@@ -26,7 +27,7 @@ type Scenario = typeof SCENARIOS[number];
 type Action = "authorize" | "beer" | "salmon" | "finish" | "void" | "refund" | "reclaim";
 type Event = { action: Action; label: string; amount: string; at: string; status: "prepared" | "pending" | "finalized" | "rejected"; transaction: string; transactionBase64: string; receipt?: SettleResponse };
 type Order = { id: string; capabilityHash: string; payer: Address; payment: Address; scenario: Scenario; required: PaymentRequired; unsigned: string; createdAt: number; status: "draft" | "active" | "closed" | "pending" | "rejected"; events: Event[]; reclaimUnsigned?: string; reclaimLifetime?: { blockhash: string; lastValidBlockHeight: string; blockhashSlot?: string } };
-export type RestaurantConfig = ResourceServerConfig & { ledger: Ledger & Pick<ChainReader, "getSignatureStatus" | "getAccountAtLeast">; orders: RestaurantOrders; reclaimJournal: SubmissionJournal; origin: string };
+export type RestaurantConfig = ResourceServerConfig & { ledger: Ledger & Pick<ChainReader, "getSignatureStatus" | "getAccountAtLeast">; orders: RestaurantOrders; reclaimJournal: SubmissionJournal; origin: string; merchantToken?: string };
 
 export class RestaurantOrders {
   readonly dir: string;
@@ -76,6 +77,12 @@ export async function restaurantSnapshot(c: RestaurantConfig, order: Order): Pro
 
 export function createRestaurantApp(c: RestaurantConfig): Hono {
   if (c.amount !== DEMO_BUDGET) throw new Error("restaurant budget must be exactly 100 six-decimal demo USDC");
+  // Separate application authority: an order capability never authorizes merchant signing.
+  const merchantToken = c.merchantToken;
+  if (merchantToken !== undefined && (merchantToken.length < 32 || merchantToken.trim() !== merchantToken || /[\r\n]/.test(merchantToken) || merchantToken === c.bearerToken)) {
+    throw new Error("merchant token must be independent and at least 32 characters");
+  }
+  const merchantAuth = merchantToken ? requireBearerToken(merchantToken) : undefined;
   const app = new Hono();
   const cookieName = "capture402-order";
   const secured = c.origin.startsWith("https:");
@@ -176,8 +183,12 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
     ctx.header(PAYMENT_RESPONSE_HEADER, encodeHeader(result.receipt));
     return ctx.json({ receipt: result.receipt, order: order.id }, result.kind === "succeeded" ? 200 : 402);
   });
+  app.use("/api/orders/:id/actions/*", async (ctx, next) => {
+    if (!merchantAuth) return ctx.json({ error: "merchant operations disabled" }, 503);
+    return merchantAuth(ctx, next);
+  });
   app.post("/api/orders/:id/actions/:action", async ctx => {
-    let order = owned(ctx.req.param("id"), getCookie(ctx, cookieName)); const action = ctx.req.param("action") as Action;
+    let order = c.orders.read(ctx.req.param("id")); const action = ctx.req.param("action") as Action;
     if (!["beer", "salmon", "finish", "void", "refund"].includes(action)) return ctx.json({ error: "unsupported menu action" }, 400);
     c.orders.reserve(order.id, action);
     order = c.orders.read(order.id);

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getBase64Encoder, getTransactionDecoder, partiallySignTransaction, type Address } from "@solana/kit";
 import { getMintToInstruction } from "@solana-program/token";
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { demoSponsorComputeBounds } from "../src/demo-compute.js";
 import { createRestaurantApp, DEMO_BUDGET, DEMO_UNIT, RestaurantOrders, type RestaurantConfig } from "../src/restaurant.js";
 import { createPresentationApp } from "../src/restaurant-server.js";
@@ -15,6 +15,7 @@ import { decodeHeader, encodeHeader, type PaymentRequired } from "../src/http-tr
 import { createHarness, type Harness, NOW, inspect } from "./fixture.js";
 import type { Hono } from "hono";
 let h: Harness, c: RestaurantConfig, app: Hono, dir: string;
+const merchantToken = "local-merchant-test-credential-0123456789";
 const origin = "http://restaurant.test";
 type Session = { id: string; cookie: string; required: PaymentRequired; unsigned: string };
 beforeEach(async () => {
@@ -28,7 +29,7 @@ beforeEach(async () => {
     },
     getAccountAtLeast: async (address: Address) => ({ kind: "ok" as const, slot: 1n, account: await h.ledger.getAccount(address) }),
   });
-  c = { facilitatorUrl: h.url, bearerToken: "local-only-test", network: h.ledger.network, programId: h.facilitator.programId, feePayer: h.facilitatorKey.address, server: h.server, asset: h.mint, amount: DEMO_BUDGET, captureDeadlineSeconds: 150, refundDeadlineSeconds: 30, store: new OperationStore(join(dir, "legacy")), orders: new RestaurantOrders(join(dir, "orders")), reclaimJournal: new FileSubmissionJournal(join(dir, "reclaim")), ledger, origin, now: () => h.ledger.now(), getLatestBlockhash: async () => h.lifetime(), handler: async () => { throw new Error("unused legacy one-shot handler"); } };
+  c = { merchantToken, facilitatorUrl: h.url, bearerToken: "local-only-test", network: h.ledger.network, programId: h.facilitator.programId, feePayer: h.facilitatorKey.address, server: h.server, asset: h.mint, amount: DEMO_BUDGET, captureDeadlineSeconds: 150, refundDeadlineSeconds: 30, store: new OperationStore(join(dir, "legacy")), orders: new RestaurantOrders(join(dir, "orders")), reclaimJournal: new FileSubmissionJournal(join(dir, "reclaim")), ledger, origin, now: () => h.ledger.now(), getLatestBlockhash: async () => h.lifetime(), handler: async () => { throw new Error("unused legacy one-shot handler"); } };
   app = createRestaurantApp(c);
 });
 afterEach(async () => { await h.close(); });
@@ -47,12 +48,68 @@ async function authorize(s: Session) {
   return app.request(`${origin}/resource?order=${s.id}`, { method: "POST", headers: { cookie: s.cookie, origin, "PAYMENT-SIGNATURE": encodeHeader({ x402Version: 2, resource: s.required.resource, accepted: s.required.accepts[0], payload: { transaction: await sign(s.unsigned) } }) } });
 }
 const view = async (s: Session) => (await (await app.request(`${origin}/api/orders/${s.id}`, { headers: { cookie: s.cookie } })).json()) as any;
-const action = (s: Session, a: string) => app.request(`${origin}/api/orders/${s.id}/actions/${a}`, { method: "POST", headers: { cookie: s.cookie, origin } });
+const action = (s: Session, a: string) => app.request(`${origin}/api/orders/${s.id}/actions/${a}`, { method: "POST", headers: { authorization: `Bearer ${merchantToken}`, origin } });
 async function expectAction(s: Session, a: string) {
   const r = await action(s, a); const body = await r.json() as any;
   expect(body, JSON.stringify(body)).toMatchObject({ receipt: { success: true } }); expect(r.status).toBe(200);
   expect(decodeHeader(r.headers.get("PAYMENT-RESPONSE")!)).toMatchObject({ success: true, transaction: body.receipt.transaction });
 }
+describe("merchant application authority", () => {
+  test.each(["beer", "salmon", "finish", "void", "refund"])("payer session cannot request %s or reach merchant signing", async a => {
+    const s = await offer("refund"); await authorize(s);
+    // A refundable balance makes refund meaningful; all refusals must occur before eligibility.
+    await expectAction(s, "beer");
+    const disk = readFileSync(c.orders.path(s.id), "utf8");
+    const files = readdirSync(join(dir, "orders")).sort();
+    const submitted = h.ledger.submissions.length, simulated = h.ledger.simulated.length;
+    const sign = vi.fn(c.server.signTransactions);
+    app = createRestaurantApp({ ...c, server: { ...c.server, signTransactions: sign } });
+    for (const token of [undefined, "incorrect", merchantToken.slice(0, -1) + "X", c.bearerToken, s.cookie.split("=")[1]]) {
+      const headers: Record<string, string> = { cookie: s.cookie, origin, "content-type": "application/json" };
+      if (token) headers.authorization = `Bearer ${token}`;
+      const r = await app.request(`${origin}/api/orders/${s.id}/actions/${a}`, {
+        method: "POST", headers, body: JSON.stringify({ role: "merchant", merchant: true }),
+      });
+      expect(r.status).toBe(401);
+    }
+    expect(sign).not.toHaveBeenCalled();
+    expect(h.ledger.submissions).toHaveLength(submitted);
+    expect(h.ledger.simulated).toHaveLength(simulated);
+    expect(readFileSync(c.orders.path(s.id), "utf8")).toBe(disk);
+    expect(readdirSync(join(dir, "orders")).sort()).toEqual(files);
+    expect(c.orders.busy(s.id)).toBe(false);
+  });
+  test("missing configuration fails closed, including across restart", async () => {
+    const s = await offer(); await authorize(s);
+    for (const a of ["beer", "salmon", "finish", "void", "refund"]) {
+      app = createRestaurantApp({ ...c, merchantToken: undefined, orders: new RestaurantOrders(join(dir, "orders")) });
+      expect((await action(s, a)).status).toBe(503);
+      expect(c.orders.attempted(s.id, a as any)).toBe(false);
+    }
+    expect(h.ledger.submissions).toHaveLength(1);
+    expect(c.orders.busy(s.id)).toBe(false);
+  });
+  test("merchant authentication precedes order lookup and survives restart", async () => {
+    expect((await app.request(`${origin}/api/orders/missing/actions/beer`, { method: "POST", headers: { origin } })).status).toBe(401);
+    const s = await offer(); await authorize(s);
+    app = createRestaurantApp({ ...c, orders: new RestaurantOrders(join(dir, "orders")) });
+    await expectAction(s, "beer"); // Merchant request intentionally carries no payer cookie.
+    const wrongOrigin = await app.request(`${origin}/api/orders/${s.id}/actions/void`, {
+      method: "POST", headers: { authorization: `Bearer ${merchantToken}`, origin: "https://foreign.example" },
+    });
+    expect(wrongOrigin.status).toBe(403);
+    expect(h.ledger.submissions).toHaveLength(2);
+    for (const path of [`/api/orders/${s.id}`, `/api/orders/${s.id}/reclaim`]) {
+      expect((await app.request(origin + path, { headers: { authorization: `Bearer ${merchantToken}` } })).status).toBe(409);
+    }
+  });
+  test("empty, short and reused facilitator credentials are rejected", () => {
+    for (const token of ["", "short", "x".repeat(31), " " + merchantToken, merchantToken + "\n"]) {
+      expect(() => createRestaurantApp({ ...c, merchantToken: token })).toThrow("merchant token");
+    }
+    expect(() => createRestaurantApp({ ...c, bearerToken: merchantToken })).toThrow("merchant token");
+  });
+});
 describe("restaurant budget lifecycle", () => {
   test("402 → signed authorize → menu handler → 40 → 25 → void remaining 35 with exact token deltas and finalized signatures", async () => {
     const before = h.tokens(await h.payerAta()); const s = await offer();
@@ -69,7 +126,7 @@ describe("restaurant budget lifecycle", () => {
     const restored = createRestaurantApp({ ...c, orders: new RestaurantOrders(join(dir, "orders")) });
     expect((await restored.request(`${origin}/api/orders/${s.id}`, { headers: { cookie: s.cookie } })).status).toBe(200);
     expect((await action(s, "beer")).status).toBe(409); expect(h.ledger.submissions).toHaveLength(4);
-    const publicWire = JSON.stringify(v); expect(publicWire).not.toContain("transactionBase64"); expect(publicWire).not.toContain("capabilityHash");
+    const publicWire = JSON.stringify(v); expect(publicWire).not.toContain("transactionBase64"); expect(publicWire).not.toContain("capabilityHash"); expect(publicWire).not.toContain(merchantToken);
   });
   test("expired never-submitted draft can be replaced by an explicit fresh offer without touching old evidence or submitting", async () => {
     const first = await offer(); const original = readFileSync(c.orders.path(first.id),"utf8");

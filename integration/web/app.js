@@ -36,7 +36,7 @@ function render() {
   const payerMatches = !order || order.payer === connection?.account?.address;
   $('authorize').disabled = busy || stale || !config?.configured || !connection?.account || !payerMatches || order && !['draft','rejected'].includes(order.status);
   $('authorize').textContent = diagnosticOnly ? 'Sign only · compare wallet response ↗' : busy ? 'Waiting for the original result…' : 'Authorize 100 demo USDC ↗';
-  document.querySelectorAll('[data-action]').forEach(b => { b.disabled = diagnosticOnly || busy || stale || !config?.configured || !order?.actions?.[b.dataset.action]; });
+  document.querySelectorAll('[data-action]').forEach(b => { b.disabled = true; b.title = 'Only an authenticated restaurant operator can perform this action.'; });
   $('finish').textContent = `Finish Order · Release remaining ${scenario === 'refund' ? 60 : 35} ↗`;
   $('reclaim-box').hidden = !order || order.remaining <= 0;
   $('reclaim').disabled = diagnosticOnly || busy || stale || !connection?.account || !payerMatches || !order?.actions?.reclaim;
@@ -105,10 +105,6 @@ $('authorize').onclick = () => run(async () => {
   const envelope = { x402Version:2, resource:required.resource, accepted:offer, payload:{ transaction:signed } };
   const { data } = await request(`/resource?order=${id}`, { method:'POST', headers:{ 'PAYMENT-SIGNATURE':encodeEnvelope(envelope) } }, [402]);
   if (!data.receipt?.success) throw new Error(data.receipt?.errorReason ?? 'Authorization unresolved. Inspect this order.');
-});
-for (const button of document.querySelectorAll('[data-action]')) button.onclick = () => run(async () => {
-  const { data } = await request(`/api/orders/${order.id}/actions/${button.dataset.action}`, { method:'POST', headers:{ 'Content-Type':'application/json' }, body:'{}' });
-  if (!data.receipt?.success) throw new Error('The original merchant transaction is unresolved.');
 });
 $('reclaim').onclick = () => run(async () => {
   if (connection?.account?.address !== order.payer) throw new Error('Connect the original payer wallet.');

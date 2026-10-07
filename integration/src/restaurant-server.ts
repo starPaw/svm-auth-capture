@@ -48,6 +48,7 @@ async function main() {
     if (!mint || mint.owner !== TOKEN_PROGRAM_ADDRESS || mint.data.length !== getMintDecoder().fixedSize || !getMintDecoder().decode(mint.data).isInitialized || getMintDecoder().decode(mint.data).decimals !== 6) throw new Error("restaurant requires an initialized classic SPL mint with six decimals");
     const baseDir = process.env.SAC006_STORE_DIR!;
     const config: RestaurantConfig = {
+      merchantToken: process.env.SAC006_MERCHANT_TOKEN || undefined,
       facilitatorUrl: process.env.SAC006_FACILITATOR_URL!, bearerToken: process.env.SAC006_BEARER_TOKEN!, network: record.network.caip2, programId: record.programId,
       feePayer: process.env.SAC006_FEE_PAYER as Address, server, asset: process.env.SAC006_ASSET_MINT as Address, amount: DEMO_BUDGET,
       captureDeadlineSeconds: DEMO_TIMING.captureSeconds, refundDeadlineSeconds: DEMO_TIMING.refundSecondsAfterCapture,
