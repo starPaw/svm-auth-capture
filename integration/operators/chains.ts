@@ -107,8 +107,8 @@ async function main(): Promise<void> {
       emit("setup token transfer", { amount, attempt, result });
       if (result.kind === "submitted" && result.outcome?.status === "succeeded") return;
       for (;;) {
-        const check = await ledger.isBlockhashValid(life.blockhash);
-        if (check.kind === "ok" && !check.valid) break;
+        const expiry = await ledger.isBlockhashValid(life.blockhash);
+        if (expiry.kind === "ok" && !expiry.valid) break;
         await new Promise((r) => setTimeout(r, 5_000));
       }
       if (BigInt((await snapshot(c, `transfer ${amount}: after unresolved attempt ${attempt}`)).serverAta) === target) return;
