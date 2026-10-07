@@ -164,3 +164,30 @@ describe("FileSubmissionJournal through Facilitator.settle", () => {
     expect(h.ledger.submissions.length).toBe(before);
   });
 });
+
+test("expiry successor is exclusive while unresolved and cannot erase or reuse original approval", () => {
+  const dir = mkdtempSync(join(tmpdir(), "sac006-expiry-successor-"));
+  const journal = new FileSubmissionJournal(dir);
+  const original = { signature: "old", messageHash: "hash", transactionBase64: "tx", blockhash: "bh", operation: "reclaim" as const, payment: "payment", payer: "payer", expectedHeld: "10", expectedRefundable: "0" };
+  journal.prepare(original);
+  journal.resolve("old", { result: "unresolved", recordedAt: "t1" });
+  const old = journal.read("old");
+  const successor = { ...original, signature: "new", retryAfter: "old", reclaimRecovery: { kind: "expired-no-effect" as const, blockhash: "bh", originSlot: "10", expirySlot: "200", paymentSlot: "201" } };
+  journal.prepare(successor);
+  journal.resolve("new", { result: "unresolved", recordedAt: "t2" });
+  expect(() => new FileSubmissionJournal(dir).prepare({ ...successor, signature: "third" })).toThrow(/new/);
+  expect(journal.read("old")).toEqual(old);
+  expect(journal.read("third")).toBeUndefined();
+});
+
+test.each(["zero-held", "stale-snapshot", "invalid-origin", "wrong-blockhash", "changed-pair", "recorded-success"])("journal refuses invalid expiry recovery proof: %s", mode => {
+  const journal = new FileSubmissionJournal(mkdtempSync(join(tmpdir(), "sac006-expiry-proof-")));
+  const original = { signature: "old", messageHash: "hash", transactionBase64: "tx", blockhash: "bh", operation: "reclaim" as const, payment: "payment", payer: "payer", expectedHeld: "10", expectedRefundable: "0" };
+  journal.prepare(original);
+  journal.resolve("old", { result: mode === "recorded-success" ? "finalized-succeeded" : "unresolved", recordedAt: "t1" });
+  const successor = { ...original, signature: "new", retryAfter: "old", reclaimRecovery: { kind: "expired-no-effect" as const, blockhash: mode === "wrong-blockhash" ? "other" : "bh", originSlot: mode === "invalid-origin" ? "200" : "10", expirySlot: "200", paymentSlot: mode === "stale-snapshot" ? "199" : "201" } };
+  if (mode === "zero-held") successor.expectedHeld = "0";
+  if (mode === "changed-pair") successor.expectedRefundable = "1";
+  expect(() => journal.prepare(successor)).toThrow(/finalized failure or expiry/);
+  expect(journal.read("new")).toBeUndefined();
+});

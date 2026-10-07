@@ -44,7 +44,12 @@ export type PreparedSubmission = {
   payer: string;
   expectedHeld: string;
   expectedRefundable: string;
-  /** Explicit payer continuation after this exact reclaim was proved finalized-failed. */
+  /** Finalized origin and lifetime returned when preparing reclaim; legacy entries lack these. */
+  blockhashSlot?: string;
+  lastValidBlockHeight?: string;
+  /** Reclaim-only proof retained on the successor; original outcome remains unmodified. */
+  reclaimRecovery?: { kind: "expired-no-effect"; blockhash: string; originSlot: string; expirySlot: string; paymentSlot: string };
+  /** Explicit payer continuation after finalized failure or proven expiry without reclaim effect. */
   retryAfter?: string;
 };
 
@@ -108,13 +113,15 @@ export class FileSubmissionJournal implements SubmissionJournal {
 
   private reserveReclaim(entry: PreparedSubmission): void {
     // Reclaim reservations form an append-only chain. An explicit continuation after proven
-    // failure reserves one successor exclusively; old locks/evidence are never deleted.
+    // failure or proven expiry without effect reserves one successor exclusively;
+    // old locks/evidence are never deleted.
     const root = join(this.dir, `reclaim-${entry.payment}.lock`);
     let lock = root;
     if (entry.retryAfter !== undefined) {
       const previous = this.read(entry.retryAfter);
-      if (!previous || previous.operation !== "reclaim" || previous.payment !== entry.payment || previous.payer !== entry.payer || previous.attempts.at(-1)?.outcome?.result !== "finalized-failed") {
-        throw new SubmissionAlreadyReserved("reclaim continuation requires the original payment's finalized failure");
+      if (!previous || previous.operation !== "reclaim" || previous.payment !== entry.payment || previous.payer !== entry.payer ||
+          (previous.attempts.at(-1)?.outcome?.result !== "finalized-failed" && !this.expiredReclaimProof(entry, previous))) {
+        throw new SubmissionAlreadyReserved("reclaim continuation requires finalized failure or expiry without effect");
       }
       let current = readFileSync(root, "utf8");
       const seen = new Set<string>();
@@ -134,6 +141,16 @@ export class FileSubmissionJournal implements SubmissionJournal {
       if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new SubmissionAlreadyReserved(`reclaim requires reconciliation of original signature ${readFileSync(lock, "utf8")}`);
       throw error;
     }
+  }
+
+  private expiredReclaimProof(entry: PreparedSubmission, previous: SubmissionEntry): boolean {
+    const proof = entry.reclaimRecovery;
+    if (!proof || previous.attempts.at(-1)?.outcome?.result === "finalized-succeeded" ||
+        proof.kind !== "expired-no-effect" || proof.blockhash !== previous.blockhash ||
+        entry.expectedHeld !== previous.expectedHeld || entry.expectedRefundable !== previous.expectedRefundable ||
+        !/^[1-9][0-9]*$/.test(entry.expectedHeld) ||
+        ![proof.originSlot, proof.expirySlot, proof.paymentSlot].every(s => /^(0|[1-9][0-9]*)$/.test(s))) return false;
+    return BigInt(proof.expirySlot) > BigInt(proof.originSlot) && BigInt(proof.paymentSlot) >= BigInt(proof.expirySlot);
   }
 
   private reclaimSuccessor(payment: string, signature: string): string {

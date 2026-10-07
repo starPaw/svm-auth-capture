@@ -139,3 +139,125 @@ test("a thrown submission is retained as unresolved evidence", async () => {
     expect(journal.list()[0]?.attempts[0]?.outcome?.result).toBe("submit-threw");
   } finally { h.ledger.submit = submit; }
 });
+
+async function pendingReclaim(captureAmount = 0n) {
+  const payment = await h.authorized();
+  if (captureAmount > 0n) expect((await h.facilitator.settle(h.body(await h.capture(payment, captureAmount, false, 100n, 0n)))).success).toBe(true);
+  h.setTime(DC);
+  const dir = mkdtempSync(join(tmpdir(), "sac006-expired-reclaim-"));
+  const journal = new FileSubmissionJournal(dir);
+  const submit = h.ledger.submit;
+  h.ledger.submit = async () => ({ kind: "submitted" });
+  let original;
+  try { original = await submitReclaim({ ...argsFor(payment, journal), lifetime: { ...h.lifetime(), blockhashSlot: 10n } }); }
+  finally { h.ledger.submit = submit; }
+  h.svm.expireBlockhash();
+  const reader = {
+    getSignatureStatus: async (): Promise<SignatureLookup> => ({ kind: "not-found" }),
+    getFinalizedBlockhashStatus: async (blockhash: string, originSlot: bigint) => {
+      expect(blockhash).toBe(journal.read(original.signature)!.blockhash);
+      expect(originSlot).toBe(10n);
+      return { kind: "ok" as const, valid: false, slot: 200n };
+    },
+    getAccountAtLeast: async (address: Address, fence: bigint) => {
+      expect(fence).toBe(200n);
+      return { kind: "ok" as const, slot: 201n, account: await h.ledger.getAccount(address) };
+    },
+  };
+  return { payment, dir, journal, original, reader, args: { ...argsFor(payment, journal), retryAfter: original.signature, reader } };
+}
+
+test("expired missing reclaim permits one explicit successor across concurrent invocations, preserving original evidence", async () => {
+  const c = await pendingReclaim();
+  const before = JSON.stringify(c.journal.read(c.original.signature));
+  const payerBefore = h.tokens(await h.payerAta());
+  const vaultBefore = h.tokens(await h.vault(c.payment));
+  const n = h.ledger.submissions.length;
+  const outcomes = await Promise.allSettled([submitReclaim(c.args), submitReclaim({ ...c.args, journal: new FileSubmissionJournal(c.dir) })]);
+  expect(outcomes.filter(x => x.status === "fulfilled")).toHaveLength(1);
+  const winner = outcomes.find(x => x.status === "fulfilled")!;
+  if (winner.status !== "fulfilled") throw new Error("missing successor");
+  expect(winner.value.result).toMatchObject({ kind: "submitted", outcome: { status: "succeeded", commitment: "finalized" } });
+  expect(h.ledger.submissions.length).toBe(n + 1);
+  expect(h.state(c.payment).held).toBe(0n);
+  expect(h.tokens(await h.payerAta())).toBe(payerBefore + 100n);
+  expect(h.tokens(await h.vault(c.payment))).toBe(vaultBefore - 100n);
+  expect(JSON.stringify(c.journal.read(c.original.signature))).toBe(before);
+  expect(c.journal.read(winner.value.signature)?.reclaimRecovery).toMatchObject({ kind: "expired-no-effect", originSlot: "10", expirySlot: "200", paymentSlot: "201" });
+  await expect(submitReclaim(c.args)).rejects.toThrow(/positive remaining hold/);
+});
+
+test.each(["valid", "expiry-unavailable", "early-bank", "account-unavailable", "stale-slot", "wrong-owner", "changed-held", "changed-refundable", "zero-held", "changed-terms", "tampered-wire", "missing-origin", "status-unavailable", "status-confirmed", "status-succeeded", "recorded-success"])("expiry recovery fails closed: %s", async mode => {
+  const c = await pendingReclaim();
+  const original = c.journal.read(c.original.signature)!;
+  const oldRead = c.reader.getAccountAtLeast;
+  const reader: NonNullable<Parameters<typeof submitReclaim>[0]["reader"]> = { ...c.reader };
+  if (mode === "valid") reader.getFinalizedBlockhashStatus = async () => ({ kind: "ok", valid: true, slot: 200n });
+  if (mode === "expiry-unavailable") reader.getFinalizedBlockhashStatus = async () => ({ kind: "unavailable", detail: "429" });
+  if (mode === "early-bank") reader.getFinalizedBlockhashStatus = async () => ({ kind: "ok", valid: false, slot: 10n });
+  if (mode === "account-unavailable") reader.getAccountAtLeast = async () => ({ kind: "unavailable", detail: "timeout" });
+  if (mode === "status-unavailable") reader.getSignatureStatus = async () => ({ kind: "unavailable", detail: "429" });
+  if (mode === "status-confirmed") reader.getSignatureStatus = async () => ({ kind: "found", commitment: "confirmed", slot: 100n, err: null });
+  if (mode === "status-succeeded") reader.getSignatureStatus = async () => ({ kind: "found", commitment: "finalized", slot: 100n, err: null });
+  if (["stale-slot", "wrong-owner", "changed-held", "changed-refundable", "zero-held", "changed-terms"].includes(mode)) reader.getAccountAtLeast = async (a, fence) => {
+    const r = await oldRead(a, fence);
+    const account = { ...r.account!, data: new Uint8Array(r.account!.data) };
+    const v = new DataView(account.data.buffer);
+    if (mode === "changed-held") v.setBigUint64(160, 99n, true);
+    if (mode === "zero-held") v.setBigUint64(160, 0n, true);
+    if (mode === "changed-refundable") v.setBigUint64(168, 1n, true);
+    if (mode === "changed-terms") v.setBigUint64(144, 1n, true);
+    if (mode === "wrong-owner") account.owner = h.outsider.address;
+    return { ...r, slot: mode === "stale-slot" ? 199n : r.slot, account };
+  };
+  // A read seam leaves durable evidence untouched while presenting malformed legacy metadata.
+  const journal = { prepare: c.journal.prepare.bind(c.journal), resolve: c.journal.resolve.bind(c.journal), findByMessageHash: c.journal.findByMessageHash.bind(c.journal),
+    read: (s: string) => s !== c.original.signature ? c.journal.read(s) : { ...original, ...(mode === "tampered-wire" ? { transactionBase64: "tampered" } : {}), ...(mode === "missing-origin" ? { blockhashSlot: undefined } : {}), ...(mode === "recorded-success" ? { attempts: [{ preparedAt: "t", outcome: { result: "finalized-succeeded" as const, recordedAt: "t" } }] } : {}) } };
+  const n = h.ledger.submissions.length, state = await h.snapshot(c.payment);
+  await expect(submitReclaim({ ...c.args, reader, journal })).rejects.toThrow(/continuation is blocked/);
+  expect(h.ledger.submissions.length).toBe(n);
+  expect(await h.snapshot(c.payment)).toBe(state);
+  expect(c.journal.read(c.original.signature)?.attempts[0]?.outcome?.result).toBe("unresolved");
+});
+
+test("a concurrent release between proof and broadcast cannot pay twice", async () => {
+  const c = await pendingReclaim();
+  const concurrent = await import("../src/transactions.ts");
+  const competitor = await concurrent.buildTransaction({ feePayer: h.server.address,
+    instructions: [await concurrent.voidInstruction({ programId: h.facilitator.programId, payment: c.payment, payer: h.payer.address, server: h.server.address, mint: h.mint }, 100n, 0n)],
+    signers: [h.server], lifetime: h.lifetime() });
+  const before = h.tokens(await h.payerAta());
+  h.ledger.beforeSubmit = async () => {
+    h.ledger.beforeSubmit = undefined;
+    expect(await h.ledger.submit(competitor)).toMatchObject({ kind: "submitted", outcome: { status: "succeeded" } });
+  };
+  const result = await submitReclaim({ ...c.args, lifetime: h.lifetime() });
+  expect(result.result).toMatchObject({ kind: "submitted", outcome: { status: "failed", commitment: "finalized" } });
+  expect(h.state(c.payment).held).toBe(0n);
+  expect(h.tokens(await h.payerAta())).toBe(before + 100n);
+});
+
+test("legacy reclaim needs an authenticated operator origin and can recover without rewriting old metadata", async () => {
+  const c = await pendingReclaim();
+  const old = c.journal.read(c.original.signature)!;
+  const legacy = { prepare: c.journal.prepare.bind(c.journal), resolve: c.journal.resolve.bind(c.journal), findByMessageHash: c.journal.findByMessageHash.bind(c.journal),
+    read: (s: string) => s !== c.original.signature ? c.journal.read(s) : { ...old, blockhashSlot: undefined, lastValidBlockHeight: undefined } };
+  expect((await submitReclaim({ ...c.args, journal: legacy, retryBlockhashSlot: 10n })).result).toMatchObject({ kind: "submitted", outcome: { status: "succeeded" } });
+  expect(c.journal.read(c.original.signature)).toEqual(old);
+});
+
+test("concurrent server refund preserves its new F while reclaim returns only the remaining H", async () => {
+  const c = await pendingReclaim(20n);
+  const txs = await import("../src/transactions.ts");
+  const refund = await txs.buildTransaction({ feePayer: h.server.address,
+    instructions: [await txs.refundInstruction({ programId: h.facilitator.programId, payment: c.payment, payer: h.payer.address, server: h.server.address, mint: h.mint }, 10n, 80n, 20n)],
+    signers: [h.server], lifetime: h.lifetime() });
+  const before = h.tokens(await h.payerAta());
+  h.ledger.beforeSubmit = async () => {
+    h.ledger.beforeSubmit = undefined;
+    expect(await h.ledger.submit(refund)).toMatchObject({ kind: "submitted", outcome: { status: "succeeded" } });
+  };
+  expect((await submitReclaim(c.args)).result).toMatchObject({ kind: "submitted", outcome: { status: "succeeded" } });
+  expect(h.state(c.payment)).toMatchObject({ held: 0n, refundable: 10n });
+  expect(h.tokens(await h.payerAta())).toBe(before + 90n);
+});

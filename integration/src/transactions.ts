@@ -32,7 +32,7 @@ import {
   voidData,
 } from "./program.ts";
 
-export type Lifetime = { blockhash: Blockhash; lastValidBlockHeight: bigint };
+export type Lifetime = { blockhash: Blockhash; lastValidBlockHeight: bigint; blockhashSlot?: bigint };
 
 /** Compiles a legacy message with the sponsor as fee payer and applies the given partial signers. */
 export async function buildTransaction(a: {

@@ -857,3 +857,24 @@ describe("one absolute settlement deadline preserves reconciliation identity", (
     } finally { vi.useRealTimers(); rmSync(dir, { recursive: true, force: true }); }
   });
 });
+
+describe("reclaim finalized origin and expiry", () => {
+  test("requires an exact finalized ancestor, finalized invalidity, and a fenced response", async () => {
+    const calls: unknown[] = [];
+    const ledger = new RpcLedger({ network: NETWORK, genesisHash: GENESIS, rpcUrl: "http://unused.invalid", rpc: fakeRpc({
+      getBlock: (slot: bigint, config: unknown) => { calls.push([slot, config]); return sendable({ blockhash: "old" }); },
+      isBlockhashValid: (hash: string, config: unknown) => { calls.push([hash, config]); return sendable({ context: { slot: 200n }, value: false }); },
+    }) });
+    expect(await ledger.getFinalizedBlockhashStatus("old", 10n)).toEqual({ kind: "ok", valid: false, slot: 200n });
+    expect(calls).toEqual([[10n, { commitment: "finalized", transactionDetails: "none", rewards: false }], ["old", { commitment: "finalized", minContextSlot: 10n }]]);
+  });
+  test.each(["missing-origin", "different-fork", "malformed-slot", "lagging-bank", "malformed-value", "rpc-unavailable"])("fails closed on %s", async mode => {
+    let hashReads = 0;
+    const ledger = new RpcLedger({ network: NETWORK, genesisHash: GENESIS, rpcUrl: "http://unused.invalid", rpc: fakeRpc({
+      getBlock: () => mode === "rpc-unavailable" ? { send: () => Promise.reject(new Error("429")) } : sendable(mode === "missing-origin" ? null : { blockhash: mode === "different-fork" ? "other" : "old" }),
+      isBlockhashValid: () => { hashReads++; return sendable({ context: { slot: mode === "malformed-slot" ? "200" : mode === "lagging-bank" ? 9n : 200n }, value: mode === "malformed-value" ? null : false }); },
+    }) });
+    expect((await ledger.getFinalizedBlockhashStatus("old", 10n)).kind).toBe("unavailable");
+    if (["missing-origin", "different-fork", "rpc-unavailable"].includes(mode)) expect(hashReads).toBe(0);
+  });
+});

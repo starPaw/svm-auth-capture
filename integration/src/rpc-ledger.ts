@@ -267,8 +267,9 @@ export class RpcLedger implements Ledger, ChainReader {
 
   /** A finalized blockhash and its last valid block height, for building a new transaction. */
   async latestBlockhash(): Promise<Lifetime> {
-    const { value } = await this.request((abortSignal) => this.rpc.getLatestBlockhash({ commitment: "finalized" }).send({ abortSignal }));
-    return { blockhash: value.blockhash, lastValidBlockHeight: value.lastValidBlockHeight };
+    const { context, value } = await this.request((abortSignal) => this.rpc.getLatestBlockhash({ commitment: "finalized" }).send({ abortSignal }));
+    if (!validSlot(context?.slot)) throw new Error("malformed blockhash context");
+    return { blockhash: value.blockhash, lastValidBlockHeight: value.lastValidBlockHeight, blockhashSlot: BigInt(context.slot) };
   }
 
   async getAccount(address: Address): Promise<LedgerAccount | null> {
@@ -408,6 +409,26 @@ export class RpcLedger implements Ledger, ChainReader {
         this.rpc.isBlockhashValid(blockhash as Blockhash, { commitment: "processed" }).send({ abortSignal }),
       );
       if (typeof value !== "boolean" || !validSlot(context?.slot)) throw new Error("malformed blockhash response");
+      return { kind: "ok", valid: value, slot: BigInt(context.slot) };
+    } catch (error) {
+      return { kind: "unavailable", detail: describe(error) };
+    }
+  }
+
+  /** Authenticate a canonical finalized origin before treating an invalid hash as expired.
+   * A bare invalid hash could be unknown/newer than the bank; this ancestor cannot become
+   * valid again on the finalized chain. No wall-clock or fixed block-age assumption. */
+  async getFinalizedBlockhashStatus(blockhash: string, originSlot: bigint): Promise<BlockhashCheck> {
+    try {
+      if (originSlot < 0n) throw new Error("invalid blockhash origin slot");
+      const block = await this.request((abortSignal) => this.rpc.getBlock(originSlot, {
+        commitment: "finalized", transactionDetails: "none", rewards: false,
+      }).send({ abortSignal }));
+      if (!block || block.blockhash !== blockhash) throw new Error("blockhash does not match its finalized origin");
+      const { context, value } = await this.request((abortSignal) => this.rpc.isBlockhashValid(blockhash as Blockhash, {
+        commitment: "finalized", minContextSlot: originSlot,
+      }).send({ abortSignal }));
+      if (typeof value !== "boolean" || !validSlot(context?.slot) || BigInt(context.slot) < originSlot) throw new Error("malformed finalized blockhash response");
       return { kind: "ok", valid: value, slot: BigInt(context.slot) };
     } catch (error) {
       return { kind: "unavailable", detail: describe(error) };
