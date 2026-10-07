@@ -10,8 +10,9 @@
 // which holds the same message bytes without the sponsor signature. This journal never drives a
 // retry: it is evidence for manual reconciliation only.
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { ensureDurableDirectory, replaceDurableFile } from "./durable-file.ts";
 import type { Operation } from "./types.ts";
 
 export type SubmissionOutcome = "not-submitted" | "unresolved" | "finalized-succeeded" | "finalized-failed" | "submit-threw";
@@ -63,7 +64,7 @@ export class FileSubmissionJournal implements SubmissionJournal {
     if (options.create === false) {
       if (!existsSync(dir)) throw new Error(`submission journal ${dir} does not exist`);
     } else {
-      mkdirSync(dir, { recursive: true });
+      ensureDurableDirectory(dir);
     }
   }
 
@@ -72,9 +73,7 @@ export class FileSubmissionJournal implements SubmissionJournal {
   }
 
   private write(entry: SubmissionEntry): void {
-    const tmp = `${this.path(entry.signature)}.tmp-${process.pid}-${Date.now()}`;
-    writeFileSync(tmp, JSON.stringify(entry, null, 2));
-    renameSync(tmp, this.path(entry.signature));
+    replaceDurableFile(this.path(entry.signature), JSON.stringify(entry, null, 2));
   }
 
   prepare(entry: PreparedSubmission): void {

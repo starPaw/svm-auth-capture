@@ -3,8 +3,9 @@
 // identified by public key, and the RPC only through `redactRpcUrl`.
 import { appendFileSync, readFileSync } from "node:fs";
 import { type Address, createKeyPairSignerFromBytes, createSolanaRpc, type KeyPairSigner } from "@solana/kit";
+import { AccountState, getTokenDecoder } from "@solana-program/token";
 import { loadDeploymentRecord, type DeploymentRecord } from "../src/deployment-record.ts";
-import { ata, decodePayment } from "../src/program.ts";
+import { ata, decodePayment, TOKEN_PROGRAM_ADDRESS } from "../src/program.ts";
 import { redactRpcUrl, RpcLedger } from "../src/rpc-ledger.ts";
 
 export function env(name: string): string {
@@ -91,21 +92,21 @@ export type Snapshot = {
  * for a payment, its `(H,F)` and deadlines read at a finalized slot no older than `minSlot`.
  */
 export async function snapshot(c: Context, label: string, payment?: Address, minSlot = 0n): Promise<Snapshot> {
-  const rpc = createSolanaRpc(c.rpcUrl);
   const balance = async (owner: Address) => {
-    const signal = AbortSignal.timeout(10_000);
-    try {
-      const { context, value } = await rpc.getTokenAccountBalance(await ata(owner, c.mint), { commitment: "finalized" }).send({ abortSignal: signal });
-      return { slot: BigInt(context.slot), amount: value.amount as string };
-    } catch {
-      return { slot: 0n, amount: "absent" };
-    }
+    const read = await c.ledger.getAccountAtLeast(await ata(owner, c.mint), minSlot);
+    if (read.kind !== "ok") throw new Error(`balance snapshot unavailable: ${read.detail}`);
+    if (read.slot < minSlot) throw new Error("balance snapshot predates the required slot");
+    if (!read.account || read.account.owner !== TOKEN_PROGRAM_ADDRESS) throw new Error("balance snapshot requires an existing classic SPL token account");
+    const token = getTokenDecoder().decode(read.account.data);
+    if (token.mint !== c.mint || token.owner !== owner || token.state !== AccountState.Initialized) throw new Error("balance snapshot token account is unusable or has substituted terms");
+    return { slot: read.slot, amount: token.amount.toString() };
   };
   const [p, s, clock] = await Promise.all([balance(c.payer.address), balance(c.server.address), c.ledger.now()]);
   const snap: Snapshot = { label, clock: clock.toString(), balanceSlot: (p.slot < s.slot ? p.slot : s.slot).toString(), payerAta: p.amount, serverAta: s.amount };
   if (payment) {
     const read = await c.ledger.getAccountAtLeast(payment, minSlot);
     if (read.kind !== "ok") throw new Error(`payment snapshot unavailable: ${read.detail}`);
+    if (read.slot < minSlot) throw new Error("payment snapshot predates the required slot");
     const decoded = read.account && read.account.owner === c.record.programId ? decodePayment(read.account.data) : undefined;
     snap.payment = decoded
       ? {
@@ -125,11 +126,27 @@ export async function snapshot(c: Context, label: string, payment?: Address, min
 
 /** Same balances and payment state: a rejected operation changed nothing it guards. */
 export function unchanged(before: Snapshot, after: Snapshot): boolean {
+  // A historical snapshot with missing/unknown balances cannot prove preservation either.
+  if (![before.payerAta, before.serverAta, after.payerAta, after.serverAta].every((v) => /^(0|[1-9][0-9]*)$/.test(v))) return false;
   return (
     before.payerAta === after.payerAta &&
     before.serverAta === after.serverAta &&
     json(before.payment && { ...before.payment, slot: 0 }) === json(after.payment && { ...after.payment, slot: 0 })
   );
+}
+
+/** Success evidence must identify the exact signature's finalized slot, not a local clock. */
+export async function finalizedSlot(c: Context, signature: string): Promise<bigint> {
+  const status = await c.ledger.getSignatureStatus(signature);
+  if (status.kind !== "found" || status.commitment !== "finalized" || status.err !== null) throw new Error("finalized success slot unavailable; evidence remains unknown");
+  return status.slot;
+}
+
+/** Finalized history sets a read fence for the CLI's post-transaction payment snapshots. */
+export async function paymentHistorySlot(c: Context, payment: Address): Promise<bigint> {
+  const entries = await createSolanaRpc(c.rpcUrl).getSignaturesForAddress(payment, { commitment: "finalized", limit: 1 }).send({ abortSignal: AbortSignal.timeout(10_000) });
+  if (entries.length !== 1) throw new Error("payment history unavailable; cannot fence a post-transaction snapshot");
+  return entries[0]!.slot;
 }
 
 export async function waitForClock(c: Context, atLeast: bigint, why: string): Promise<bigint> {

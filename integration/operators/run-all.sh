@@ -67,12 +67,21 @@ start_services() {
   until grep -q "listening" "$LOG/resource-$tag.log"; do kill -0 "$RES_PID" 2>/dev/null || { cat "$LOG/resource-$tag.log"; exit 1; }; sleep 1; done
   cat "$LOG/facilitator-$tag.log" "$LOG/resource-$tag.log" | tee -a "$LOG/run-all.log"
 }
+stop_process_tree() {
+  local pid="$1" child
+  [[ -n "$pid" ]] || return 0
+  while read -r child; do
+    [[ -z "$child" ]] || stop_process_tree "$child"
+  done < <(pgrep -P "$pid" || true)
+  kill "$pid" 2>/dev/null || true
+}
 stop_services() {
   local tag="$1"
-  # npm starts the node process as a child: stop the services themselves, then their npm parents.
-  pkill -f 'src/devnet-(server|resource-server)\.ts' 2>/dev/null || true
-  kill "$FAC_PID" "$RES_PID" 2>/dev/null || true
+  # Stop only the processes this run owns; never kill another checkout's demo.
+  stop_process_tree "$FAC_PID"
+  stop_process_tree "$RES_PID"
   wait "$FAC_PID" "$RES_PID" 2>/dev/null || true
+  FAC_PID=""; RES_PID=""
   sleep 1
   {
     echo "services stopped ($tag) at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -136,6 +145,9 @@ run 20-chains "${NODE[@]}" evidence/chains.ts
 step "6. fault injection around the real adapter (criterion 3)"
 run 30-fault-injection "${NODE[@]}" evidence/fault-injection.ts
 
+step "7. real resource handler failure -> void (criterion 2)"
+run 40-handler-failure "${NODE[@]}" evidence/handler-failure.ts
+
 step "final state and per-payment transaction history"
 run 99-final "${NODE[@]}" evidence/snapshot.ts final
 run 99-history "${NODE[@]}" evidence/history.ts
@@ -146,5 +158,8 @@ if grep -rqF -e "$SOLANA_RPC_URL" -e "$SAC006_BEARER_TOKEN" "$OUT" || { [[ "$que
   echo "SECRET FOUND in $OUT; not keeping this run"; exit 1
 fi
 echo "no RPC credential or bearer token in the run directory" | tee -a "$LOG/run-all.log"
-(cd "$OUT" && find . -type f ! -name RUN_SHA256SUMS | sort | xargs shasum -a 256 > RUN_SHA256SUMS)
+# Finish all writers, including the EXIT trap's service-stop log, before hashing.
+stop_services final
+trap - EXIT
 echo "run complete: $OUT" | tee -a "$LOG/run-all.log"
+(cd "$OUT" && find . -type f ! -name RUN_SHA256SUMS | sort | xargs shasum -a 256 > RUN_SHA256SUMS && shasum -a 256 -c RUN_SHA256SUMS)

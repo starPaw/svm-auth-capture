@@ -3,7 +3,7 @@
 // operations on one payment and wait on the cluster Clock). Every rejection is bracketed by
 // finalized snapshots proving the guarded state did not change; any deviation exits non-zero.
 //   node --experimental-strip-types evidence/chains.ts      (env: see run-all.sh)
-import type { Address } from "@solana/kit";
+import { getSignatureFromTransaction, type Address } from "@solana/kit";
 import { Facilitator } from "../src/facilitator.ts";
 import { ata, reclaimAccounts, refundData, Tag, toInstruction, TOKEN_PROGRAM_ADDRESS } from "../src/program.ts";
 import { submitReclaim } from "../src/reclaim.ts";
@@ -21,7 +21,7 @@ import {
   voidPayload,
 } from "../src/transactions.ts";
 import type { PaymentRequirements, SettleResponse } from "../src/types.ts";
-import { check, context, emit, slotOf, snapshot, unchanged, waitForClock } from "./lib.ts";
+import { check, context, emit, finalizedSlot, slotOf, snapshot, unchanged, waitForClock } from "./lib.ts";
 
 type Terms = { maximum: bigint; dc: bigint; dr: bigint };
 
@@ -30,6 +30,11 @@ async function main(): Promise<void> {
   const { record, ledger, sponsor, payer, server, mint } = c;
   const facilitator = new Facilitator({ network: record.network.caip2, programId: record.programId, feePayer: sponsor, ledger });
   const lifetime = () => ledger.latestBlockhash();
+  // Every later account read must follow all transaction/expiry evidence already observed.
+  let evidenceSlot = 0n;
+  const advanceSlot = (slot: bigint) => { if (slot > evidenceSlot) evidenceSlot = slot; };
+  const state = (label: string, payment?: Address, minSlot = 0n) =>
+    snapshot(c, label, payment, minSlot > evidenceSlot ? minSlot : evidenceSlot);
 
   const requirements = (t: Terms): PaymentRequirements => ({
     scheme: "auth-capture",
@@ -47,17 +52,18 @@ async function main(): Promise<void> {
 
   async function succeeded(label: string, res: SettleResponse): Promise<SettleResponse> {
     check(res.success, `${label} settled`, { errorReason: res.errorReason });
+    advanceSlot(await finalizedSlot(c, res.transaction));
     emit(label, { signature: res.transaction, slot: await slotOf(c, res.transaction), result: res.extensions?.["auth-capture"] });
     return res;
   }
 
   /** A rejection must name `reason`, broadcast nothing, and leave the guarded state unchanged. */
   async function rejected(label: string, payment: Address | undefined, reason: string, attempt: () => Promise<SettleResponse>): Promise<void> {
-    const before = await snapshot(c, `${label}: before`, payment);
+    const before = await state(`${label}: before`, payment);
     const res = await attempt();
     emit(`REJECTION ${label}`, { errorReason: res.errorReason, transaction: res.transaction });
     check(!res.success && res.errorReason === reason && res.transaction === "", `${label} rejected with ${reason}, nothing broadcast`, { got: res.errorReason });
-    const after = await snapshot(c, `${label}: after`, payment, BigInt(before.payment?.slot ?? "0"));
+    const after = await state(`${label}: after`, payment, BigInt(before.payment?.slot ?? "0"));
     check(unchanged(before, after), `${label} left balances and (H,F) unchanged`);
   }
 
@@ -99,19 +105,25 @@ async function main(): Promise<void> {
       ],
       data,
     );
-    const target = BigInt((await snapshot(c, `transfer ${amount}: before`)).serverAta) + (to === server.address ? amount : -amount);
+    const target = BigInt((await state(`transfer ${amount}: before`)).serverAta) + (to === server.address ? amount : -amount);
     for (let attempt = 1; attempt <= 3; attempt += 1) {
       const life = await lifetime();
       const tx = await buildTransaction({ feePayer: sponsor.address, instructions: [ix], signers: [sponsor, from], lifetime: life });
       const result = await ledger.submit(tx);
       emit("setup token transfer", { amount, attempt, result });
-      if (result.kind === "submitted" && result.outcome?.status === "succeeded") return;
+      if (result.kind === "submitted" && result.outcome?.status === "succeeded") {
+        advanceSlot(await finalizedSlot(c, getSignatureFromTransaction(tx)));
+        return;
+      }
       for (;;) {
         const expiry = await ledger.isBlockhashValid(life.blockhash);
-        if (expiry.kind === "ok" && !expiry.valid) break;
+        if (expiry.kind === "ok" && !expiry.valid) {
+          advanceSlot(expiry.slot);
+          break;
+        }
         await new Promise((r) => setTimeout(r, 5_000));
       }
-      if (BigInt((await snapshot(c, `transfer ${amount}: after unresolved attempt ${attempt}`)).serverAta) === target) return;
+      if (BigInt((await state(`transfer ${amount}: after unresolved attempt ${attempt}`)).serverAta) === target) return;
     }
     check(false, `token transfer of ${amount} executed`);
   };
@@ -122,18 +134,18 @@ async function main(): Promise<void> {
   // ---- Chain A: authorize -> partial capture -> capture-and-void -> later refund (criterion 2)
   emit("CHAIN A", { steps: "authorize M=100 -> capture 30 -> capture 20 + release -> refund 15" });
   const tA: Terms = { maximum: 100n, dc: now0 + 480n, dr: now0 + 900n };
-  await snapshot(c, "A before");
+  await state("A before");
   const pA = await authorize(tA.maximum, tA.dc, tA.dr);
-  let s = await snapshot(c, "A after authorize", pA);
+  let s = await state("A after authorize", pA);
   check(s.payment?.held === "100" && s.payment.refundable === "0", "A (H,F)=(100,0)");
   await succeeded("A partial capture 30", await capture(pA, tA, 30n, false, 100n, 0n));
-  s = await snapshot(c, "A after partial capture", pA);
+  s = await state("A after partial capture", pA);
   check(s.payment?.held === "70" && s.payment.refundable === "30", "A (H,F)=(70,30)");
 
   await rejected("stale (H,F)", pA, "invalid_auth_capture_svm_unexpected_payment_state", () => capture(pA, tA, 20n, true, 100n, 0n));
 
   await succeeded("A capture-and-void 20", await capture(pA, tA, 20n, true, 70n, 30n));
-  s = await snapshot(c, "A after capture-and-void", pA);
+  s = await state("A after capture-and-void", pA);
   check(s.payment?.held === "0" && s.payment.refundable === "50", "A (H,F)=(0,50)");
 
   await rejected("terms mismatch (Dc differs from the stored payment)", pA, "invalid_auth_capture_svm_terms_mismatch", () =>
@@ -141,7 +153,7 @@ async function main(): Promise<void> {
   );
 
   await succeeded("A later refund 15", await refund(pA, tA, 15n, 0n, 50n));
-  s = await snapshot(c, "A after refund", pA);
+  s = await state("A after refund", pA);
   check(s.payment?.held === "0" && s.payment.refundable === "35", "A (H,F)=(0,35)");
 
   await rejected("unusable destination (payer token account replaced by the mint)", pA, "invalid_auth_capture_svm_accounts", async () => {
@@ -159,25 +171,25 @@ async function main(): Promise<void> {
 
   // Insufficient server liquidity: leave the server ATA below a refund that F allows, then restore.
   {
-    const before = await snapshot(c, "liquidity: server balance", pA);
+    const before = await state("liquidity: server balance", pA);
     const drain = BigInt(before.serverAta) - 5n;
     check(drain > 0n, "server ATA holds more than 5 to drain", { serverAta: before.serverAta });
     await tokenTransfer(server, payer.address, drain);
     await rejected("insufficient refund liquidity (server ATA 5 < refund 20 <= F 35)", pA, "invalid_auth_capture_svm_server_insufficient_funds", () => refund(pA, tA, 20n, 0n, 35n));
     await tokenTransfer(payer, server.address, drain);
-    const restored = await snapshot(c, "liquidity: restored", pA);
+    const restored = await state("liquidity: restored", pA);
     check(restored.serverAta === before.serverAta && restored.payment?.refundable === "35", "server liquidity restored; F still 35");
   }
 
-  // ---- Chain B: handler-failure void (criterion 2)
+  // ---- Chain B: direct lifecycle void; handler failure is exercised by handler-failure.ts
   emit("CHAIN B", { steps: "authorize M=50 -> void" });
   const nowB = await ledger.now();
   const tB: Terms = { maximum: 50n, dc: nowB + 180n, dr: nowB + 360n };
-  const bBefore = await snapshot(c, "B before");
+  const bBefore = await state("B before");
   const pB = await authorize(tB.maximum, tB.dc, tB.dr);
-  await snapshot(c, "B after authorize", pB);
-  await succeeded("B handler-failure void", await voidHold(pB, tB, 50n, 0n));
-  s = await snapshot(c, "B after void", pB);
+  await state("B after authorize", pB);
+  await succeeded("B direct lifecycle void", await voidHold(pB, tB, 50n, 0n));
+  s = await state("B after void", pB);
   check(s.payment?.held === "0" && s.payment.refundable === "0" && s.payerAta === bBefore.payerAta, "B hold fully released to the payer");
 
   // ---- Chain D: capture at/after Dc is refused (criterion 4)
@@ -221,11 +233,12 @@ async function main(): Promise<void> {
 
   // ---- Payer-direct reclaim of the remaining holds (D: uncaptured; E: after a partial capture).
   for (const [label, p] of [["D", pD], ["E", pE]] as const) {
-    const before = await snapshot(c, `${label} before payer reclaim`, p);
+    const before = await state(`${label} before payer reclaim`, p);
     const { signature, result } = await submitReclaim({ ledger, programId: record.programId, payer, payment: p, lifetime: await lifetime() });
     emit(`${label} payer reclaim`, { signature, slot: await slotOf(c, signature), result });
     check(result.kind === "submitted" && result.outcome?.status === "succeeded", `${label} reclaim finalized`);
-    const after = await snapshot(c, `${label} after payer reclaim`, p, BigInt(before.payment!.slot));
+    advanceSlot(await finalizedSlot(c, signature));
+    const after = await state(`${label} after payer reclaim`, p, BigInt(before.payment!.slot));
     check(
       after.payment?.held === "0" &&
         after.payment.refundable === before.payment?.refundable &&

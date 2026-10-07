@@ -24,8 +24,9 @@
 // The facilitator's own `SubmissionJournal` holds the fully co-signed bytes and signature,
 // written before broadcast; both share the same message bytes.
 import { createHash } from "node:crypto";
-import { mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { createDurableFile, ensureDurableDirectory, replaceDurableFile } from "./durable-file.ts";
 import type { SettleResponse } from "./types.ts";
 
 export type OperationStatus =
@@ -107,7 +108,7 @@ export class OperationStore {
   // under Node's `--experimental-strip-types`, which does not support parameter properties.
   constructor(dir: string) {
     this.dir = dir;
-    mkdirSync(dir, { recursive: true });
+    ensureDurableDirectory(dir);
   }
 
   private path(fp: string): string {
@@ -119,7 +120,7 @@ export class OperationStore {
     const now = new Date().toISOString();
     const record: OperationRecord = { fingerprint: fp, caller, resource, createdAt: now, updatedAt: now, status: "reserved" };
     try {
-      writeFileSync(this.path(fp), JSON.stringify(record, null, 2), { flag: "wx" });
+      createDurableFile(this.path(fp), JSON.stringify(record, null, 2));
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code === "EEXIST") throw new ReservationConflict(fp);
       throw e;
@@ -140,9 +141,7 @@ export class OperationStore {
     const existing = this.read(fp);
     if (!existing) throw new Error(`no reservation for fingerprint ${fp}`);
     const next: OperationRecord = { ...existing, ...patch, updatedAt: new Date().toISOString() };
-    const tmp = `${this.path(fp)}.tmp-${process.pid}-${Date.now()}`;
-    writeFileSync(tmp, JSON.stringify(next, null, 2));
-    renameSync(tmp, this.path(fp));
+    replaceDurableFile(this.path(fp), JSON.stringify(next, null, 2));
     return next;
   }
 

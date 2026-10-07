@@ -11,6 +11,7 @@ import {
   type Blockhash,
   getBase64EncodedWireTransaction,
   getSignatureFromTransaction,
+  getSolanaErrorFromTransactionError,
   getTransactionDecoder,
   isSolanaError,
   type Rpc,
@@ -18,12 +19,16 @@ import {
   SOLANA_ERROR__JSON_RPC__SERVER_ERROR_SEND_TRANSACTION_PREFLIGHT_FAILURE,
   SOLANA_ERROR__TRANSACTION_ERROR__ALREADY_PROCESSED,
   SOLANA_ERROR__TRANSACTION_ERROR__BLOCKHASH_NOT_FOUND,
+  SOLANA_ERROR__TRANSACTION_ERROR__UNKNOWN,
+  SOLANA_ERROR__INSTRUCTION_ERROR__UNKNOWN,
   type SolanaRpcApi,
   type Transaction,
+  type TransactionError,
 } from "@solana/kit";
 import type { FinalizedOutcome, Ledger, LedgerAccount, SimulationOutcome, SubmitResult } from "./ledger.ts";
 import type { BlockhashCheck, ChainReader, MessageSearch, SignatureLookup, SlotAccount } from "./reconciliation.ts";
 import type { Lifetime } from "./transactions.ts";
+import { isObject } from "./types.ts";
 
 const CLOCK_SYSVAR = "SysvarC1ock11111111111111111111111111111111" as Address;
 const base64Encoder = getBase64Encoder();
@@ -66,16 +71,57 @@ function decodeClockUnixTimestamp(data: Uint8Array): bigint {
 }
 
 /**
- * An RPC URL safe to log or put in an error: scheme, host, and path only. Provider API keys
- * travel in the query string or userinfo, and every message here can end up in evidence.
+ * Provider credentials can occur in any path, query, userinfo, or fragment. Keep only the
+ * endpoint origin; do not guess which path segments a provider uses for credentials.
  */
 export function redactRpcUrl(url: string): string {
   try {
     const u = new URL(url);
-    return `${u.protocol}//${u.host}${u.pathname === "/" ? "" : u.pathname}${u.search || u.username ? " (credentials redacted)" : ""}`;
+    return `${u.origin}${u.pathname !== "/" || u.search || u.username || u.password || u.hash ? " (credentials redacted)" : ""}`;
   } catch {
     return "<unparseable RPC URL>";
   }
+}
+
+const isIndex = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= 255;
+
+/** Require a known SDK error variant and its payload before treating it as failure evidence. */
+function validTransactionError(value: unknown): boolean {
+  if (typeof value !== "string") {
+    if (!isObject(value) || Object.keys(value).length !== 1) return false;
+    if ("InstructionError" in value) {
+      const parts = value.InstructionError;
+      if (!Array.isArray(parts) || parts.length !== 2 || !isIndex(parts[0])) return false;
+      const error = parts[1];
+      if (typeof error !== "string" && !(isObject(error) && Object.keys(error).length === 1 && typeof error.Custom === "number" && Number.isInteger(error.Custom) && error.Custom >= 0 && error.Custom <= 0xffff_ffff)) return false;
+    } else if ("DuplicateInstruction" in value) {
+      if (!isIndex(value.DuplicateInstruction)) return false;
+    } else {
+      const detail = value.InsufficientFundsForRent ?? value.ProgramExecutionTemporarilyRestricted;
+      if (!isObject(detail) || Object.keys(detail).length !== 1 || !isIndex(detail.account_index)) return false;
+    }
+  }
+  try {
+    const error = getSolanaErrorFromTransactionError(value as TransactionError);
+    return !isSolanaError(error, SOLANA_ERROR__TRANSACTION_ERROR__UNKNOWN) && !isSolanaError(error, SOLANA_ERROR__INSTRUCTION_ERROR__UNKNOWN);
+  } catch {
+    return false;
+  }
+}
+
+/** Runtime validation: SDK types do not establish that the provider returned these fields. */
+function signatureLookup(response: unknown): SignatureLookup {
+  const unavailable = (): SignatureLookup => ({ kind: "unavailable", detail: "malformed signature status response" });
+  if (!isObject(response) || !Array.isArray(response.value) || response.value.length !== 1) return unavailable();
+  const status: unknown = response.value[0];
+  if (status === null) return { kind: "not-found" };
+  if (!isObject(status) || !Object.hasOwn(status, "err")) return unavailable();
+  const commitment = status.confirmationStatus;
+  if (commitment !== "processed" && commitment !== "confirmed" && commitment !== "finalized") return unavailable();
+  const slot = status.slot;
+  if (!(typeof slot === "bigint" && slot >= 0n) && !(typeof slot === "number" && Number.isSafeInteger(slot) && slot >= 0)) return unavailable();
+  if (status.err !== null && !validTransactionError(status.err)) return unavailable();
+  return { kind: "found", slot: BigInt(slot as bigint | number), commitment, err: status.err === null ? null : JSON.stringify(status.err) };
 }
 
 function sleep(ms: number): Promise<void> {
@@ -262,13 +308,13 @@ export class RpcLedger implements Ledger, ChainReader {
   private async pollForFinalized(signature: string, deadline: number): Promise<FinalizedOutcome | undefined> {
     while (Date.now() < deadline) {
       try {
-        const { value } = await byDeadline(deadline, (abortSignal) =>
+        const response = await byDeadline(deadline, (abortSignal) =>
           this.rpc.getSignatureStatuses([asSignature(signature)], { searchTransactionHistory: true }).send({ abortSignal }),
         );
-        const status = value[0];
-        if (status && status.confirmationStatus === "finalized") {
+        const status = signatureLookup(response);
+        if (status.kind === "found" && status.commitment === "finalized") {
           if (status.err === null) return { status: "succeeded", commitment: "finalized" };
-          return { status: "failed", commitment: "finalized", error: JSON.stringify(status.err), logs: await this.fetchFinalizedLogs(signature) };
+          return { status: "failed", commitment: "finalized", error: status.err, logs: await this.fetchFinalizedLogs(signature) };
         }
         // `null` (missing history) or a weaker commitment is missing evidence, not proof of
         // non-finality: keep polling within the bounded wait.
@@ -286,16 +332,10 @@ export class RpcLedger implements Ledger, ChainReader {
 
   async getSignatureStatus(signature: string): Promise<SignatureLookup> {
     try {
-      const { value } = await this.request((abortSignal) =>
+      const response = await this.request((abortSignal) =>
         this.rpc.getSignatureStatuses([asSignature(signature)], { searchTransactionHistory: true }).send({ abortSignal }),
       );
-      const status = value[0];
-      if (!status) return { kind: "not-found" };
-      const commitment = status.confirmationStatus;
-      if (commitment !== "processed" && commitment !== "confirmed" && commitment !== "finalized") {
-        return { kind: "unavailable", detail: `malformed confirmationStatus ${JSON.stringify(commitment)}` };
-      }
-      return { kind: "found", slot: BigInt(status.slot), commitment, err: status.err === null ? null : JSON.stringify(status.err) };
+      return signatureLookup(response);
     } catch (error) {
       return { kind: "unavailable", detail: describe(error) };
     }
@@ -349,6 +389,7 @@ export class RpcLedger implements Ledger, ChainReader {
         const { context, value } = await byDeadline(deadline, (abortSignal) =>
           this.rpc.getAccountInfo(address, { encoding: "base64", commitment: "finalized", minContextSlot }).send({ abortSignal }),
         );
+        if (BigInt(context.slot) < minContextSlot) throw new Error("RPC returned an account older than minContextSlot");
         const account = value
           ? { owner: value.owner, data: decodeBase64(value.data[0]), lamports: value.lamports, executable: value.executable }
           : null;

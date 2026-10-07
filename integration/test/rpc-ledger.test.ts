@@ -74,8 +74,10 @@ describe("RpcLedger.verifyGenesis", () => {
     const error = await ledger.verifyGenesis().catch((e: Error) => e);
     expect(String(error)).toMatch(/https:\/\/devnet\.example-rpc\.com \(credentials redacted\)/);
     expect(String(error)).not.toContain("secret-key-value");
-    expect(redactRpcUrl("https://user:pw@rpc.example/v1?x=1")).toBe("https://rpc.example/v1 (credentials redacted)");
+    expect(redactRpcUrl("https://user:pw@rpc.example/v1?x=1")).toBe("https://rpc.example (credentials redacted)");
     expect(redactRpcUrl("https://api.devnet.solana.com")).toBe("https://api.devnet.solana.com");
+    expect(redactRpcUrl("https://rpc.example/v2/SYNTHETIC_PATH_KEY#secret")).toBe("https://rpc.example (credentials redacted)");
+    expect(redactRpcUrl("https://user:pw@rpc.example/token/?key=secret")).not.toMatch(/user|pw|token|secret/);
   });
 
   test("rejects a mismatched genesis", async () => {
@@ -167,7 +169,7 @@ describe("RpcLedger.simulate", () => {
       genesisHash: GENESIS,
       rpcUrl: "http://unused.invalid",
       rpc: fakeRpc({
-        simulateTransaction: () => sendable({ value: { err: { InstructionError: [0, "Custom"] }, logs: ["log a", "log b"] } }),
+        simulateTransaction: () => sendable({ value: { err: { InstructionError: [0, { Custom: 6 }] }, logs: ["log a", "log b"] } }),
       }),
     });
     const outcome = await ledger.simulate(await sampleTransaction());
@@ -314,7 +316,7 @@ describe("RpcLedger.submit", () => {
       pollIntervalMs: 1,
       rpc: fakeRpc({
         sendTransaction: () => sendable(signature),
-        getSignatureStatuses: () => sendable({ value: [{ confirmationStatus: "finalized", err: null }] }),
+        getSignatureStatuses: () => sendable({ value: [{ confirmationStatus: "finalized", err: null, slot: 7n }] }),
       }),
     });
     const result = await ledger.submit(transaction);
@@ -332,7 +334,7 @@ describe("RpcLedger.submit", () => {
       rpc: fakeRpc({
         sendTransaction: () => sendable(signature),
         getSignatureStatuses: () =>
-          sendable({ value: [{ confirmationStatus: "finalized", err: { InstructionError: [0, "Custom"] } }] }),
+          sendable({ value: [{ confirmationStatus: "finalized", err: { InstructionError: [0, { Custom: 6 }] }, slot: 7n }] }),
         getTransaction: () => sendable({ meta: { logMessages: ["failure log"] } }),
       }),
     });
@@ -441,7 +443,7 @@ describe("RpcLedger network awaits are bounded", () => {
       pollIntervalMs: 1,
       rpc: fakeRpc({
         sendTransaction: () => sendable(getSignatureFromTransaction(transaction)),
-        getSignatureStatuses: () => sendable({ value: [{ confirmationStatus: "finalized", err: { InstructionError: [0, "Custom"] }, slot: 1n }] }),
+        getSignatureStatuses: () => sendable({ value: [{ confirmationStatus: "finalized", err: { InstructionError: [0, { Custom: 6 }] }, slot: 1n }] }),
         getTransaction: () => stalled(signals),
       }),
     });
@@ -546,7 +548,7 @@ describe("RpcLedger network awaits are bounded", () => {
       rpc: fakeRpc({
         sendTransaction: () => sendable(getSignatureFromTransaction(transaction)),
         getSignatureStatuses: () => ({
-          send: () => new Promise((r) => setTimeout(() => r({ value: [{ confirmationStatus: "finalized", err: { InstructionError: [0, "Custom"] }, slot: 1n }] }), 25)),
+          send: () => new Promise((r) => setTimeout(() => r({ value: [{ confirmationStatus: "finalized", err: { InstructionError: [0, { Custom: 6 }] }, slot: 1n }] }), 25)),
         }),
         getTransaction: () => ({ send: () => new Promise((r) => setTimeout(() => r({ meta: { logMessages: ["late log"] } }), 15)) }),
       }),
@@ -604,12 +606,45 @@ describe("RpcLedger ChainReader", () => {
   const ledgerWith = (rpc: Partial<Record<keyof SolanaRpcApi, unknown>>) =>
     new RpcLedger({ network: NETWORK, genesisHash: GENESIS, rpcUrl: "http://unused.invalid", rpc: fakeRpc(rpc) });
 
+  test.each([
+    {},
+    { value: [] },
+    { value: [undefined] },
+    { value: [{ slot: 1n, confirmationStatus: "finalized" }] },
+    { value: [{ slot: -1n, confirmationStatus: "finalized", err: null }] },
+    { value: [{ slot: 1n, confirmationStatus: "finalized", err: false }] },
+    { value: [{ slot: 1n, confirmationStatus: "finalized", err: {} }] },
+    { value: [{ slot: 1n, confirmationStatus: "finalized", err: "UnknownFutureVariant" }] },
+    { value: [{ slot: 1n, confirmationStatus: "finalized", err: { InstructionError: [0, { Custom: -1 }] } }] },
+  ])("malformed status case %# stays unavailable, never definitive", async (response) => {
+    const sig = getSignatureFromTransaction(await sampleTransaction());
+    expect((await ledgerWith({ getSignatureStatuses: () => sendable(response) }).getSignatureStatus(sig)).kind).toBe("unavailable");
+  });
+
+  test("malformed finalized error remains pending without resending", async () => {
+    const tx = await sampleTransaction();
+    let broadcasts = 0;
+    const ledger = new RpcLedger({ network: NETWORK, genesisHash: GENESIS, rpcUrl: "http://unused.invalid", confirmTimeoutMs: 20, pollIntervalMs: 1, rpc: fakeRpc({
+      sendTransaction: () => { broadcasts += 1; return sendable(getSignatureFromTransaction(tx)); },
+      getSignatureStatuses: () => sendable({ value: [{ slot: 1n, confirmationStatus: "finalized" }] }),
+    }) });
+    expect(await ledger.submit(tx)).toEqual({ kind: "submitted", outcome: undefined });
+    expect(broadcasts).toBe(1);
+  });
+
+  test("ignores an account response older than its requested evidence slot", async () => {
+    let reads = 0;
+    const ledger = ledgerWith({ getAccountInfo: () => sendable({ context: { slot: ++reads === 1 ? 89n : 91n }, value: null }) });
+    expect(await ledger.getAccountAtLeast(PROGRAM_ID, 90n)).toEqual({ kind: "ok", slot: 91n, account: null });
+    expect(reads).toBe(2);
+  });
+
   test("reports a signature's slot, commitment, and error", async () => {
     const ledger = ledgerWith({
-      getSignatureStatuses: () => sendable({ value: [{ confirmationStatus: "confirmed", err: { InstructionError: [0, "Custom"] }, slot: 42n }] }),
+      getSignatureStatuses: () => sendable({ value: [{ confirmationStatus: "confirmed", err: { InstructionError: [0, { Custom: 6 }] }, slot: 42n }] }),
     });
     const sig = getSignatureFromTransaction(await sampleTransaction());
-    expect(await ledger.getSignatureStatus(sig)).toEqual({ kind: "found", slot: 42n, commitment: "confirmed", err: '{"InstructionError":[0,"Custom"]}' });
+    expect(await ledger.getSignatureStatus(sig)).toEqual({ kind: "found", slot: 42n, commitment: "confirmed", err: '{"InstructionError":[0,{"Custom":6}]}' });
   });
 
   test("reports missing history as not-found and an RPC failure as unavailable, never as absence", async () => {

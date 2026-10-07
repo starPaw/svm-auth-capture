@@ -134,6 +134,7 @@ function paymentEffect(sub: PreSubmission, op: SubmissionEvidence["op"], snapsho
 function verdictFor(e: Omit<SubmissionEvidence, "verdict">, sub: PreSubmission, snapshot?: PaymentSnapshot): Verdict {
   const s = e.status;
   if (s.kind === "found") {
+    if (s.err !== null && (typeof s.err !== "string" || s.err.length === 0)) return "unknown";
     if (s.commitment !== "finalized") return "not-final";
     return s.err === null ? "landed-succeeded" : "landed-failed";
   }

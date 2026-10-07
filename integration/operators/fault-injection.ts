@@ -20,7 +20,7 @@ import { reconcileEntry } from "../src/reconciliation.ts";
 import { createResourceApp, type HandlerResult } from "../src/resource-server.ts";
 import { SponsorshipGuard } from "../src/sponsorship.ts";
 import { FileSubmissionJournal } from "../src/submission-journal.ts";
-import { check, context, emit, slotOf, snapshot, waitForClock } from "./lib.ts";
+import { check, context, emit, finalizedSlot, slotOf, snapshot, waitForClock } from "./lib.ts";
 
 type Fault = "lost" | "weak";
 
@@ -245,7 +245,7 @@ async function main(): Promise<void> {
     check(report.submissions.map((s) => s.verdict).join(",") === "landed-succeeded,landed-succeeded", "both original transactions finalized");
     check(report.payment?.kind === "ok" && report.payment.exists && report.payment.held === "0", "payment at a finalized slot >= the capture shows H=0");
 
-    const stored = await snapshot(c, "step 6 payment", rec.terminal!.payment as Address);
+    const stored = await snapshot(c, "step 6 payment", rec.terminal!.payment as Address, await finalizedSlot(c, rec.terminal!.signature));
     const req = {
       scheme: "auth-capture",
       network: record.network.caip2,
@@ -285,7 +285,7 @@ async function main(): Promise<void> {
     }
     const { signature, result } = await submitReclaim({ ledger: real, programId: record.programId, payer, payment, lifetime: await real.latestBlockhash() });
     emit("payer reclaim", { payment, signature, slot: await slotOf(c, signature), result });
-    const after = await snapshot(c, "after reclaim", payment, BigInt(before.payment!.slot));
+    const after = await snapshot(c, "after reclaim", payment, await finalizedSlot(c, signature));
     check(after.payment?.held === "0" && BigInt(after.payerAta) === BigInt(before.payerAta) + BigInt(before.payment!.held!), "payer recovered exactly the hold");
   }
   emit("fault injection: all checks passed");
