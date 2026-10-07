@@ -23,14 +23,16 @@ import {
   captureAccounts,
   captureData,
   paymentAddress,
+  reclaimAccounts,
   refundAccounts,
   refundData,
+  Tag,
   toInstruction,
   voidAccounts,
   voidData,
-} from "./program.js";
+} from "./program.ts";
 
-export type Lifetime = { blockhash: Blockhash; lastValidBlockHeight: bigint };
+export type Lifetime = { blockhash: Blockhash; lastValidBlockHeight: bigint; blockhashSlot?: bigint };
 
 /** Compiles a legacy message with the sponsor as fee payer and applies the given partial signers. */
 export async function buildTransaction(a: {
@@ -134,6 +136,21 @@ export async function refundInstruction(
       payerAta: await ata(s.payer, s.mint),
     }),
     refundData(amount, expectedHeld, expectedRefundable),
+  );
+}
+
+/**
+ * The payer's direct reclaim: builds the one-signer `reclaim` instruction (wire: `[Tag.reclaim]`,
+ * no further fields). Never relayed through the facilitator (`/settle` rejects with
+ * `Reason.reclaimNotRelayed`): the payer signs, pays their own fee, and submits this directly
+ * against a `Ledger`, so it stays usable while the facilitator and resource server are both
+ * stopped.
+ */
+export async function reclaimInstruction(s: Stored): Promise<Instruction> {
+  return toInstruction(
+    s.programId,
+    reclaimAccounts({ payer: s.payer, payment: s.payment, mint: s.mint, vault: await ata(s.payment, s.mint), payerAta: await ata(s.payer, s.mint) }),
+    Uint8Array.of(Tag.reclaim),
   );
 }
 

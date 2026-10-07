@@ -201,24 +201,14 @@ describe("settlement outcomes", () => {
     try {
       const firstP = h.post("/settle", body);
       await enteredAtSubmit;
-      // The first request's preflight (including simulation) is done; the next simulation is the
-      // duplicate's, and its join into the in-flight map follows immediately after. Release the
-      // first request only then, so the duplicate is guaranteed to join rather than race.
-      let duplicateSimulating!: () => void;
-      const sawSimulate = new Promise<void>((resolve) => {
-        duplicateSimulating = resolve;
-      });
-      h.ledger.beforeSimulate = () => {
-        h.ledger.beforeSimulate = undefined;
-        duplicateSimulating();
-      };
-      const duplicateP = h.post("/settle", body);
-      await sawSimulate;
+      // Enter settle synchronously while the original is gated. Duplicate validation uses
+      // immutable data now, so it no longer simulates or depends on the live hold.
+      const duplicateP = h.facilitator.settle(body);
       release();
       const [first, duplicate] = await Promise.all([firstP, duplicateP]);
 
       expect(first.json).toMatchObject({ success: false, errorReason: Reason.transactionState });
-      expect(duplicate.json).toMatchObject({
+      expect(duplicate).toMatchObject({
         success: false,
         errorReason: Reason.duplicateSettlement,
         transaction: "",

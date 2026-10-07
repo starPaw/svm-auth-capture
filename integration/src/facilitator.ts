@@ -3,9 +3,11 @@
 // "Relay, recovery, and separation from application state". Preflight only: the program's
 // onchain guards remain authoritative, and no economic term is ever taken from the request
 // when the signed transaction or stored payment state defines it.
+import { isDeepStrictEqual } from "node:util";
 import {
   type Address,
   type CompiledTransactionMessage,
+  getBase64EncodedWireTransaction,
   getBase64Encoder,
   getCompiledTransactionMessageDecoder,
   getPublicKeyFromAddress,
@@ -20,7 +22,7 @@ import {
   verifySignature,
 } from "@solana/kit";
 import { AccountState, getMintDecoder, getTokenDecoder } from "@solana-program/token";
-import type { Ledger } from "./ledger.js";
+import type { Ledger, SubmitResult } from "./ledger.ts";
 import {
   type AccountSlot,
   ata,
@@ -38,9 +40,12 @@ import {
   TOKEN_PROGRAM_ADDRESS,
   U64_MAX,
   voidAccounts,
-} from "./program.js";
+} from "./program.ts";
+import { messageHash, submissionOutcome, SubmissionAlreadyReserved, type SubmissionJournal, type SubmissionOutcome } from "./submission-journal.ts";
 import {
+  EXTRA_KEYS,
   type FacilitatorRequest,
+  isObject,
   type OperationResult,
   type PaymentRequirements,
   Reason,
@@ -49,7 +54,7 @@ import {
   SCHEME,
   type SettleResponse,
   type VerifyResponse,
-} from "./types.js";
+} from "./types.ts";
 
 export const COMPUTE_BUDGET_PROGRAM_ADDRESS = "ComputeBudget111111111111111111111111111111" as Address;
 
@@ -64,15 +69,24 @@ export type FacilitatorConfig = {
   /** Bounds on the optional compute-budget instructions the sponsor pays for. */
   maxComputeUnitLimit?: number;
   maxComputeUnitPriceMicroLamports?: bigint;
+  /**
+   * Durable record of the exact co-signed bytes, signature, and blockhash lifetime, written
+   * before every broadcast (`submission-journal.ts`). Required by the Devnet runtime; optional
+   * for the bounded SAC-004 endpoint exercise, which claims no recovery behavior.
+   */
+  journal?: SubmissionJournal;
 };
 
 class Rejection extends Error {
-  constructor(
-    readonly reason: ReasonCode,
-    detail: string,
-    readonly payer?: string,
-  ) {
+  readonly reason: ReasonCode;
+  readonly payer?: string;
+
+  // Plain-field assignment, not a TS constructor parameter property: this file must stay runnable
+  // under Node's `--experimental-strip-types`, which does not support parameter properties.
+  constructor(reason: ReasonCode, detail: string, payer?: string) {
     super(detail);
+    this.reason = reason;
+    this.payer = payer;
   }
 }
 
@@ -85,6 +99,8 @@ type Verified = {
   transaction: Transaction;
   payer: Address;
   result: OperationResult;
+  /** The stored `(H,F)` pair the signed instruction expects (authorize: the empty `(0,0)`). */
+  expected: { held: bigint; refundable: bigint };
 };
 
 type Terms = {
@@ -95,16 +111,15 @@ type Terms = {
   refundDeadline: bigint;
 };
 
+type RequestProfile = { scheme: Record<string, unknown>; terms: Terms };
+type InFlightSettlement = { response: Promise<SettleResponse>; profile: RequestProfile };
+
 const transactionDecoder = getTransactionDecoder();
 const messageDecoder = getCompiledTransactionMessageDecoder();
 const tokenDecoder = getTokenDecoder();
 const mintDecoder = getMintDecoder();
 const base64 = getBase64Encoder();
 
-/** The only `extra` fields of the supported profile; see integration/README.md. */
-const EXTRA_KEYS = new Set(["paymentFlow", "captureDeadline", "refundDeadline", "programId", "feePayer"]);
-
-const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 
 /** The exact message bytes a `/settle` body would broadcast, or undefined if it carries none. */
 function messageKey(body: unknown): string | undefined {
@@ -147,13 +162,14 @@ export class Facilitator {
   private readonly ledger: Ledger;
   private readonly maxUnitLimit: number;
   private readonly maxUnitPrice: bigint;
+  private readonly journal?: SubmissionJournal;
   /**
    * Settlements in flight in this process, keyed by the exact message bytes of the validated
    * transaction. A concurrent identical `/settle` must not submit twice for one economic event;
-   * it receives the first operation's outcome with `duplicate: true`. Not durable: no journal
-   * or idempotency store.
+   * it receives a non-success response retaining an unresolved original's signature. This
+   * map is process-local; the separate submission journal protects broadcasts after restart.
    */
-  private readonly inFlight = new Map<string, Promise<SettleResponse>>();
+  private readonly inFlight = new Map<string, InFlightSettlement>();
 
   constructor(config: FacilitatorConfig) {
     if (config.ledger.network !== config.network) {
@@ -165,6 +181,7 @@ export class Facilitator {
     this.ledger = config.ledger;
     this.maxUnitLimit = config.maxComputeUnitLimit ?? 400_000;
     this.maxUnitPrice = config.maxComputeUnitPriceMicroLamports ?? 10_000n;
+    this.journal = config.journal;
   }
 
   get feePayerAddress(): Address {
@@ -188,35 +205,50 @@ export class Facilitator {
    * set synchronously from the raw message bytes, so a concurrent identical `/settle` always
    * joins it; the joiner validates its own request before joining, so a modified or corrupted
    * duplicate is rejected instead of joining the in-flight operation. A joined duplicate is
-   * never a second success: it reports `duplicate_settlement`, a non-success with an empty
-   * transaction, and broadcasts nothing. The first request's own response remains the
-   * operation's terminal receipt.
+   * never a second success and broadcasts nothing. It retains an unresolved original's
+   * signature; otherwise it reports `duplicate_settlement` without another success receipt.
    */
   async settle(body: unknown): Promise<SettleResponse> {
+    let profile: RequestProfile;
+    try {
+      profile = this.checkRequest(body);
+    } catch (e) {
+      return this.rejectionResponse(e);
+    }
     const key = messageKey(body);
     const first = key === undefined ? undefined : this.inFlight.get(key);
     if (first) {
-      // Validate before joining: an invalid variant of the same message bytes is rejected,
-      // never confused with the valid in-flight operation.
-      let payer: string | undefined;
+      // Validate only immutable request data and the economic signature. Re-reading mutable
+      // state or simulating could reject bytes that the original has already broadcast.
       try {
-        payer = (await this.check(body)).payer;
+        await this.checkDuplicate(profile, first.profile);
       } catch (e) {
         return this.rejectionResponse(e);
       }
-      await first;
+      const original = await first.response;
+      if (original.errorReason === Reason.settlementPending) return original;
       // Same message bytes and a validated profile: one economic event, one submission. The
       // standard SettleResponse has no duplicate marker, so a second success would let a
       // standard caller execute the resource twice; report a stable non-success instead.
-      return { success: false, errorReason: Reason.duplicateSettlement, transaction: "", network: this.network, ...(payer ? { payer } : {}) };
+      return { success: false, errorReason: Reason.duplicateSettlement, transaction: "", network: this.network, ...(original.payer ? { payer: original.payer } : {}) };
     }
     const settling = this.checkAndBroadcast(body);
-    if (key !== undefined) this.inFlight.set(key, settling);
+    if (key !== undefined) this.inFlight.set(key, { response: settling, profile: { terms: profile.terms, scheme: { ...profile.scheme } } });
     try {
       return await settling;
     } finally {
       if (key !== undefined) this.inFlight.delete(key);
     }
+  }
+
+  /** A duplicate's message key already equals the original; validate its unsigned metadata too. */
+  private async checkDuplicate(actual: RequestProfile, original: RequestProfile): Promise<void> {
+    if (!isDeepStrictEqual(actual.terms, original.terms)) reject(Reason.termsMismatch, "duplicate requirements differ from the original terms");
+    const { transaction: _actualTransaction, ...actualFields } = actual.scheme;
+    const { transaction: _originalTransaction, ...originalFields } = original.scheme;
+    if (!isDeepStrictEqual(actualFields, originalFields)) reject(Reason.payloadMismatch, "duplicate payload differs from the original operation");
+    const signer = await this.peekSecondSigner(actual.scheme.transaction);
+    await this.decodeTransaction(actual.scheme.transaction, signer);
   }
 
   private rejectionResponse(e: unknown): SettleResponse {
@@ -228,6 +260,17 @@ export class Facilitator {
 
   /** Validates once, then co-signs as fee payer, submits, and reports the finalized outcome. */
   private async checkAndBroadcast(body: unknown): Promise<SettleResponse> {
+    // Consult durable evidence before state preflight: changed state or an expired deadline
+    // cannot classify an earlier broadcast as rejected. Never return a second success either.
+    const key = messageKey(body);
+    if (this.journal && key !== undefined) {
+      try {
+        const previous = this.journal.findByMessageHash(messageHash(Buffer.from(key, "base64")));
+        if (previous.length > 0) return { success: false, errorReason: Reason.settlementPending, transaction: previous[0]!.signature, network: this.network };
+      } catch {
+        return { success: false, errorReason: Reason.settlementPending, transaction: "", network: this.network };
+      }
+    }
     let verified: Verified;
     try {
       verified = await this.check(body);
@@ -242,24 +285,41 @@ export class Facilitator {
     const signed = await partiallySignTransaction([this.feePayer.keyPair], verified.transaction);
     const signature = getSignatureFromTransaction(signed);
     const base = { transaction: signature, network: this.network, payer: verified.payer };
-    let outcome;
+    if (this.journal) {
+      try {
+        this.journal.prepare({
+          signature,
+          messageHash: messageHash(signed.messageBytes),
+          transactionBase64: getBase64EncodedWireTransaction(signed),
+          blockhash: messageDecoder.decode(signed.messageBytes).lifetimeToken,
+          operation: verified.result.operation,
+          payment: verified.result.payment,
+          payer: verified.payer,
+          expectedHeld: verified.expected.held.toString(),
+          expectedRefundable: verified.expected.refundable.toString(),
+        });
+      } catch (e) {
+        if (e instanceof SubmissionAlreadyReserved) return { success: false, errorReason: Reason.settlementPending, ...base };
+        // Nothing was broadcast: without a durable pre-broadcast record the bytes never leave.
+        console.error(`submission journal write failed for ${signature}; not broadcasting:`, e);
+        return { success: false, errorReason: Reason.settlementNotSubmitted, transaction: "", network: this.network, payer: verified.payer };
+      }
+    }
+    let outcome: SubmitResult;
     try {
       outcome = await this.ledger.submit(signed);
-    } catch {
+    } catch (e) {
+      this.recordOutcome(signature, "submit-threw", e instanceof Error ? e.message : String(e));
       return { success: false, errorReason: Reason.settlementPending, ...base };
     }
+    const { result, detail } = submissionOutcome(outcome);
+    this.recordOutcome(signature, result, detail);
     // The adapter established the exact bytes were never broadcast: a non-pending failure with
     // an empty transaction. A retry of the same bytes is fresh, not a second movement.
-    if (outcome.kind === "not-submitted") {
+    if (result === "not-submitted") {
       return { success: false, errorReason: Reason.settlementNotSubmitted, transaction: "", network: this.network, ...(verified.payer ? { payer: verified.payer } : {}) };
     }
-    // Broadcast but unresolved, or a malformed/mislabeled adapter result: stay pending with the
-    // broadcast signature. Never reclassified as not-submitted; an earlier broadcast may land.
-    const result = outcome.outcome;
-    if (!result || result.commitment !== "finalized") {
-      return { success: false, errorReason: Reason.settlementPending, ...base };
-    }
-    if (result.status === "succeeded") {
+    if (result === "finalized-succeeded") {
       // A void settles nothing to the server: omit the generic `amount` and keep the released
       // hold only in the extension result, so generic consumers never read it as revenue.
       return {
@@ -269,11 +329,22 @@ export class Facilitator {
         extensions: { [RESULT_KEY]: verified.result },
       };
     }
-    if (result.status === "failed") return { success: false, errorReason: Reason.transactionState, ...base };
+    if (result === "finalized-failed") return { success: false, errorReason: Reason.transactionState, ...base };
+    // Broadcast but unresolved: stay pending with the broadcast signature.
     return { success: false, errorReason: Reason.settlementPending, ...base };
   }
 
-  private async check(body: unknown): Promise<Verified> {
+  /** Evidence only: a failure to record the outcome never changes the settlement response. */
+  private recordOutcome(signature: string, result: SubmissionOutcome, detail?: string): void {
+    if (!this.journal) return;
+    try {
+      this.journal.resolve(signature, { result, recordedAt: new Date().toISOString(), ...(detail ? { detail } : {}) });
+    } catch (e) {
+      console.error(`submission journal outcome write failed for ${signature} (${result}):`, e);
+    }
+  }
+
+  private checkRequest(body: unknown): RequestProfile {
     if (!isObject(body)) reject(Reason.invalidPayload, "request body must be an object");
     if (body.x402Version !== 2) reject(Reason.x402Version, "x402Version must be 2");
     const payload = body.paymentPayload;
@@ -285,6 +356,11 @@ export class Facilitator {
     this.checkAccepted(request.paymentPayload.accepted, request.paymentRequirements, terms);
     const scheme = request.paymentPayload.payload;
     if (!isObject(scheme)) reject(Reason.invalidPayload, "payload must be an object");
+    return { scheme, terms };
+  }
+
+  private async check(body: unknown): Promise<Verified> {
+    const { scheme, terms } = this.checkRequest(body);
 
     if (scheme.type === undefined) return this.checkAuthorize(scheme, terms);
     if (scheme.type === "reclaim") reject(Reason.reclaimNotRelayed, "reclaim is payer-direct and never relayed through /settle");
@@ -305,7 +381,7 @@ export class Facilitator {
     if (!isObject(extra)) reject(Reason.invalidRequirements, "extra must be an object");
     // Zero-fee, single-wallet, escrow-only profile: any other selector (fee bounds, operator,
     // transfer method, capture mode, ...) is unsupported and rejected, never ignored.
-    const unsupported = Object.keys(extra).filter((k) => !EXTRA_KEYS.has(k));
+    const unsupported = Object.keys(extra).filter((k) => !EXTRA_KEYS.includes(k));
     if (unsupported.length > 0) reject(Reason.unsupportedExtra, `unsupported extra fields: ${unsupported.join(", ")}`);
     // Escrow is the scheme default; any other flow or an unknown value is unsupported.
     if (extra.paymentFlow !== undefined && extra.paymentFlow !== "escrow") reject(Reason.paymentFlow, "only paymentFlow=escrow is supported");
@@ -517,6 +593,7 @@ export class Facilitator {
       transaction,
       payer,
       result: { operation: "authorize", payment, amount: terms.maximum.toString(), held: terms.maximum.toString(), refundable: "0" },
+      expected: { held: 0n, refundable: 0n },
     };
   }
 
@@ -626,7 +703,7 @@ export class Facilitator {
       return reject(Reason.instructionData, "unsupported instruction", payer);
     }
     await this.simulate(transaction, payer);
-    return { transaction, payer, result };
+    return { transaction, payer, result, expected: { held: stored.held, refundable: stored.refundable } };
   }
 
   /** Explicit payload fields must equal the signed instruction; the signed bytes are what executes. */
