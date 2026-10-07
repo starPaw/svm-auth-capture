@@ -28,6 +28,7 @@ export class FaultyLedger implements Ledger {
   readonly network: string;
   private readonly real: Ledger;
   private armed?: { fault: Fault; skip: number };
+  private originalFaultResult?: SubmitResult;
 
   constructor(real: Ledger) {
     this.real = real;
@@ -36,6 +37,7 @@ export class FaultyLedger implements Ledger {
   /** Degrades the result of the submit() call after `skip` natural ones; one-shot. */
   arm(fault: Fault, skip = 0): void {
     this.armed = { fault, skip };
+    this.originalFaultResult = undefined;
   }
   disarm(): void {
     this.armed = undefined;
@@ -60,13 +62,19 @@ export class FaultyLedger implements Ledger {
     const real = await this.real.submit(transaction);
     // A controlled downgrade requires proved natural finality. Never relabel unknown/failure
     // as confirmed success or continue this campaign past an ambiguous original submission.
-    check(real.kind === "submitted" && real.outcome?.status === "succeeded" && real.outcome.commitment === "finalized", "fault injection requires a real finalized success; otherwise stop for original-signature reconciliation", { realResult: real });
+    this.originalFaultResult = real;
+    this.requireFinalizedOriginal();
     if (armed.fault === "lost") {
       emit("[FAULT INJECTED] result stripped", { realResult: real, returned: { kind: "submitted" } });
       return { kind: "submitted" };
     }
     emit("[FAULT INJECTED] commitment weakened", { realResult: real, returned: "confirmed" });
     return { kind: "submitted", outcome: { status: "succeeded", commitment: "confirmed" as "finalized" } };
+  }
+  /** The facilitator catches submit errors; the driver must independently stop at its boundary. */
+  requireFinalizedOriginal(): void {
+    const real = this.originalFaultResult;
+    check(real?.kind === "submitted" && real.outcome?.status === "succeeded" && real.outcome.commitment === "finalized", "fault injection requires a real finalized success; otherwise stop for original-signature reconciliation", { realResult: real });
   }
 }
 
@@ -145,6 +153,7 @@ async function main(): Promise<void> {
     const calls = handlerCalls;
     faulty.arm("lost");
     const res = await send(app.url, header);
+    faulty.requireFinalizedOriginal();
     const receipt = receiptOf(res);
     emit("response", { status: res.status, paymentResponse: receipt });
     check(res.status === 402 && receipt?.errorReason === "settlement_pending", "402 with a settlement_pending PAYMENT-RESPONSE");
@@ -173,6 +182,7 @@ async function main(): Promise<void> {
     const calls = handlerCalls;
     faulty.arm("weak");
     const res = await send(app.url, header);
+    faulty.requireFinalizedOriginal();
     emit("response", { status: res.status, paymentResponse: receiptOf(res) });
     check(res.status === 402 && receiptOf(res)?.errorReason === "settlement_pending", "confirmed-only is reported settlement_pending");
     check(handlerCalls === calls, "handler never started");
@@ -222,6 +232,7 @@ async function main(): Promise<void> {
     const salt = signed.salt;
     faulty.arm("lost", 1);
     const res = await send(app.url, signed.header);
+    faulty.requireFinalizedOriginal();
     check(res.status !== 402, "authorize finalized naturally before injecting the capture fault; otherwise stop");
     const calls = handlerCalls;
     const receipt = receiptOf(res!);
@@ -283,5 +294,6 @@ async function main(): Promise<void> {
 
 if (process.argv[1]?.endsWith("fault-injection.ts")) main().catch((error) => {
   console.error(error instanceof Error ? (error.stack ?? error.message) : String(error));
-  process.exitCode = 1;
+  // The failed campaign owns its ephemeral HTTP listeners; exit instead of leaving them live.
+  process.exit(1);
 });

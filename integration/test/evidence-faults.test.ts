@@ -20,6 +20,8 @@ describe("Devnet controlled fault evidence", () => {
     const { faulty, submit } = adapter(result as SubmitResult);
     faulty.arm("weak");
     await expect(faulty.submit(tx)).rejects.toThrow("requires a real finalized success");
+    // A facilitator may catch the adapter error. The driver must still refuse to continue.
+    expect(() => faulty.requireFinalizedOriginal()).toThrow("requires a real finalized success");
     expect(submit).toHaveBeenCalledTimes(1);
   });
 
@@ -27,6 +29,7 @@ describe("Devnet controlled fault evidence", () => {
     const { faulty, submit } = adapter({ kind: "submitted", outcome: { status: "succeeded", commitment: "finalized" } });
     faulty.arm(fault);
     const result = await faulty.submit(tx);
+    expect(() => faulty.requireFinalizedOriginal()).not.toThrow();
     expect(result).toEqual(fault === "lost" ? { kind: "submitted" } : { kind: "submitted", outcome: { status: "succeeded", commitment: "confirmed" } });
     expect(submit).toHaveBeenCalledTimes(1);
   });
