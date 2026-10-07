@@ -18,6 +18,8 @@ cd "$(dirname "$0")/.."
 : "${SOLANA_RPC_URL:?}" "${SAC006_FACILITATOR_KEYPAIR_PATH:?}" "${SAC006_PAYER_KEYPAIR_PATH:?}" "${SAC006_SERVER_KEYPAIR_PATH:?}" "${SAC006_ASSET_MINT:?}"
 export SAC006_DEPLOYMENT_RECORD_PATH="${SAC006_DEPLOYMENT_RECORD_PATH:-../docs/evidence/sac-007/deployment-identity.v1.json}"
 export SAC006_PORT="${SAC006_PORT:-8787}" SAC006_RESOURCE_PORT="${SAC006_RESOURCE_PORT:-8788}"
+# Settlement window for the in-process drivers (the services keep the 60s runtime default).
+export SAC006_CONFIRM_TIMEOUT_MS="${SAC006_CONFIRM_TIMEOUT_MS:-120000}"
 NODE=(node --experimental-strip-types --no-warnings)
 
 # The evidence must describe committed code: refuse a dirty runtime/driver tree.
@@ -51,6 +53,7 @@ step "manifest"
   if [[ -f ../target/deploy/svm_auth_capture.so ]]; then echo "local_sbf_sha256: $(shasum -a 256 ../target/deploy/svm_auth_capture.so | cut -d' ' -f1)"; fi
   echo "sponsor: $SPONSOR"; echo "payer: $PAYER"; echo "server: $SERVER"; echo "mint: $SAC006_ASSET_MINT"
   echo "authorize_amount: $SAC006_AUTHORIZE_AMOUNT capture_deadline_seconds: $SAC006_CAPTURE_DEADLINE_SECONDS refund_deadline_seconds: $SAC006_REFUND_DEADLINE_SECONDS"
+  echo "services_settlement_window_ms: 60000 (runtime default) drivers_settlement_window_ms: $SAC006_CONFIRM_TIMEOUT_MS"
   echo "rpc: $("${NODE[@]}" -e 'import("./src/rpc-ledger.ts").then(m => console.log(m.redactRpcUrl(process.env.SOLANA_RPC_URL)))')"
 } | tee "$OUT/MANIFEST.txt"
 shasum -a 256 src/*.ts evidence/* package.json package-lock.json tsconfig.json > "$OUT/SOURCE_SHA256SUMS"

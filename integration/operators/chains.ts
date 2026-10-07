@@ -80,7 +80,12 @@ async function main(): Promise<void> {
     const tx = await signedByServer(await refundInstruction(stored(p), amount, h, f));
     return facilitator.settle(body(req, refundPayload(p, tx, amount, h, f)));
   };
-  /** Classic SPL Token `Transfer` (tag 3), used only to move server liquidity for the refund-liquidity case. */
+  /**
+   * Classic SPL Token `Transfer` (tag 3), used only to move server liquidity for the
+   * refund-liquidity case; it is setup, not the behavior under test. An unresolved attempt is
+   * never blindly resent: the driver waits until its blockhash can no longer land, reads the
+   * finalized destination balance, and sends a new transfer only if the first did not execute.
+   */
   const tokenTransfer = async (from: typeof payer, to: Address, amount: bigint) => {
     const data = new Uint8Array(9);
     data[0] = 3;
@@ -94,9 +99,21 @@ async function main(): Promise<void> {
       ],
       data,
     );
-    const tx = await buildTransaction({ feePayer: sponsor.address, instructions: [ix], signers: [sponsor, from], lifetime: await lifetime() });
-    const result = await ledger.submit(tx);
-    check(result.kind === "submitted" && result.outcome?.status === "succeeded", `token transfer of ${amount} finalized`, { result });
+    const target = BigInt((await snapshot(c, `transfer ${amount}: before`)).serverAta) + (to === server.address ? amount : -amount);
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const life = await lifetime();
+      const tx = await buildTransaction({ feePayer: sponsor.address, instructions: [ix], signers: [sponsor, from], lifetime: life });
+      const result = await ledger.submit(tx);
+      emit("setup token transfer", { amount, attempt, result });
+      if (result.kind === "submitted" && result.outcome?.status === "succeeded") return;
+      for (;;) {
+        const check = await ledger.isBlockhashValid(life.blockhash);
+        if (check.kind === "ok" && !check.valid) break;
+        await new Promise((r) => setTimeout(r, 5_000));
+      }
+      if (BigInt((await snapshot(c, `transfer ${amount}: after unresolved attempt ${attempt}`)).serverAta) === target) return;
+    }
+    check(false, `token transfer of ${amount} executed`);
   };
 
   const now0 = await ledger.now();

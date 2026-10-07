@@ -50,7 +50,11 @@ export type Context = {
 export async function context(): Promise<Context> {
   const record = loadDeploymentRecord(env("SAC006_DEPLOYMENT_RECORD_PATH"));
   const rpcUrl = env("SOLANA_RPC_URL");
-  const ledger = new RpcLedger({ network: record.network.caip2, genesisHash: record.network.genesisHash, rpcUrl });
+  // Drivers may allow a longer settlement window than the 60s runtime default: Devnet finalization
+  // (or RPC status rate limiting) has been observed to exceed it, and a driver step that is not
+  // the scenario under test should not fail on that.
+  const confirmTimeoutMs = Number(process.env.SAC006_CONFIRM_TIMEOUT_MS ?? "60000");
+  const ledger = new RpcLedger({ network: record.network.caip2, genesisHash: record.network.genesisHash, rpcUrl, confirmTimeoutMs });
   await ledger.verifyGenesis();
   const [sponsor, payer, server] = await Promise.all([
     loadKeypair(env("SAC006_FACILITATOR_KEYPAIR_PATH")),
@@ -67,6 +71,7 @@ export async function context(): Promise<Context> {
     payer: payer.address,
     server: server.address,
     mint,
+    confirmTimeoutMs,
   });
   return { record, ledger, rpcUrl, sponsor, payer, server, mint };
 }

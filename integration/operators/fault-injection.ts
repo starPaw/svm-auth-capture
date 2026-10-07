@@ -114,6 +114,8 @@ async function main(): Promise<void> {
         handlerCalls += 1;
         return { ok: true, amount: AMOUNT, releaseRemainder: true };
       },
+      // Above this facilitator's worst case with the driver's settlement window.
+      facilitatorTimeoutMs: 300_000,
     });
   const policy: ClientPolicy = { network: record.network.caip2, programId: record.programId, payTo: server.address, asset: mint, maxAmount: AMOUNT, maxCaptureWindowSeconds: 300, feePayer: sponsor.address };
 
