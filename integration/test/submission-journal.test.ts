@@ -27,6 +27,35 @@ const facilitatorWith = (journal: SubmissionJournal) =>
   new Facilitator({ network: h.ledger.network, programId: h.facilitator.programId, feePayer: h.facilitatorKey, ledger: h.ledger, journal });
 
 describe("FileSubmissionJournal through Facilitator.settle", () => {
+  test("restart never resubmits an unresolved original, even while state still permits it", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "sac006-restart-"));
+    const submit = h.ledger.submit;
+    let broadcasts = 0;
+    h.ledger.submit = async () => { broadcasts += 1; return { kind: "submitted" }; };
+    try {
+      const body = h.body(authorizePayload(await h.signedAuthorize({ salt: h.newSalt() })));
+      const first = await facilitatorWith(new FileSubmissionJournal(dir)).settle(body);
+      const second = await facilitatorWith(new FileSubmissionJournal(dir)).settle(body);
+      expect(first.errorReason).toBe("settlement_pending");
+      expect(second).toMatchObject({ success: false, errorReason: "settlement_pending", transaction: first.transaction });
+      expect(broadcasts).toBe(1);
+    } finally { h.ledger.submit = submit; }
+  });
+
+  test("separate facilitators atomically reserve one broadcast", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "sac006-concurrent-journal-"));
+    const submit = h.ledger.submit;
+    let broadcasts = 0;
+    h.ledger.submit = async () => { broadcasts += 1; return { kind: "submitted" }; };
+    try {
+      const body = h.body(authorizePayload(await h.signedAuthorize({ salt: h.newSalt() })));
+      const results = await Promise.all([facilitatorWith(new FileSubmissionJournal(dir)).settle(body), facilitatorWith(new FileSubmissionJournal(dir)).settle(body)]);
+      expect(results.every(r => !r.success)).toBe(true);
+      expect(broadcasts).toBe(1);
+      expect(new FileSubmissionJournal(dir).list()[0]!.attempts).toHaveLength(1);
+    } finally { h.ledger.submit = submit; }
+  });
+
   test("persists the exact co-signed bytes, signature, and blockhash before broadcasting", async () => {
     const journal = new FileSubmissionJournal(mkdtempSync(join(tmpdir(), "sac006-journal-")));
     let atSubmit: SubmissionEntry[] = [];
@@ -66,7 +95,7 @@ describe("FileSubmissionJournal through Facilitator.settle", () => {
     }
   });
 
-  test("a re-broadcast of identical bytes appends an attempt and keeps the earlier outcome", async () => {
+  test("identical bytes cannot overwrite or append to the original unresolved reservation", async () => {
     const journal = new FileSubmissionJournal(mkdtempSync(join(tmpdir(), "sac006-journal-")));
     const base = {
       signature: "sig",
@@ -81,11 +110,11 @@ describe("FileSubmissionJournal through Facilitator.settle", () => {
     };
     journal.prepare(base);
     journal.resolve("sig", { result: "unresolved", recordedAt: "t1" });
-    journal.prepare(base);
+    expect(() => journal.prepare(base)).toThrow(/reconciliation/);
     const entry = journal.read("sig")!;
-    expect(entry.attempts).toHaveLength(2);
+    expect(entry.attempts).toHaveLength(1);
     expect(entry.attempts[0]!.outcome?.result).toBe("unresolved");
-    expect(entry.attempts[1]!.outcome).toBeUndefined();
+
   });
 
   test("opening a missing journal read-only fails instead of looking empty", () => {
@@ -94,6 +123,7 @@ describe("FileSubmissionJournal through Facilitator.settle", () => {
 
   test("a journal write failure prevents the broadcast", async () => {
     const failing: SubmissionJournal = {
+      findByMessageHash: () => [],
       prepare: () => {
         throw new Error("disk full");
       },

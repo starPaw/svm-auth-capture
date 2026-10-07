@@ -191,15 +191,35 @@ function preflightFailure(err: unknown): unknown {
 }
 
 describe("RpcLedger.submit", () => {
-  test("classifies a preflight execution error as not-submitted", async () => {
+  test.each(["ProviderInventedError", {}, { InstructionError: [0, { Custom: -1 }] }])("malformed preflight cause remains unresolved: %j", async (err) => {
+    const ledger = new RpcLedger({ network: NETWORK, genesisHash: GENESIS, rpcUrl: "http://unused.invalid", confirmTimeoutMs: 10, pollIntervalMs: 1,
+      rpc: fakeRpc({ sendTransaction: () => ({ send: () => Promise.reject(preflightFailure(err)) }) }) });
+    expect((await ledger.submit(await sampleTransaction())).kind).toBe("submitted");
+  });
+
+  test.each([{}, { value: undefined }, { value: false }, { value: 0 }])("a malformed account response cannot establish absence: %j", async (response) => {
+    const ledger = new RpcLedger({ network: NETWORK, genesisHash: GENESIS, rpcUrl: "http://unused.invalid", confirmTimeoutMs: 5, pollIntervalMs: 1,
+      rpc: fakeRpc({ getAccountInfo: () => sendable({ context: { slot: 100n }, ...response }) }) });
+    await expect(ledger.getAccount(PROGRAM_ID)).rejects.toThrow();
+    expect((await ledger.getAccountAtLeast(PROGRAM_ID, 1n)).kind).toBe("unavailable");
+  });
+
+  test.each([undefined, null, 0, "false"])("malformed blockhash validity stays unavailable: %j", async (value) => {
+    const ledger = new RpcLedger({ network: NETWORK, genesisHash: GENESIS, rpcUrl: "http://unused.invalid",
+      rpc: fakeRpc({ isBlockhashValid: () => sendable({ context: { slot: 100n }, value }) }) });
+    expect((await ledger.isBlockhashValid("bh")).kind).toBe("unavailable");
+  });
+
+  test("a preflight execution error without original status stays unresolved", async () => {
     const ledger = new RpcLedger({
       network: NETWORK,
       genesisHash: GENESIS,
       rpcUrl: "http://unused.invalid",
+      confirmTimeoutMs: 10, pollIntervalMs: 1,
       rpc: fakeRpc({ sendTransaction: () => ({ send: () => Promise.reject(preflightFailure({ InstructionError: [0, { Custom: 6 }] })) }) }),
     });
     const result = await ledger.submit(await sampleTransaction());
-    expect(result.kind).toBe("not-submitted");
+    expect(result.kind).toBe("submitted");
   });
 
   test("keeps an AlreadyProcessed preflight refusal submitted and resolves the original signature", async () => {
@@ -274,6 +294,7 @@ describe("RpcLedger.submit", () => {
       network: NETWORK,
       genesisHash: GENESIS,
       rpcUrl: "http://unused.invalid",
+      confirmTimeoutMs: 10, pollIntervalMs: 1,
       rpc: fakeRpc({
         sendTransaction: () => ({
           send: () => Promise.reject(preflightError),
@@ -281,7 +302,7 @@ describe("RpcLedger.submit", () => {
       }),
     });
     const result = await ledger.submit(await sampleTransaction());
-    expect(result).toEqual({ kind: "submitted" });
+    expect(result).toEqual({ kind: "submitted", outcome: undefined });
   });
 
   test("classifies a generic send failure as ambiguous submitted", async () => {

@@ -48,7 +48,6 @@ export type Verdict =
   | "landed-failed" // the original signature is finalized with an execution error: no economic effect
   | "not-final" // seen only at processed/confirmed commitment
   | "may-still-land" // not found and its blockhash is still valid
-  | "expired-not-executed" // blockhash expired, not found, and the payment state corroborates non-execution
   | "payment-exists-history-missing" // authorize not found, but the payment identity it creates exists
   | "unknown"; // evidence unavailable, or state moved for a reason this report cannot attribute: stays pending
 
@@ -143,7 +142,9 @@ function verdictFor(e: Omit<SubmissionEvidence, "verdict">, sub: PreSubmission, 
   const effect = paymentEffect(sub, e.op, snapshot);
   if (effect === "present") return "payment-exists-history-missing";
   if (effect === "unattributed") return "unknown";
-  return e.blockhashCheck.valid ? "may-still-land" : "expired-not-executed";
+  // false means invalid at that bank, not necessarily expired: it may be unknown to a
+  // lagging node or on a competing fork. Neither absence nor unchanged state closes that gap.
+  return e.blockhashCheck.valid ? "may-still-land" : "unknown";
 }
 
 async function readPayment(reader: ChainReader, programId: Address, payment: Address, minSlot: bigint): Promise<PaymentSnapshot> {
@@ -194,6 +195,6 @@ export async function reconcileEntry(
   const payment = await readPayment(reader, programId, subs[0]!.sub.payment as Address, minSlot);
 
   const submissions = partial.map((e, i) => ({ ...e, verdict: verdictFor(e, subs[i]!.sub, payment) }));
-  const definitive: ReadonlySet<Verdict> = new Set(["landed-succeeded", "landed-failed", "expired-not-executed"]);
+  const definitive: ReadonlySet<Verdict> = new Set(["landed-succeeded", "landed-failed"]);
   return { record, submissions, payment, conclusion: submissions.every((s) => definitive.has(s.verdict)) ? "definitive" : "pending" };
 }

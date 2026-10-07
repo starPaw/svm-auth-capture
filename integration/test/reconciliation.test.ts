@@ -151,13 +151,13 @@ describe("reconcileEntry: absence is never assumed", () => {
     expect(report.conclusion).toBe("pending");
   });
 
-  test("not found, blockhash expired, and no payment at a later slot: the authorize did not execute", async () => {
+  test("an unknown but still-live blockhash cannot prove expiry", async () => {
     const store = await storeWith({ authorize: {} });
     const reader = fakeReader({ blockhash: { kind: "ok", valid: false, slot: 500n } });
     const report = await reconcileEntry(store, reader, LOCAL_PROGRAM_ID, "fp");
-    expect(report.submissions[0]!.verdict).toBe("expired-not-executed");
+    expect(report.submissions[0]!.verdict).toBe("unknown");
     expect(reader.accountReads).toEqual([500n]);
-    expect(report.conclusion).toBe("definitive");
+    expect(report.conclusion).toBe("pending");
   });
 
   test("not found but the payment exists: history is missing, not absence", async () => {
@@ -168,11 +168,11 @@ describe("reconcileEntry: absence is never assumed", () => {
     expect(report.conclusion).toBe("pending");
   });
 
-  test("an expired terminal with the expected pair unchanged did not execute", async () => {
+  test("an unknown blockhash and unchanged pair cannot rule out later execution", async () => {
     const store = await storeWith({ authorize: { signature: "a" }, terminal: { op: "capture" } });
     const reader = fakeReader({ statuses: { a: finalized(10n) }, account: paymentAccount(100n, 0n) });
     const report = await reconcileEntry(store, reader, LOCAL_PROGRAM_ID, "fp");
-    expect(report.submissions.map((s) => s.verdict)).toEqual(["landed-succeeded", "expired-not-executed"]);
+    expect(report.submissions.map((s) => s.verdict)).toEqual(["landed-succeeded", "unknown"]);
   });
 
   test("an expired terminal whose pair moved is not attributed (payer reclaim also moves it)", async () => {

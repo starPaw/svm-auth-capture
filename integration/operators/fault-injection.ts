@@ -213,23 +213,13 @@ async function main(): Promise<void> {
   {
     const store = new OperationStore(storeDir("6-lost-capture"));
     const app = await startApp(resourceApp(store));
-    // The fault targets the capture, so the authorize must finalize naturally first. A natural
-    // unresolved authorize (slow finalization) is itself recorded, its hold reclaimed in cleanup,
-    // and the scenario retried with a new payment.
-    let res: Response | undefined;
-    let salt: Uint8Array = new Uint8Array();
-    for (let attempt = 1; attempt <= 3; attempt += 1) {
-      const signed = await signedHeader(app.url);
-      salt = signed.salt;
-      faulty.arm("lost", 1);
-      res = await send(app.url, signed.header);
-      if (res.status !== 402) break;
-      faulty.disarm();
-      const rec = store.read(fingerprint(payer.address, "/resource", salt))!;
-      emit("NATURAL authorize unresolved before the injected capture fault; retrying with a new payment", { attempt, status: rec.status, receipt: rec.authorizeReceipt });
-      check(rec.status === "authorize-pending" && rec.handlerResult === undefined, "the naturally unresolved authorize stayed authorize-pending; the handler did not run for it");
-      holds.push({ payment: rec.authorize!.payment as Address, captureDeadline: signed.captureDeadline });
-    }
+    // Any naturally unresolved authorization stops this scenario. Never create fresh consent
+    // to get past an unknown outcome; retain its original journal for manual reconciliation.
+    const signed = await signedHeader(app.url);
+    const salt = signed.salt;
+    faulty.arm("lost", 1);
+    const res = await send(app.url, signed.header);
+    check(res.status !== 402, "authorize finalized naturally before injecting the capture fault; otherwise stop");
     const calls = handlerCalls;
     const receipt = receiptOf(res!);
     const body = (await res!.json()) as { ok?: boolean };
@@ -268,7 +258,7 @@ async function main(): Promise<void> {
       })
     ).json()) as { success: boolean; errorReason?: string };
     emit("NATURAL naive retry of the journaled capture bytes", { result: retried });
-    check(!retried.success && retried.errorReason === "invalid_auth_capture_svm_unexpected_payment_state", "refused against current (H,F); never a second payment");
+    check(!retried.success && retried.errorReason === "settlement_pending", "durable reservation refused another broadcast; never a second payment");
     const after = await snapshot(c, "step 6 payment after retry", t.payment as Address, BigInt(stored.payment!.slot));
     check(after.payment?.held === stored.payment?.held && after.payment?.refundable === stored.payment?.refundable, "retry left (H,F) unchanged");
     await app.close();
@@ -283,7 +273,7 @@ async function main(): Promise<void> {
       emit("no hold to reclaim", { payment, state: before.payment });
       continue;
     }
-    const { signature, result } = await submitReclaim({ ledger: real, programId: record.programId, payer, payment, lifetime: await real.latestBlockhash() });
+    const { signature, result } = await submitReclaim({ ledger: real, programId: record.programId, payer, payment, lifetime: await real.latestBlockhash(), journal });
     emit("payer reclaim", { payment, signature, slot: await slotOf(c, signature), result });
     const after = await snapshot(c, "after reclaim", payment, await finalizedSlot(c, signature));
     check(after.payment?.held === "0" && BigInt(after.payerAta) === BigInt(before.payerAta) + BigInt(before.payment!.held!), "payer recovered exactly the hold");

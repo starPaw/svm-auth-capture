@@ -55,7 +55,7 @@ export async function context(): Promise<Context> {
   // (or RPC status rate limiting) has been observed to exceed it, and a driver step that is not
   // the scenario under test should not fail on that.
   const confirmTimeoutMs = Number(process.env.SAC006_CONFIRM_TIMEOUT_MS ?? "60000");
-  const ledger = new RpcLedger({ network: record.network.caip2, genesisHash: record.network.genesisHash, rpcUrl, confirmTimeoutMs });
+  const ledger = new RpcLedger({ deployment: record, network: record.network.caip2, genesisHash: record.network.genesisHash, rpcUrl, confirmTimeoutMs });
   await ledger.verifyGenesis();
   const [sponsor, payer, server] = await Promise.all([
     loadKeypair(env("SAC006_FACILITATOR_KEYPAIR_PATH")),

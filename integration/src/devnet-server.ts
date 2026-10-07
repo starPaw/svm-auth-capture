@@ -34,7 +34,7 @@ async function main(): Promise<void> {
   const rpcUrl = requireEnv("SOLANA_RPC_URL");
   const feePayer = await loadFeePayer(requireEnv("SAC006_FACILITATOR_KEYPAIR_PATH"));
 
-  const ledger = new RpcLedger({ network: record.network.caip2, genesisHash: record.network.genesisHash, rpcUrl });
+  const ledger = new RpcLedger({ deployment: record, network: record.network.caip2, genesisHash: record.network.genesisHash, rpcUrl });
   await ledger.verifyGenesis();
 
   // The exact co-signed bytes, signature, and blockhash of every broadcast are written here first.

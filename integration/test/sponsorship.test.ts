@@ -19,6 +19,13 @@ function fakeLedger(balance: bigint): Ledger {
 }
 
 describe("SponsorshipGuard.check", () => {
+  test.each([NaN, Infinity, -1, 1.5, Number.MAX_SAFE_INTEGER + 1])("rejects an invalid attempt limit: %s", (maxAttempts) => {
+    expect(() => new SponsorshipGuard({ ledger: fakeLedger(10n), feePayer: FEE_PAYER, maxAttempts, minLamportsBalance: 1n })).toThrow(/maxAttempts/);
+  });
+
+  test("rejects a negative balance floor", () => {
+    expect(() => new SponsorshipGuard({ ledger: fakeLedger(10n), feePayer: FEE_PAYER, maxAttempts: 1, minLamportsBalance: -1n })).toThrow(/minLamportsBalance/);
+  });
   test("authorizes attempts while under the cap and above the balance floor", async () => {
     const guard = new SponsorshipGuard({ ledger: fakeLedger(10_000n), feePayer: FEE_PAYER, maxAttempts: 2, minLamportsBalance: 1_000n });
     expect(await guard.check()).toBeUndefined();

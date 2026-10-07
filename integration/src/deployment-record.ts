@@ -23,6 +23,14 @@ export const ACCEPTED_DEPLOYMENT_RECORD = {
 export type DeploymentRecord = {
   network: { cluster: string; genesisHash: string; caip2: string };
   programId: Address;
+  deployment: {
+    loader: Address;
+    programData: Address;
+    upgradeAuthority: Address | null;
+    slot: bigint;
+    executableSha256: string;
+    executableSize: number;
+  };
   /** The pinned accepted record's SHA-256 this file matched (byte-exact, or after CRLF → LF). */
   sha256: string;
 };
@@ -181,7 +189,13 @@ export function parseDeploymentRecord(raw: unknown): Omit<DeploymentRecord, "sha
     if (outside) fail(`verification.evidence_paths entry ${JSON.stringify(path)} is not a relative path inside the evidence directory`);
   }
 
-  return { network: { cluster: network.cluster, genesisHash, caip2 }, programId };
+  if (loader !== UPGRADEABLE_LOADER || program.program_data === null) fail("runtime supports only the accepted upgradeable-loader layout");
+  if (artifactSize <= 0n || artifactSize > 10_485_760n) fail("build.artifact_size_bytes is outside the supported executable size");
+  return { network: { cluster: network.cluster, genesisHash, caip2 }, programId, deployment: {
+    loader, programData: program.program_data as Address,
+    upgradeAuthority: authorityStatus === "present" ? authority.public_key as Address : null,
+    slot: deploymentSlot, executableSha256: artifactSha256, executableSize: Number(artifactSize),
+  } };
 }
 
 /**

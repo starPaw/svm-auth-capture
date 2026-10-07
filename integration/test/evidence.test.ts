@@ -1,4 +1,9 @@
-import { type Address } from "@solana/kit";
+import { generateKeyPairSigner, type Address } from "@solana/kit";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { transferSetupTokens } from "../operators/chains.ts";
+import { FileSubmissionJournal } from "../src/submission-journal.ts";
 import { AccountState, getTokenEncoder } from "@solana-program/token";
 import { expect, test } from "vitest";
 import { type Context, type Snapshot, finalizedSlot, snapshot, unchanged } from "../operators/lib.ts";
@@ -8,6 +13,19 @@ import type { SlotAccount } from "../src/reconciliation.ts";
 const payer = "11111111111111111111111111111112" as Address;
 const server = "11111111111111111111111111111113" as Address;
 const mint = "11111111111111111111111111111114" as Address;
+
+test.each([undefined, { status: "succeeded", commitment: "confirmed" }])("setup transfers retain original bytes and never retry an unresolved result: %j", async (outcome) => {
+  const [sponsor, payer, server] = await Promise.all([generateKeyPairSigner(), generateKeyPairSigner(), generateKeyPairSigner()]);
+  const journal = new FileSubmissionJournal(mkdtempSync(join(tmpdir(), "sac006-setup-")));
+  let sends = 0;
+  const c = { sponsor, payer, server, mint, ledger: {
+    latestBlockhash: async () => ({ blockhash: "11111111111111111111111111111111", lastValidBlockHeight: 1n }),
+    submit: async () => { sends += 1; expect(journal.list()).toHaveLength(1); return { kind: "submitted", outcome }; },
+  } } as unknown as Context;
+  await expect(transferSetupTokens(c, journal, payer, server.address, 1n)).rejects.toThrow(/stop for original-signature reconciliation/);
+  expect(sends).toBe(1);
+  expect(journal.list()[0]?.transactionBase64).toBeTruthy();
+});
 
 async function fixture(read?: (a: Address, slot: bigint) => Promise<SlotAccount>) {
   const payerAta = await ata(payer, mint);

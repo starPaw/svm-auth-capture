@@ -73,7 +73,7 @@ export type OperationRecord = {
   authorize?: PreSubmission;
   /** The facilitator's settle response for the authorize, including a pending or failed one. */
   authorizeReceipt?: SettleResponse;
-  handlerResult?: { ok: boolean; detail?: string };
+  handlerResult?: { ok: boolean; detail?: string; amount?: string; releaseRemainder?: boolean };
   terminal?: PreSubmission & { op: "capture" | "void" };
   terminalReceipt?: SettleResponse;
   note?: string;

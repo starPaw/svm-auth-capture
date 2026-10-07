@@ -34,6 +34,8 @@ export class SponsorshipGuard {
   // Plain-field assignment, not a TS constructor parameter property: this file must stay runnable
   // under Node's `--experimental-strip-types`, which does not support parameter properties.
   constructor(config: SponsorshipGuardConfig) {
+    if (!Number.isSafeInteger(config.maxAttempts) || config.maxAttempts < 0) throw new Error("maxAttempts must be a nonnegative safe integer");
+    if (config.minLamportsBalance < 0n) throw new Error("minLamportsBalance must be nonnegative");
     this.config = config;
   }
 

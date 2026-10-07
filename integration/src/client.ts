@@ -171,7 +171,7 @@ async function main(): Promise<void> {
     ...(process.env.SAC006_CLIENT_EXPECTED_FEE_PAYER ? { feePayer: process.env.SAC006_CLIENT_EXPECTED_FEE_PAYER as Address } : {}),
   };
   // The RPC this client reads the clock and blockhash from must be the record's cluster.
-  const ledger = new RpcLedger({ network: record.network.caip2, genesisHash: record.network.genesisHash, rpcUrl: requireEnv("SOLANA_RPC_URL") });
+  const ledger = new RpcLedger({ deployment: record, network: record.network.caip2, genesisHash: record.network.genesisHash, rpcUrl: requireEnv("SOLANA_RPC_URL") });
   await ledger.verifyGenesis();
 
   const result = await payForResource({

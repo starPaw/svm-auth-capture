@@ -320,7 +320,7 @@ describe("unresolved and refused settlements keep their evidence and never compl
     const record = store.list().find((r) => r.terminalReceipt?.transaction === receipt.transaction)!;
     expect(record.status).toBe("terminal-pending");
     expect(record.terminal!.signature).toBe(receipt.transaction);
-    expect(record.handlerResult).toEqual({ ok: true });
+    expect(record.handlerResult).toEqual({ ok: true, amount: "100", releaseRemainder: true });
   });
 
   test("a facilitator that never answers is cut off at facilitatorTimeoutMs and stays unresolved", async () => {
@@ -343,7 +343,7 @@ describe("unresolved and refused settlements keep their evidence and never compl
 
   test("an unrecognized facilitator reason is unresolved, never a definitive rejection", async () => {
     const unknown: typeof fetch = async () =>
-      new Response(JSON.stringify({ success: false, errorReason: "some_future_reason", transaction: "FutureSig", network: h.ledger.network }), { status: 200 });
+      new Response(JSON.stringify({ success: false, errorReason: "some_future_reason", transaction: "", network: h.ledger.network }), { status: 200 });
     const app = await startServer(createResourceApp(resourceConfig({ fetchImpl: unknown })));
     try {
       const calledBefore = handlerCalls;
@@ -352,7 +352,7 @@ describe("unresolved and refused settlements keep their evidence and never compl
       expect(handlerCalls).toBe(calledBefore);
       const record = store.list().find((r) => r.authorizeReceipt?.errorReason === "some_future_reason")!;
       expect(record.status).toBe("authorize-pending");
-      expect(record.authorize!.signature).toBe("FutureSig");
+      expect(record.authorize!.signature).toBe("");
     } finally {
       await app.close();
     }
@@ -378,6 +378,39 @@ describe("unresolved and refused settlements keep their evidence and never compl
 });
 
 describe("gateway: authentication and allowlist precede the facilitator", () => {
+  test("a crash after metering preserves the complete handler result before terminal signing", async () => {
+    const app = await startServer(createResourceApp(resourceConfig({
+      handler: async () => ({ ok: true, amount: 37n, releaseRemainder: false }),
+      getLatestBlockhash: async () => { throw new Error("injected stop after metering"); },
+    })));
+    try {
+      const response = await pay(app.url);
+      expect(response.status).toBe(500);
+      const record = store.unresolved().find(r => r.note?.includes("injected stop after metering"))!;
+      expect(record.status).toBe("handler-succeeded");
+      expect(record.handlerResult).toEqual({ ok: true, amount: "37", releaseRemainder: false });
+      expect(record.terminal).toBeUndefined();
+    } finally { await app.close(); }
+  });
+  test.each(["empty", "foreign-network", "unrelated-signature", "http-error"])("malformed success receipt (%s) never starts the handler or leaks success", async (variant) => {
+    const corrupt: typeof fetch = async (input, init) => {
+      const response = await fetch(input, init);
+      const receipt = await response.json() as SettleResponse;
+      if (variant === "empty") receipt.transaction = "";
+      if (variant === "foreign-network") receipt.network = "solana:foreign";
+      if (variant === "unrelated-signature") receipt.transaction = "1".repeat(64);
+      return new Response(JSON.stringify(receipt), { status: variant === "http-error" ? 500 : 200 });
+    };
+    const app = await startServer(createResourceApp(resourceConfig({ fetchImpl: corrupt })));
+    try {
+      const before = handlerCalls;
+      const response = await pay(app.url);
+      expect(handlerCalls).toBe(before);
+      expect(response.status).toBe(402);
+      expect(response.paymentResponse).toMatchObject({ success: false, errorReason: "settlement_pending" });
+    } finally { await app.close(); }
+  });
+
   test("a request with no bearer token is rejected before reaching the facilitator", async () => {
     const before = h.ledger.submissions.length;
     const res = await fetch(`${gateway.url}/settle`, {

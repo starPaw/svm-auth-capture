@@ -29,7 +29,7 @@ async function main(): Promise<void> {
   }
 
   const record = loadDeploymentRecord(requireEnv("SAC006_DEPLOYMENT_RECORD_PATH"));
-  const ledger = new RpcLedger({ network: record.network.caip2, genesisHash: record.network.genesisHash, rpcUrl: requireEnv("SOLANA_RPC_URL") });
+  const ledger = new RpcLedger({ deployment: record, network: record.network.caip2, genesisHash: record.network.genesisHash, rpcUrl: requireEnv("SOLANA_RPC_URL") });
   await ledger.verifyGenesis();
   // Optional: the facilitator's pre-broadcast journal identifies a signature whose receipt was lost.
   const journalDir = process.env.SAC006_FACILITATOR_JOURNAL_DIR;

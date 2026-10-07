@@ -5,14 +5,14 @@
 // exact broadcast bytes, their signature, and their blockhash lifetime are persisted here,
 // before `Ledger.submit` is called. If that write fails, nothing is broadcast.
 //
-// One JSON file per signature, written via write-to-temp-then-rename. `messageHash` (SHA-256 of
+// One exclusively reserved JSON file per signature; outcomes use write-temp-then-rename. `messageHash` (SHA-256 of
 // the message bytes) lets an operator correlate an entry with a resource server's own journal,
-// which holds the same message bytes without the sponsor signature. This journal never drives a
-// retry: it is evidence for manual reconciliation only.
+// which holds the same message bytes without the sponsor signature. Existing entries prevent any new broadcast of the same message, including after restart;
+// they never drive a retry.
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { ensureDurableDirectory, replaceDurableFile } from "./durable-file.ts";
+import { createDurableFile, ensureDurableDirectory, replaceDurableFile } from "./durable-file.ts";
 import type { Operation } from "./types.ts";
 
 export type SubmissionOutcome = "not-submitted" | "unresolved" | "finalized-succeeded" | "finalized-failed" | "submit-threw";
@@ -28,7 +28,7 @@ export type PreparedSubmission = {
   transactionBase64: string;
   /** The message's recent blockhash: its lifetime anchor. */
   blockhash: string;
-  operation: Operation;
+  operation: Operation | "reclaim" | "setup";
   payment: string;
   payer: string;
   expectedHeld: string;
@@ -36,18 +36,21 @@ export type PreparedSubmission = {
 };
 
 /**
- * One file per signature. Identical bytes always carry the same signature, so a later
- * re-broadcast of the same bytes (for example after a `not-submitted` refusal, or by another
- * facilitator process) appends an attempt instead of erasing the earlier one's evidence.
+ * One reservation per signature. Legacy entries can contain multiple attempts; new entries
+ * permit one attempt only. Existing outcomes, including not-submitted, require manual
+ * reconciliation rather than automatic reuse.
  */
 export type SubmissionEntry = PreparedSubmission & { attempts: SubmissionAttempt[] };
 
 export interface SubmissionJournal {
-  /** Must durably persist a new attempt for `entry` before returning; a throw prevents the broadcast. */
+  findByMessageHash(hash: string): SubmissionEntry[];
+  /** Must exclusively reserve `entry` durably before returning; a throw prevents broadcast. */
   prepare(entry: PreparedSubmission): void;
   /** Records the adapter's classification of the latest attempt; evidence only. */
   resolve(signature: string, outcome: NonNullable<SubmissionAttempt["outcome"]>): void;
 }
+
+export class SubmissionAlreadyReserved extends Error {}
 
 export function messageHash(messageBytes: ArrayLike<number>): string {
   return createHash("sha256").update(Uint8Array.from(messageBytes)).digest("hex");
@@ -77,8 +80,23 @@ export class FileSubmissionJournal implements SubmissionJournal {
   }
 
   prepare(entry: PreparedSubmission): void {
-    const previous = this.read(entry.signature)?.attempts ?? [];
-    this.write({ ...entry, attempts: [...previous, { preparedAt: new Date().toISOString() }] });
+    try {
+      createDurableFile(this.path(entry.signature), JSON.stringify({ ...entry, attempts: [{ preparedAt: new Date().toISOString() }] }, null, 2));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new SubmissionAlreadyReserved("original submission requires reconciliation; never rebroadcast");
+      throw error;
+    }
+    // Reclaim is a single payer action per payment. A second CLI invocation with a new
+    // blockhash must not hide an unresolved original, even across concurrent processes.
+    if (entry.operation === "reclaim") {
+      const lock = join(this.dir, `reclaim-${entry.payment}.lock`);
+      try {
+        createDurableFile(lock, entry.signature);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new SubmissionAlreadyReserved(`reclaim requires reconciliation of original signature ${readFileSync(lock, "utf8")}`);
+        throw error;
+      }
+    }
   }
 
   resolve(signature: string, outcome: NonNullable<SubmissionAttempt["outcome"]>): void {

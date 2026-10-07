@@ -16,10 +16,12 @@
 // facilitator response stays unresolved for manual reconciliation (`reconciliation.ts`).
 import {
   type Address,
+  getBase58Encoder,
   getBase64Encoder,
   getCompiledTransactionMessageDecoder,
   getPublicKeyFromAddress,
   getTransactionDecoder,
+  isSignature,
   type KeyPairSigner,
   type SignatureBytes,
   type Transaction,
@@ -255,7 +257,7 @@ function isSettleResponse(v: unknown): v is SettleResponse {
  * refusal (or a gateway refusal that never reached the facilitator) counts as "did not execute";
  * a lost, malformed, pending, or unrecognized answer stays unresolved.
  */
-async function settle(config: ResourceServerConfig, body: unknown): Promise<SettleOutcome> {
+async function settle(config: ResourceServerConfig, body: ReturnType<typeof facilitatorBody>, transaction: Transaction, payer: Address): Promise<SettleOutcome> {
   const pending = (detail: string): SettleOutcome => ({
     kind: "unresolved",
     receipt: { success: false, errorReason: Reason.settlementPending, transaction: "", network: config.network },
@@ -286,8 +288,15 @@ async function settle(config: ResourceServerConfig, body: unknown): Promise<Sett
     }
     return pending(`malformed settle response (HTTP ${res.status})`);
   }
+  if (json.network !== config.network) return pending("settle response has the wrong network");
+  if (json.transaction && (!isSignature(json.transaction) || !(await verifySignature(
+    await getPublicKeyFromAddress(config.feePayer), getBase58Encoder().encode(json.transaction) as SignatureBytes, transaction.messageBytes,
+  )))) return pending("receipt signature is not bound to this submission");
   if (json.success) {
-    return json.transaction ? { kind: "succeeded", receipt: json } : { kind: "unresolved", receipt: json, detail: "success without a signature" };
+    // A receipt for another transaction must never release protected work. The first Solana
+    // signature is the sponsor's signature over precisely the message sent in this request.
+    const matches = res.ok && json.errorReason === undefined && json.payer === payer && json.transaction !== "";
+    return matches ? { kind: "succeeded", receipt: json } : pending("success receipt is not bound to this submission");
   }
   if (isDefinitiveReason(json.errorReason)) return { kind: "rejected", receipt: json };
   return { kind: "unresolved", receipt: json, detail: `unresolved settle: ${json.errorReason ?? "no errorReason"}` };
@@ -361,7 +370,7 @@ export function createResourceApp(config: ResourceServerConfig): Hono {
         expectedRefundable: "0",
       };
       record({ status: "authorizing", authorize });
-      const settledAuthorize = await settle(config, facilitatorBody(paymentPayload, accepted));
+      const settledAuthorize = await settle(config, facilitatorBody(paymentPayload, accepted), transaction, payer);
       authorize.signature = settledAuthorize.receipt.transaction;
       if (settledAuthorize.kind !== "succeeded") {
         // A refused or unresolved authorize never starts the handler.
@@ -384,8 +393,11 @@ export function createResourceApp(config: ResourceServerConfig): Hono {
       } catch (e) {
         result = { ok: false, detail: e instanceof Error ? e.message : "handler threw" };
       }
-      // `handlerResult` is JSON-persisted: only `{ ok, detail }`, never the bigint fields.
-      record({ status: result.ok ? "handler-succeeded" : "handler-failed", handlerResult: result.ok ? { ok: true } : { ok: false, detail: result.detail } });
+      // Retain the complete result before obtaining another blockhash: a crash here must not
+      // erase metering or require the handler to run again. JSON amounts are decimal strings.
+      record({ status: result.ok ? "handler-succeeded" : "handler-failed", handlerResult: result.ok
+        ? { ok: true, amount: result.amount.toString(), releaseRemainder: result.releaseRemainder }
+        : { ok: false, detail: result.detail } });
 
       // --- Terminal settle: this server's consent, durable before the facilitator sees it.
       const lifetime = await config.getLatestBlockhash();
@@ -409,7 +421,7 @@ export function createResourceApp(config: ResourceServerConfig): Hono {
       };
       record({ status: "terminal-settling", terminal });
       const terminalBody = facilitatorBody({ x402Version: 2, resource: { url: resourceUrl }, accepted, payload: terminalPayload }, accepted);
-      const settledTerminal = await settle(config, terminalBody);
+      const settledTerminal = await settle(config, terminalBody, terminalTx, payer);
       terminal.signature = settledTerminal.receipt.transaction;
       if (settledTerminal.kind !== "succeeded") {
         // Never a completed-payment response, even if the handler succeeded.

@@ -50,7 +50,7 @@ async function demoHandler(): Promise<HandlerResult> {
 async function main(): Promise<void> {
   const record = loadDeploymentRecord(requireEnv("SAC006_DEPLOYMENT_RECORD_PATH"));
   const rpcUrl = requireEnv("SOLANA_RPC_URL");
-  const ledger = new RpcLedger({ network: record.network.caip2, genesisHash: record.network.genesisHash, rpcUrl });
+  const ledger = new RpcLedger({ deployment: record, network: record.network.caip2, genesisHash: record.network.genesisHash, rpcUrl });
   await ledger.verifyGenesis();
 
   const facilitatorUrl = requireEnv("SAC006_FACILITATOR_URL");

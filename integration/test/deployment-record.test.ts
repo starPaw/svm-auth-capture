@@ -8,6 +8,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "vitest";
+import { getAddressEncoder, type Rpc, type SolanaRpcApi } from "@solana/kit";
+import { RpcLedger } from "../src/rpc-ledger.ts";
 import { ACCEPTED_DEPLOYMENT_RECORD, loadDeploymentRecord, parseDeploymentRecord } from "../src/deployment-record.js";
 
 const ACCEPTED_PATH = fileURLToPath(new URL(`../../${ACCEPTED_DEPLOYMENT_RECORD.path}`, import.meta.url));
@@ -28,9 +30,43 @@ function rejects(mutate: (r: Record<string, any>) => void, reason: RegExp): void
 }
 
 describe("the accepted SAC-007 record", () => {
+  test.each(["matching", "byte", "padding", "slot", "authority", "pointer", "loader", "executable", "stale"])("live deployment comparison: %s", async (mutation) => {
+    const record = loadDeploymentRecord(ACCEPTED_PATH);
+    const pin = record.deployment;
+    const p = new Uint8Array(36);
+    new DataView(p.buffer).setUint32(0, 2, true);
+    p.set(getAddressEncoder().encode(pin.programData), 4);
+    const binary = readFileSync(new URL("../../docs/evidence/sac-007/build-candidate/svm_auth_capture.so", import.meta.url));
+    const d = new Uint8Array(45 + binary.length + 8);
+    const view = new DataView(d.buffer);
+    view.setUint32(0, 3, true); view.setBigUint64(4, pin.slot, true);
+    d[12] = 1; d.set(getAddressEncoder().encode(pin.upgradeAuthority!), 13); d.set(binary, 45);
+    if (mutation === "byte") d[45] = d[45]! ^ 1;
+    if (mutation === "padding") d[d.length - 1] = 1;
+    if (mutation === "slot") view.setBigUint64(4, pin.slot + 1n, true);
+    if (mutation === "authority") d[13] = d[13]! ^ 1;
+    if (mutation === "pointer") p[4] = p[4]! ^ 1;
+    const account = (data: Uint8Array, executable: boolean) => ({ owner: pin.loader, executable, lamports: 1n, data: [Buffer.from(data).toString("base64"), "base64"] });
+    const program = account(p, true);
+    if (mutation === "loader") program.owner = record.programId;
+    if (mutation === "executable") program.executable = false;
+    const rpc = { getGenesisHash: () => ({ send: async () => record.network.genesisHash }), getMultipleAccounts: () => ({ send: async () => ({
+      context: { slot: mutation === "stale" ? pin.slot - 1n : pin.slot }, value: [program, account(d, false)],
+    }) }) } as unknown as Rpc<SolanaRpcApi>;
+    const check = new RpcLedger({ deployment: record, network: record.network.caip2, genesisHash: record.network.genesisHash, rpcUrl: "http://unused.invalid", rpc }).verifyGenesis();
+    if (mutation === "matching") await expect(check).resolves.toBeUndefined();
+    else await expect(check).rejects.toThrow(/deployment/);
+  });
+
+  test("startup must reject a missing or upgraded live program even when genesis and record match", async () => {
+    const record = loadDeploymentRecord(ACCEPTED_PATH);
+    const config = { network: record.network.caip2, genesisHash: record.network.genesisHash, rpcUrl: "http://unused.invalid", deployment: record,
+      rpc: { getGenesisHash: () => ({ send: async () => record.network.genesisHash }), getMultipleAccounts: () => ({ send: async () => ({ context: { slot: 600000000n }, value: [null, null] }) }) } as unknown as Rpc<SolanaRpcApi> };
+    await expect(new RpcLedger(config).verifyGenesis()).rejects.toThrow(/deployment/);
+  });
   test("loads under the default pin and yields the consumed identity", () => {
     const record = loadDeploymentRecord(ACCEPTED_PATH);
-    expect(record).toEqual({
+    expect(record).toMatchObject({
       network: { cluster: "devnet", genesisHash: "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG", caip2: "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1" },
       programId: "992QmwmwCebawRJsTCgvc8qnzGivbFaD39ZQE7VhHp7o",
       sha256: ACCEPTED_DEPLOYMENT_RECORD.sha256,

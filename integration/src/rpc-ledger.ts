@@ -4,9 +4,11 @@
 // facilitator requires (see `ledger.ts`). The program's onchain guards remain authoritative;
 // this adapter never replaces a blockhash, re-signs, or retries an ambiguous submission. It also
 // serves the read-only `ChainReader` evidence manual reconciliation uses (`reconciliation.ts`).
+import { createHash } from "node:crypto";
 import {
   type Address,
   createSolanaRpc,
+  getAddressDecoder,
   getBase64Encoder,
   type Blockhash,
   getBase64EncodedWireTransaction,
@@ -17,8 +19,6 @@ import {
   type Rpc,
   signature as asSignature,
   SOLANA_ERROR__JSON_RPC__SERVER_ERROR_SEND_TRANSACTION_PREFLIGHT_FAILURE,
-  SOLANA_ERROR__TRANSACTION_ERROR__ALREADY_PROCESSED,
-  SOLANA_ERROR__TRANSACTION_ERROR__BLOCKHASH_NOT_FOUND,
   SOLANA_ERROR__TRANSACTION_ERROR__UNKNOWN,
   SOLANA_ERROR__INSTRUCTION_ERROR__UNKNOWN,
   type SolanaRpcApi,
@@ -29,6 +29,7 @@ import type { FinalizedOutcome, Ledger, LedgerAccount, SimulationOutcome, Submit
 import type { BlockhashCheck, ChainReader, MessageSearch, SignatureLookup, SlotAccount } from "./reconciliation.ts";
 import type { Lifetime } from "./transactions.ts";
 import { isObject } from "./types.ts";
+import type { DeploymentRecord } from "./deployment-record.ts";
 
 const CLOCK_SYSVAR = "SysvarC1ock11111111111111111111111111111111" as Address;
 const base64Encoder = getBase64Encoder();
@@ -49,6 +50,8 @@ export type RpcLedgerConfig = {
   /** Full base58 genesis hash the configured RPC endpoint must observe; checked by `verifyGenesis`. */
   genesisHash: string;
   rpcUrl: string;
+  /** Accepted identity to compare with the live loader accounts at startup. */
+  deployment?: DeploymentRecord;
   /**
    * Settlement deadline for `submit`, in milliseconds from the moment it is called: it bounds the
    * `sendTransaction` call (itself also limited to `requestTimeoutMs`) and every status request
@@ -82,6 +85,9 @@ export function redactRpcUrl(url: string): string {
     return "<unparseable RPC URL>";
   }
 }
+
+const validSlot = (v: unknown): v is number | bigint =>
+  (typeof v === "bigint" && v >= 0n) || (typeof v === "number" && Number.isSafeInteger(v) && v >= 0);
 
 const isIndex = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= 255;
 
@@ -194,12 +200,14 @@ export class RpcLedger implements Ledger, ChainReader {
   private readonly confirmTimeoutMs: number;
   private readonly pollIntervalMs: number;
   private readonly requestTimeoutMs: number;
+  private readonly deployment?: DeploymentRecord;
 
   // Plain-field assignment, not a TS constructor parameter property: this file must stay runnable
   // under Node's `--experimental-strip-types`, which does not support parameter properties.
   constructor(config: RpcLedgerConfig) {
     this.network = config.network;
     this.rpcUrl = config.rpcUrl;
+    this.deployment = config.deployment;
     this.genesisHash = config.genesisHash;
     this.rpc = config.rpc ?? createSolanaRpc(config.rpcUrl);
     this.confirmTimeoutMs = config.confirmTimeoutMs ?? 60_000;
@@ -222,6 +230,29 @@ export class RpcLedger implements Ledger, ChainReader {
     if (observed !== this.genesisHash) {
       throw new Error(`RpcLedger genesis mismatch at ${redactRpcUrl(this.rpcUrl)}: configured ${this.genesisHash}, observed ${observed}`);
     }
+    if (this.deployment) await this.verifyLiveDeployment(this.deployment);
+  }
+
+  /** Compare one finalized bank's loader metadata and executable with the accepted record. */
+  private async verifyLiveDeployment(record: DeploymentRecord): Promise<void> {
+    if (record.network.caip2 !== this.network || record.network.genesisHash !== this.genesisHash) throw new Error("deployment network mismatch");
+    const pin = record.deployment;
+    const response = await this.request((abortSignal) => this.rpc.getMultipleAccounts([record.programId, pin.programData], {
+      encoding: "base64", commitment: "finalized", minContextSlot: pin.slot,
+    }).send({ abortSignal }));
+    const mismatch = () => { throw new Error("live deployment differs from the accepted SAC-007 record; stop for deployment review"); };
+    if (!validSlot(response?.context?.slot) || BigInt(response.context.slot) < pin.slot || response.value?.length !== 2) mismatch();
+    const [program, programData] = response.value;
+    if (!program || !programData || program.owner !== pin.loader || programData.owner !== pin.loader || !program.executable || programData.executable) return mismatch();
+    const p = decodeBase64(program.data[0]);
+    const d = decodeBase64(programData.data[0]);
+    const address = getAddressDecoder();
+    if (p.length !== 36 || new DataView(p.buffer, p.byteOffset).getUint32(0, true) !== 2 || address.decode(p.slice(4)) !== pin.programData) return mismatch();
+    if (d.length < 45 + pin.executableSize) return mismatch();
+    const view = new DataView(d.buffer, d.byteOffset);
+    if (view.getUint32(0, true) !== 3 || view.getBigUint64(4, true) !== pin.slot) return mismatch();
+    if (pin.upgradeAuthority === null ? d[12] !== 0 : d[12] !== 1 || address.decode(d.slice(13, 45)) !== pin.upgradeAuthority) return mismatch();
+    if (createHash("sha256").update(d.slice(45, 45 + pin.executableSize)).digest("hex") !== pin.executableSha256 || d.slice(45 + pin.executableSize).some(byte => byte !== 0)) mismatch();
   }
 
   async now(): Promise<bigint> {
@@ -238,7 +269,8 @@ export class RpcLedger implements Ledger, ChainReader {
 
   async getAccount(address: Address): Promise<LedgerAccount | null> {
     const { value } = await this.request((abortSignal) => this.rpc.getAccountInfo(address, { encoding: "base64" }).send({ abortSignal }));
-    if (!value) return null;
+    if (value === null) return null;
+    if (!isObject(value)) throw new Error("malformed account response");
     return { owner: value.owner, data: decodeBase64(value.data[0]), lamports: value.lamports, executable: value.executable };
   }
 
@@ -269,25 +301,11 @@ export class RpcLedger implements Ledger, ChainReader {
       );
     } catch (error) {
       if (isSolanaError(error, SOLANA_ERROR__JSON_RPC__SERVER_ERROR_SEND_TRANSACTION_PREFLIGHT_FAILURE)) {
-        const cause = (error as { cause?: unknown }).cause;
-        if (
-          isSolanaError(cause, SOLANA_ERROR__TRANSACTION_ERROR__ALREADY_PROCESSED) ||
-          isSolanaError(cause, SOLANA_ERROR__TRANSACTION_ERROR__BLOCKHASH_NOT_FOUND)
-        ) {
-          // A refusal without execution is not proof these bytes never landed: `AlreadyProcessed`
-          // says this exact signature is in the status cache, and `BlockhashNotFound` can follow
-          // an earlier broadcast of the same bytes whose blockhash has since aged out. Resolve the
-          // original signature's own outcome; until it is finalized it stays unresolved.
-          return { kind: "submitted", outcome: await this.pollForFinalized(expectedSignature, deadline) };
-        }
-        if (cause === undefined) {
-          // A preflight refusal with no transaction error attached is a malformed response: it
-          // proves nothing about these bytes, so it cannot become `not-submitted`.
-          return { kind: "submitted" };
-        }
-        // The node's own preflight simulation rejected these bytes with an execution error
-        // before broadcasting them: this call put nothing on the cluster.
-        return { kind: "not-submitted", reason: `${error.message}: ${describe(cause)}` };
+        // A preflight refusal describes this call, not the history of these signed bytes.
+        // Even an execution error can follow an earlier landing at a different bank. The SDK
+        // also accepts unknown/malformed error variants. Only the original signature's own
+        // finalized status resolves any of these cases; never infer global non-submission.
+        return { kind: "submitted", outcome: await this.pollForFinalized(expectedSignature, deadline) };
       }
       // Any other failure (transport error, an expired deadline, a malformed response) cannot
       // prove the exact bytes were never broadcast: stay in the ambiguous `submitted` branch,
@@ -367,12 +385,13 @@ export class RpcLedger implements Ledger, ChainReader {
   async isBlockhashValid(blockhash: string): Promise<BlockhashCheck> {
     try {
       // Latest (processed) bank: a blockhash newer than the finalized bank is still unknown
-      // there and would look expired, so finalized cannot be used. A blockhash invalid at the
-      // latest bank is invalid for every later bank. The returned slot is where any landing must
-      // already be visible, so callers read state at a finalized slot no older than it.
+      // there and would look expired. Even processed false can mean unknown to that bank,
+      // not expired; reconciliation never treats it as proof of non-execution. Keep the
+      // observation slot to fence subsequent finalized account evidence.
       const { context, value } = await this.request((abortSignal) =>
         this.rpc.isBlockhashValid(blockhash as Blockhash, { commitment: "processed" }).send({ abortSignal }),
       );
+      if (typeof value !== "boolean" || !validSlot(context?.slot)) throw new Error("malformed blockhash response");
       return { kind: "ok", valid: value, slot: BigInt(context.slot) };
     } catch (error) {
       return { kind: "unavailable", detail: describe(error) };
@@ -389,6 +408,7 @@ export class RpcLedger implements Ledger, ChainReader {
         const { context, value } = await byDeadline(deadline, (abortSignal) =>
           this.rpc.getAccountInfo(address, { encoding: "base64", commitment: "finalized", minContextSlot }).send({ abortSignal }),
         );
+        if (!validSlot(context?.slot) || (value !== null && !isObject(value))) throw new Error("malformed account response");
         if (BigInt(context.slot) < minContextSlot) throw new Error("RPC returned an account older than minContextSlot");
         const account = value
           ? { owner: value.owner, data: decodeBase64(value.data[0]), lamports: value.lamports, executable: value.executable }

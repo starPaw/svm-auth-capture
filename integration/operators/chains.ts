@@ -3,7 +3,9 @@
 // operations on one payment and wait on the cluster Clock). Every rejection is bracketed by
 // finalized snapshots proving the guarded state did not change; any deviation exits non-zero.
 //   node --experimental-strip-types evidence/chains.ts      (env: see run-all.sh)
-import { getSignatureFromTransaction, type Address } from "@solana/kit";
+import { getSignatureFromTransaction, type Address, type KeyPairSigner } from "@solana/kit";
+import { join } from "node:path";
+import { FileSubmissionJournal, messageHash } from "../src/submission-journal.ts";
 import { Facilitator } from "../src/facilitator.ts";
 import { ata, reclaimAccounts, refundData, Tag, toInstruction, TOKEN_PROGRAM_ADDRESS } from "../src/program.ts";
 import { submitReclaim } from "../src/reclaim.ts";
@@ -21,14 +23,41 @@ import {
   voidPayload,
 } from "../src/transactions.ts";
 import type { PaymentRequirements, SettleResponse } from "../src/types.ts";
-import { check, context, emit, finalizedSlot, slotOf, snapshot, unchanged, waitForClock } from "./lib.ts";
+import { check, context, emit, finalizedSlot, slotOf, snapshot, unchanged, waitForClock, type Context } from "./lib.ts";
 
 type Terms = { maximum: bigint; dc: bigint; dr: bigint };
+
+/** A one-shot, journaled test-liquidity transfer; unresolved outcomes stop the campaign. */
+export async function transferSetupTokens(c: Context, journal: FileSubmissionJournal, from: KeyPairSigner, to: Address, amount: bigint): Promise<bigint> {
+  const { ledger, sponsor, mint } = c;
+    const data = new Uint8Array(9);
+    data[0] = 3;
+    new DataView(data.buffer).setBigUint64(1, amount, true);
+    const ix = toInstruction(
+      TOKEN_PROGRAM_ADDRESS,
+      [
+        { address: await ata(from.address, mint), signer: false, writable: true },
+        { address: await ata(to, mint), signer: false, writable: true },
+        { address: from.address, signer: true, writable: false },
+      ],
+      data,
+    );
+    const life = await ledger.latestBlockhash();
+    const tx = await buildTransaction({ feePayer: sponsor.address, instructions: [ix], signers: [sponsor, from], lifetime: life });
+    const signature = getSignatureFromTransaction(tx);
+    journal.prepare({ signature, messageHash: messageHash(tx.messageBytes), transactionBase64: encodeTransaction(tx), blockhash: life.blockhash,
+      operation: "setup", payment: await ata(from.address, mint), payer: from.address, expectedHeld: "0", expectedRefundable: "0" });
+    const result = await ledger.submit(tx);
+    emit("setup token transfer", { amount, signature, result });
+    check(result.kind === "submitted" && result.outcome?.status === "succeeded" && result.outcome.commitment === "finalized", "setup transfer finalized; otherwise stop for original-signature reconciliation");
+    return finalizedSlot(c, signature);
+}
 
 async function main(): Promise<void> {
   const c = await context();
   const { record, ledger, sponsor, payer, server, mint } = c;
-  const facilitator = new Facilitator({ network: record.network.caip2, programId: record.programId, feePayer: sponsor, ledger });
+  const journal = new FileSubmissionJournal(join(process.env.SAC006_EVIDENCE_DIR!, "chains-journal"));
+  const facilitator = new Facilitator({ journal, network: record.network.caip2, programId: record.programId, feePayer: sponsor, ledger });
   const lifetime = () => ledger.latestBlockhash();
   // Every later account read must follow all transaction/expiry evidence already observed.
   let evidenceSlot = 0n;
@@ -86,46 +115,8 @@ async function main(): Promise<void> {
     const tx = await signedByServer(await refundInstruction(stored(p), amount, h, f));
     return facilitator.settle(body(req, refundPayload(p, tx, amount, h, f)));
   };
-  /**
-   * Classic SPL Token `Transfer` (tag 3), used only to move server liquidity for the
-   * refund-liquidity case; it is setup, not the behavior under test. An unresolved attempt is
-   * never blindly resent: the driver waits until its blockhash can no longer land, reads the
-   * finalized destination balance, and sends a new transfer only if the first did not execute.
-   */
-  const tokenTransfer = async (from: typeof payer, to: Address, amount: bigint) => {
-    const data = new Uint8Array(9);
-    data[0] = 3;
-    new DataView(data.buffer).setBigUint64(1, amount, true);
-    const ix = toInstruction(
-      TOKEN_PROGRAM_ADDRESS,
-      [
-        { address: await ata(from.address, mint), signer: false, writable: true },
-        { address: await ata(to, mint), signer: false, writable: true },
-        { address: from.address, signer: true, writable: false },
-      ],
-      data,
-    );
-    const target = BigInt((await state(`transfer ${amount}: before`)).serverAta) + (to === server.address ? amount : -amount);
-    for (let attempt = 1; attempt <= 3; attempt += 1) {
-      const life = await lifetime();
-      const tx = await buildTransaction({ feePayer: sponsor.address, instructions: [ix], signers: [sponsor, from], lifetime: life });
-      const result = await ledger.submit(tx);
-      emit("setup token transfer", { amount, attempt, result });
-      if (result.kind === "submitted" && result.outcome?.status === "succeeded") {
-        advanceSlot(await finalizedSlot(c, getSignatureFromTransaction(tx)));
-        return;
-      }
-      for (;;) {
-        const expiry = await ledger.isBlockhashValid(life.blockhash);
-        if (expiry.kind === "ok" && !expiry.valid) {
-          advanceSlot(expiry.slot);
-          break;
-        }
-        await new Promise((r) => setTimeout(r, 5_000));
-      }
-      if (BigInt((await state(`transfer ${amount}: after unresolved attempt ${attempt}`)).serverAta) === target) return;
-    }
-    check(false, `token transfer of ${amount} executed`);
+  const tokenTransfer = async (from: KeyPairSigner, to: Address, amount: bigint) => {
+    advanceSlot(await transferSetupTokens(c, journal, from, to, amount));
   };
 
   const now0 = await ledger.now();
@@ -234,7 +225,7 @@ async function main(): Promise<void> {
   // ---- Payer-direct reclaim of the remaining holds (D: uncaptured; E: after a partial capture).
   for (const [label, p] of [["D", pD], ["E", pE]] as const) {
     const before = await state(`${label} before payer reclaim`, p);
-    const { signature, result } = await submitReclaim({ ledger, programId: record.programId, payer, payment: p, lifetime: await lifetime() });
+    const { signature, result } = await submitReclaim({ ledger, programId: record.programId, payer, payment: p, lifetime: await lifetime(), journal });
     emit(`${label} payer reclaim`, { signature, slot: await slotOf(c, signature), result });
     check(result.kind === "submitted" && result.outcome?.status === "succeeded", `${label} reclaim finalized`);
     advanceSlot(await finalizedSlot(c, signature));
@@ -250,7 +241,7 @@ async function main(): Promise<void> {
   emit("chains: all checks passed");
 }
 
-main().catch((error) => {
+if (process.argv[1]?.endsWith("chains.ts")) main().catch((error) => {
   console.error(error instanceof Error ? (error.stack ?? error.message) : String(error));
   process.exitCode = 1;
 });

@@ -4,11 +4,12 @@
 // stored payment account itself for its authoritative `server`/`mint`, so the only inputs this
 // needs are a `Ledger`, the payer's own keypair, and the payment PDA.
 import { readFileSync } from "node:fs";
-import { createKeyPairSignerFromBytes, getSignatureFromTransaction, type Address, type KeyPairSigner } from "@solana/kit";
+import { createKeyPairSignerFromBytes, getBase64EncodedWireTransaction, getSignatureFromTransaction, type Address, type KeyPairSigner } from "@solana/kit";
 import { loadDeploymentRecord } from "./deployment-record.ts";
 import type { Ledger, SubmitResult } from "./ledger.ts";
 import { decodePayment } from "./program.ts";
 import { RpcLedger } from "./rpc-ledger.ts";
+import { FileSubmissionJournal, messageHash, type SubmissionJournal } from "./submission-journal.ts";
 import { buildTransaction, type Lifetime, reclaimInstruction } from "./transactions.ts";
 
 /** Submits the payer's reclaim; returns the transaction's signature with the adapter's outcome. */
@@ -18,6 +19,7 @@ export async function submitReclaim(a: {
   payer: KeyPairSigner;
   payment: Address;
   lifetime: Lifetime;
+  journal: SubmissionJournal;
 }): Promise<{ signature: string; result: SubmitResult }> {
   const account = await a.ledger.getAccount(a.payment);
   if (!account || account.owner !== a.programId) throw new Error(`payment ${a.payment} is not owned by ${a.programId}`);
@@ -26,7 +28,13 @@ export async function submitReclaim(a: {
   if (stored.payer !== a.payer.address) throw new Error(`payment ${a.payment} is not this payer's payment`);
   const ix = await reclaimInstruction({ programId: a.programId, payment: a.payment, payer: a.payer.address, server: stored.server, mint: stored.mint });
   const tx = await buildTransaction({ feePayer: a.payer.address, instructions: [ix], signers: [a.payer], lifetime: a.lifetime });
-  return { signature: getSignatureFromTransaction(tx), result: await a.ledger.submit(tx) };
+  const signature = getSignatureFromTransaction(tx);
+  a.journal.prepare({ signature, messageHash: messageHash(tx.messageBytes), transactionBase64: getBase64EncodedWireTransaction(tx),
+    blockhash: a.lifetime.blockhash, operation: "reclaim", payment: a.payment, payer: a.payer.address,
+    expectedHeld: stored.held.toString(), expectedRefundable: stored.refundable.toString() });
+  const result = await a.ledger.submit(tx);
+  // The durable original stays reserved regardless of outcome; recovery never sends again.
+  return { signature, result };
 }
 
 function requireEnv(name: string): string {
@@ -47,9 +55,10 @@ async function main(): Promise<void> {
   const record = loadDeploymentRecord(requireEnv("SAC006_DEPLOYMENT_RECORD_PATH"));
   const rpcUrl = requireEnv("SOLANA_RPC_URL");
   const payer = await loadKeypair(requireEnv("SAC006_PAYER_KEYPAIR_PATH"));
-  const ledger = new RpcLedger({ network: record.network.caip2, genesisHash: record.network.genesisHash, rpcUrl });
+  const ledger = new RpcLedger({ deployment: record, network: record.network.caip2, genesisHash: record.network.genesisHash, rpcUrl });
   await ledger.verifyGenesis();
-  const { signature, result } = await submitReclaim({ ledger, programId: record.programId, payer, payment, lifetime: await ledger.latestBlockhash() });
+  const journal = new FileSubmissionJournal(process.env.SAC006_RECLAIM_JOURNAL_DIR ?? requireEnv("SAC006_FACILITATOR_JOURNAL_DIR"));
+  const { signature, result } = await submitReclaim({ ledger, programId: record.programId, payer, payment, lifetime: await ledger.latestBlockhash(), journal });
   const status = await ledger.getSignatureStatus(signature);
   console.log(JSON.stringify({ payment, signature, result, status }, (_k, v) => (typeof v === "bigint" ? v.toString() : v), 2));
 }

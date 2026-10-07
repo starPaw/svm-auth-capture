@@ -40,7 +40,7 @@ import {
   U64_MAX,
   voidAccounts,
 } from "./program.ts";
-import { messageHash, type SubmissionJournal, type SubmissionOutcome } from "./submission-journal.ts";
+import { messageHash, SubmissionAlreadyReserved, type SubmissionJournal, type SubmissionOutcome } from "./submission-journal.ts";
 import {
   EXTRA_KEYS,
   type FacilitatorRequest,
@@ -255,6 +255,17 @@ export class Facilitator {
 
   /** Validates once, then co-signs as fee payer, submits, and reports the finalized outcome. */
   private async checkAndBroadcast(body: unknown): Promise<SettleResponse> {
+    // Consult durable evidence before state preflight: changed state or an expired deadline
+    // cannot classify an earlier broadcast as rejected. Never return a second success either.
+    const key = messageKey(body);
+    if (this.journal && key !== undefined) {
+      try {
+        const previous = this.journal.findByMessageHash(messageHash(Buffer.from(key, "base64")));
+        if (previous.length > 0) return { success: false, errorReason: Reason.settlementPending, transaction: previous[0]!.signature, network: this.network };
+      } catch {
+        return { success: false, errorReason: Reason.settlementPending, transaction: "", network: this.network };
+      }
+    }
     let verified: Verified;
     try {
       verified = await this.check(body);
@@ -283,6 +294,7 @@ export class Facilitator {
           expectedRefundable: verified.expected.refundable.toString(),
         });
       } catch (e) {
+        if (e instanceof SubmissionAlreadyReserved) return { success: false, errorReason: Reason.settlementPending, ...base };
         // Nothing was broadcast: without a durable pre-broadcast record the bytes never leave.
         console.error(`submission journal write failed for ${signature}; not broadcasting:`, e);
         return { success: false, errorReason: Reason.settlementNotSubmitted, transaction: "", network: this.network, payer: verified.payer };
