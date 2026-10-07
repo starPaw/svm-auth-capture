@@ -9,6 +9,7 @@ import { readFileSync } from "node:fs";
 import { serve } from "@hono/node-server";
 import { type Address, createKeyPairSignerFromBytes, type KeyPairSigner } from "@solana/kit";
 import { ACCEPTED_DEPLOYMENT_RECORD, loadDeploymentRecord } from "./deployment-record.ts";
+import { demoSponsorComputeBounds } from "./demo-compute.ts";
 import { Facilitator } from "./facilitator.ts";
 import { createGatewayApp } from "./gateway.ts";
 import { redactRpcUrl, RpcLedger } from "./rpc-ledger.ts";
@@ -39,7 +40,7 @@ async function main(): Promise<void> {
 
   // The exact co-signed bytes, signature, and blockhash of every broadcast are written here first.
   const journal = new FileSubmissionJournal(requireEnv("SAC006_FACILITATOR_JOURNAL_DIR"));
-  const facilitator = new Facilitator({ network: record.network.caip2, programId: record.programId, feePayer, ledger, journal });
+  const facilitator = new Facilitator({ network: record.network.caip2, programId: record.programId, feePayer, ledger, journal, ...demoSponsorComputeBounds() });
   const sponsorship = new SponsorshipGuard({
     ledger,
     feePayer: feePayer.address,

@@ -25,7 +25,7 @@ import {
 } from "@solana-program/token";
 import { FailedTransactionMetadata, LiteSVM } from "litesvm";
 import { createApp } from "../src/app.js";
-import { Facilitator } from "../src/facilitator.js";
+import { Facilitator, type FacilitatorConfig } from "../src/facilitator.js";
 import type { FinalizedOutcome, Ledger, LedgerAccount, SimulationOutcome, SubmitResult } from "../src/ledger.js";
 import { ata, decodePayment, LOCAL_PROGRAM_ID, type Payment, paymentAddress, TOKEN_PROGRAM_ADDRESS } from "../src/program.js";
 import {
@@ -105,7 +105,7 @@ export class LiteSvmLedger implements Ledger {
       this.svm.withSigverify(true);
     }
     if (r instanceof FailedTransactionMetadata) return { ok: false, error: r.toString(), logs: r.meta().logs() };
-    return { ok: true };
+    return { ok: true, unitsConsumed: r.meta().computeUnitsConsumed() };
   }
 
   async submit(transaction: Transaction): Promise<SubmitResult> {
@@ -153,7 +153,7 @@ export function inspect(tx: Transaction) {
 
 export type Harness = Awaited<ReturnType<typeof createHarness>>;
 
-export async function createHarness() {
+export async function createHarness(feeBounds: Pick<FacilitatorConfig, "maxComputeUnitLimit" | "maxComputeUnitPriceMicroLamports"> = {}) {
   const svm = new LiteSVM().withSigverify(true);
   // Fail loudly if the binary is missing; never substitute a native processor.
   svm.addProgramFromFile(LOCAL_PROGRAM_ID, BINARY);
@@ -163,7 +163,7 @@ export async function createHarness() {
   for (const k of [payer, server, facilitatorKey, outsider, setup]) svm.airdrop(k.address, lamports(10_000_000_000n));
   const mint = mintKey.address;
   const ledger = new LiteSvmLedger(svm);
-  const facilitator = new Facilitator({ network: NETWORK, programId: LOCAL_PROGRAM_ID, feePayer: facilitatorKey, ledger });
+  const facilitator = new Facilitator({ network: NETWORK, programId: LOCAL_PROGRAM_ID, feePayer: facilitatorKey, ledger, ...feeBounds });
   const app = createApp(facilitator);
   const server_: ServerType = await new Promise((resolve) => {
     const s = serve({ fetch: app.fetch, port: 0, hostname: "127.0.0.1" }, () => resolve(s));
