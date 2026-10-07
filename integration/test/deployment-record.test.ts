@@ -2,7 +2,6 @@
 // access. The accepted record in this repository must load under the default pin; every
 // incomplete, malformed, placeholder, ineligible, or inconsistent variant of it must be rejected,
 // and a record whose bytes differ from the pinned accepted record is rejected even if valid.
-import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,11 +14,11 @@ import { ACCEPTED_DEPLOYMENT_RECORD, loadDeploymentRecord, parseDeploymentRecord
 const ACCEPTED_PATH = fileURLToPath(new URL(`../../${ACCEPTED_DEPLOYMENT_RECORD.path}`, import.meta.url));
 const accepted = (): Record<string, any> => JSON.parse(readFileSync(ACCEPTED_PATH, "utf8"));
 
-function writeRecord(record: unknown): { path: string; sha256: string } {
+function writeRecord(record: unknown): { path: string } {
   const path = join(mkdtempSync(join(tmpdir(), "sac006-record-")), "deployment-identity.v1.json");
   const text = JSON.stringify(record, null, 2);
   writeFileSync(path, text);
-  return { path, sha256: createHash("sha256").update(text).digest("hex") };
+  return { path };
 }
 
 /** Applies `mutate` to a copy of the accepted record and expects validation to reject it. */
@@ -84,17 +83,18 @@ describe("the accepted SAC-007 record", () => {
     expect(loadDeploymentRecord(path).sha256).toBe(ACCEPTED_DEPLOYMENT_RECORD.sha256);
   });
 
-  test("a record matching an explicitly supplied pin loads", () => {
-    const { path, sha256 } = writeRecord(accepted());
-    expect(loadDeploymentRecord(path, { expectedSha256: sha256 }).programId).toBe("992QmwmwCebawRJsTCgvc8qnzGivbFaD39ZQE7VhHp7o");
+  test("callers cannot substitute another acceptance hash", () => {
+    const { path } = writeRecord(accepted());
+    // Untyped JavaScript callers passing the old options argument cannot bypass the pin.
+    expect(() => Reflect.apply(loadDeploymentRecord, undefined, [path, { expectedSha256: "0".repeat(64) }])).toThrow(/pinned accepted record/);
   });
 
-  test("an unreadable or unparseable file is rejected", () => {
+  test("an unreadable or malformed file is rejected", () => {
     expect(() => loadDeploymentRecord(join(tmpdir(), "sac006-no-such-record.json"))).toThrow(/cannot read/);
     const path = join(mkdtempSync(join(tmpdir(), "sac006-record-")), "bad.json");
     writeFileSync(path, "{not json");
-    const sha256 = createHash("sha256").update("{not json").digest("hex");
-    expect(() => loadDeploymentRecord(path, { expectedSha256: sha256 })).toThrow(/cannot parse/);
+    expect(() => loadDeploymentRecord(path)).toThrow(/pinned accepted record/);
+    expect(() => parseDeploymentRecord(null)).toThrow(/not a JSON object/);
   });
 });
 
@@ -128,6 +128,10 @@ describe("incomplete records are rejected", () => {
 });
 
 describe("malformed fields are rejected", () => {
+  test.each(["build", "deployment", "verification"])("corrupted %s object", (key) => rejects((r) => (r[key] = "corrupted"), /not an object/));
+  test("corrupted authority object", () => rejects((r) => (r.program.upgrade_authority = []), /not an object/));
+  test.each(["1".repeat(31), "z".repeat(44), "1".repeat(64)])("incomplete or oversized genesis %#", (value) => rejects((r) => (r.network.genesis_hash = value), /genesis_hash/));
+  test.each(["2026-02-30T12:00:00Z", "2026-13-01T12:00:00Z", "2026-10-07T24:00:00Z", "2026-10-07T12:60:00Z"])("impossible timestamp %s", (value) => rejects((r) => (r.verification.observed_at = value), /observed_at/));
   test("unsupported version", () => rejects((r) => (r.schema_version = "1"), /schema_version/));
   test("non-devnet cluster", () => rejects((r) => (r.network.cluster = "mainnet-beta"), /cluster/));
   test("CAIP-2 mismatch", () => rejects((r) => (r.network.caip2 = "solana:wrong"), /does not equal/));
@@ -142,7 +146,7 @@ describe("malformed fields are rejected", () => {
   test("numeric slot instead of a decimal string", () => rejects((r) => (r.deployment.deployment_slot = 508146249), /deployment_slot/));
   test("abbreviated transaction signature", () => rejects((r) => (r.deployment.transactions[0].signature = "4S1sEL2c"), /signature/));
   test("non-UTC observation time", () => rejects((r) => (r.verification.observed_at = "2026-10-06 16:06:48"), /observed_at/));
-  test.each(["../secrets.json", "/etc/passwd", "..\\secrets.json", "C:/" + "Users/x/key.json"])("evidence path %s escaping the directory", (bad) =>
+  test.each(["../secrets.json", "/etc/passwd", "..\\secrets.json", "C:/" + "Users/x/key.json", "https://example.com/evidence", "./", "snapshots//account.json", "snapshots/\u0000account.json"])("evidence path %# escaping the directory", (bad) =>
     rejects((r) => r.verification.evidence_paths.push(bad), /evidence_paths/),
   );
 });
@@ -158,4 +162,21 @@ describe("ineligible or inconsistent verified records are rejected", () => {
   test("executable comparison not match", () => rejects((r) => (r.verification.executable_comparison.result = "unknown"), /requires match/));
   test("compared length differs from the artifact size", () => rejects((r) => (r.verification.executable_comparison.compared_length_bytes = "116703"), /compared_length_bytes/));
   test("deployed hash differs from the artifact hash", () => rejects((r) => (r.verification.executable_comparison.deployed_executable_sha256 = "0".repeat(64)), /deployed_executable_sha256/));
+});
+
+// The accepted producer template is the required-field inventory, rather than a second schema.
+const template = JSON.parse(readFileSync(ACCEPTED_PATH.replace(".v1.json", ".v1.template.json"), "utf8"));
+function requiredPaths(value: unknown, prefix: string[] = []): string[][] {
+  if (!value || typeof value !== "object") return [];
+  const entries = Array.isArray(value) ? (value.length ? [["0", value[0]] as const] : []) : Object.entries(value);
+  return entries.flatMap(([key, child]) => {
+    const path = [...prefix, key];
+    return [...(Array.isArray(value) ? [] : [path]), ...requiredPaths(child, path)];
+  });
+}
+test.each(requiredPaths(template).map(path => [path.join("."), path] as const))("v1 required field %s cannot be omitted", (_label, path) => {
+  rejects(r => {
+    const parent = path.slice(0, -1).reduce((value, key) => value[key], r);
+    delete parent[path.at(-1)!];
+  }, /invalid deployment-identity record/);
 });

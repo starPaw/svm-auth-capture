@@ -59,7 +59,7 @@ export type RpcLedgerConfig = {
   /**
    * Settlement deadline for `submit`, in milliseconds from the moment it is called: it bounds the
    * `sendTransaction` call (itself also limited to `requestTimeoutMs`) and every status request
-   * after it. A finalized failure's log fetch gets one further `requestTimeoutMs`. Default 60s:
+   * after it, including transaction/log lookup. No request extends this deadline. Default 60s:
    * Devnet finalization has been observed to exceed 30s.
    */
   confirmTimeoutMs?: number;
@@ -336,13 +336,14 @@ export class RpcLedger implements Ledger, ChainReader {
         const status = signatureLookup(response);
         if (status.kind === "found" && status.commitment === "finalized") {
           if (status.err === null) return { status: "succeeded", commitment: "finalized" };
-          return { status: "failed", commitment: "finalized", error: status.err, logs: await this.fetchFinalizedLogs(signature) };
+          return { status: "failed", commitment: "finalized", error: status.err, logs: await this.fetchFinalizedLogs(signature, deadline) };
         }
         // `null` (missing history) or a weaker commitment is missing evidence, not proof of
         // non-finality: keep polling within the bounded wait.
       } catch {
         // A transport/lookup failure or expired request is also missing evidence, not proof.
       }
+      if (Date.now() >= deadline) return undefined;
       await sleep(Math.min(this.pollIntervalMs, Math.max(0, deadline - Date.now())));
     }
     // Deadline reached without a finalized status: stays ambiguous, never guessed or resent.
@@ -438,17 +439,18 @@ export class RpcLedger implements Ledger, ChainReader {
   }
 
   /**
-   * Logs are auxiliary to an already-established finalized failure: one request with its own
-   * bound (so a failure seen at the end of the settlement window still gets a chance at its
-   * diagnostics), and an empty list when they cannot be fetched.
+   * Log lookup shares the original settlement deadline. An expired lookup leaves the whole
+   * attempt unresolved; an ordinary diagnostic lookup failure can return empty logs while
+   * retaining the original signature's independently established finalized failure.
    */
-  private async fetchFinalizedLogs(signature: string): Promise<string[]> {
+  private async fetchFinalizedLogs(signature: string, deadline: number): Promise<string[]> {
     try {
-      const tx = await this.request((abortSignal) =>
+      const tx = await byDeadline(deadline, (abortSignal) =>
         this.rpc.getTransaction(asSignature(signature), { commitment: "finalized", encoding: "json" }).send({ abortSignal }),
       );
       return [...(tx?.meta?.logMessages ?? [])];
-    } catch {
+    } catch (error) {
+      if (error instanceof RpcDeadlineExceeded || Date.now() >= deadline) throw new RpcDeadlineExceeded();
       return [];
     }
   }

@@ -19,7 +19,11 @@ import {
   type Transaction,
 } from "@solana/kit";
 import { getTransferSolInstruction } from "@solana-program/system";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { FileSubmissionJournal, messageHash, submissionOutcome } from "../src/submission-journal.ts";
 import { cachedClusterClock, redactRpcUrl, RpcDeadlineExceeded, RpcLedger } from "../src/rpc-ledger.js";
 import { buildTransaction } from "../src/transactions.js";
 
@@ -453,7 +457,7 @@ describe("RpcLedger network awaits are bounded", () => {
     expect(signals.every((s) => s.aborted)).toBe(true);
   });
 
-  test("a stalled log fetch keeps the established finalized failure, with empty logs, within its own bound", async () => {
+  test("a stalled log fetch ends unresolved within the original settlement deadline", async () => {
     const transaction = await sampleTransaction();
     const signals: AbortSignal[] = [];
     const ledger = new RpcLedger({
@@ -470,7 +474,7 @@ describe("RpcLedger network awaits are bounded", () => {
       }),
     });
     const [result, ms] = await elapsed(() => ledger.submit(transaction));
-    expect(result).toMatchObject({ kind: "submitted", outcome: { status: "failed", commitment: "finalized", logs: [] } });
+    expect(result).toEqual({ kind: "submitted", outcome: undefined });
     expect(ms).toBeLessThan(500);
     expect(signals[0]?.aborted).toBe(true);
   });
@@ -559,7 +563,7 @@ describe("RpcLedger network awaits are bounded", () => {
     expect(statusCalls).toBe(0); // an unconfirmed send never polls a signature it cannot trust
   });
 
-  test("a finalized failure seen at the end of the window still gets its own log fetch", async () => {
+  test("a late failure log cannot extend the original settlement window", async () => {
     const transaction = await sampleTransaction();
     const ledger = new RpcLedger({
       network: NETWORK,
@@ -576,7 +580,7 @@ describe("RpcLedger network awaits are bounded", () => {
       }),
     });
     const result = await ledger.submit(transaction);
-    expect(result).toMatchObject({ outcome: { status: "failed", logs: ["late log"] } });
+    expect(result).toEqual({ kind: "submitted", outcome: undefined });
   });
 
   test("the history search shares one deadline across all its requests", async () => {
@@ -790,5 +794,66 @@ describe("cachedClusterClock", () => {
     await clock();
     await clock();
     expect(reads).toBe(1);
+  });
+});
+
+
+describe("one absolute settlement deadline preserves reconciliation identity", () => {
+  test.each(["submission", "status", "logs"] as const)("%s that never resolves stays unresolved with one exact broadcast and journal entry", async (stage) => {
+    const transaction = await sampleTransaction();
+    const signature = getSignatureFromTransaction(transaction);
+    const wire = getBase64EncodedWireTransaction(transaction);
+    const hash = messageHash(transaction.messageBytes);
+    const blockhash = getCompiledTransactionMessageDecoder().decode(transaction.messageBytes).lifetimeToken;
+    const dir = mkdtempSync(join(tmpdir(), "sac006-deadline-"));
+    const journal = new FileSubmissionJournal(dir);
+    journal.prepare({ signature, transactionBase64: wire, messageHash: hash, blockhash, operation: "setup",
+      payment: PROGRAM_ID, payer: PROGRAM_ID, expectedHeld: "0", expectedRefundable: "0" });
+    const signals: AbortSignal[] = [];
+    const stalled = () => ({ send: ({ abortSignal }: { abortSignal: AbortSignal }) => {
+      signals.push(abortSignal); return new Promise<never>(() => {});
+    } });
+    const broadcasts: string[] = [];
+    const lookups: string[][] = [];
+    const logLookups: string[] = [];
+    const delayed = <T>(value: T, ms: number) => ({ send: async () => { await new Promise(resolve => setTimeout(resolve, ms)); return value; } });
+    vi.useFakeTimers();
+    try {
+      const ledger = new RpcLedger({ network: NETWORK, genesisHash: GENESIS, rpcUrl: "http://unused.invalid",
+        confirmTimeoutMs: 100, requestTimeoutMs: 10_000, pollIntervalMs: 1, rpc: fakeRpc({
+          sendTransaction: (bytes: string) => {
+            broadcasts.push(bytes);
+            return stage === "submission" ? stalled() : delayed(signature, 40);
+          },
+          getSignatureStatuses: (signatures: string[]) => {
+            lookups.push(signatures);
+            return stage === "status" ? stalled() : delayed({ value: [{ confirmationStatus: "finalized", err: { InstructionError: [0, { Custom: 6 }] }, slot: 1n }] }, 40);
+          },
+          getTransaction: (sig: string) => { logLookups.push(sig); return stalled(); },
+        }) });
+      let completed = false;
+      const resultPromise = ledger.submit(transaction).then(result => { completed = true; return result; });
+      await vi.advanceTimersByTimeAsync(99);
+      expect(completed).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(completed).toBe(true); // original deadline, including the two 40ms stages
+      const result = await resultPromise;
+      expect(result.kind).toBe("submitted");
+      if (result.kind !== "submitted") throw new Error("deadline uncertainty classified not-submitted");
+      expect(result.outcome).toBeUndefined();
+      journal.resolve(signature, { ...submissionOutcome(result), recordedAt: new Date().toISOString() });
+      const reopened = new FileSubmissionJournal(dir, { create: false });
+      expect(reopened.list()).toHaveLength(1);
+      expect(reopened.read(signature)).toMatchObject({ signature, transactionBase64: wire, messageHash: hash, blockhash,
+        attempts: [{ outcome: { result: "unresolved" } }] });
+      expect(broadcasts).toEqual([wire]);
+      expect(lookups).toEqual(stage === "submission" ? [] : [[signature]]);
+      expect(logLookups).toEqual(stage === "logs" ? [signature] : []);
+      expect(signals).toHaveLength(1);
+      expect(signals[0]!.aborted).toBe(true);
+      expect(getBase64EncodedWireTransaction(transaction)).toBe(wire);
+      expect(messageHash(transaction.messageBytes)).toBe(hash);
+      expect(getSignatureFromTransaction(transaction)).toBe(signature);
+    } finally { vi.useRealTimers(); rmSync(dir, { recursive: true, force: true }); }
   });
 });

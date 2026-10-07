@@ -36,7 +36,6 @@ export type DeploymentRecord = {
 };
 
 const UPGRADEABLE_LOADER = "BPFLoaderUpgradeab1e11111111111111111111111";
-const BASE58 = /^[1-9A-HJ-NP-Za-km-z]+$/;
 const DECIMAL = /^(0|[1-9][0-9]*)$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 const GIT_SHA = /^[0-9a-f]{40}$/;
@@ -115,8 +114,8 @@ export function parseDeploymentRecord(raw: unknown): Omit<DeploymentRecord, "sha
 
   const network = object(raw, "network", "");
   if (network.cluster !== "devnet") fail(`unsupported network.cluster ${JSON.stringify(network.cluster)}`);
-  const genesisHash = text(network, "genesis_hash", "network.", BASE58);
-  if (genesisHash.length < 32) fail("network.genesis_hash is not a complete base58 hash");
+  const genesisHash = text(network, "genesis_hash", "network.");
+  if (!isAddress(genesisHash)) fail("network.genesis_hash is not a complete 32-byte base58 hash");
   const caip2 = text(network, "caip2", "network.");
   const expectedCaip2 = `solana:${genesisHash.slice(0, 32)}`;
   if (caip2 !== expectedCaip2) fail(`network.caip2 ${JSON.stringify(caip2)} does not equal ${JSON.stringify(expectedCaip2)}`);
@@ -169,7 +168,14 @@ export function parseDeploymentRecord(raw: unknown): Omit<DeploymentRecord, "sha
   if (observationSlot < deploymentSlot || observationSlot < highestTransactionSlot) {
     fail("verification.observation_slot is earlier than the deployment slot or a listed transaction slot");
   }
-  text(verification, "observed_at", "verification.", RFC3339_UTC);
+  const observedAt = text(verification, "observed_at", "verification.", RFC3339_UTC);
+  // Date.parse alone normalizes impossible days (for example February 30). Check the calendar
+  // separately, then enforce RFC 3339's time ranges without accepting normalized dates.
+  const [year, month, day, hour, minute, second] = observedAt.match(/\d+/g)!.slice(0, 6).map(Number) as [number, number, number, number, number, number];
+  const calendar = new Date(`${observedAt.slice(0, 10)}T00:00:00Z`);
+  if (!Number.isFinite(calendar.getTime()) || calendar.getUTCFullYear() !== year || calendar.getUTCMonth() + 1 !== month || calendar.getUTCDate() !== day || hour > 23 || minute > 59 || second > 60) {
+    fail("verification.observed_at is not a valid RFC 3339 UTC calendar/time value");
+  }
   const comparison = object(verification, "executable_comparison", "verification.");
   const cmpAt = "verification.executable_comparison.";
   text(comparison, "method", cmpAt);
@@ -186,7 +192,7 @@ export function parseDeploymentRecord(raw: unknown): Omit<DeploymentRecord, "sha
   textArray(comparison, "limitations", cmpAt, { nonEmpty: false });
   for (const path of textArray(verification, "evidence_paths", "verification.", { nonEmpty: true })) {
     const outside = path.startsWith("/") || path.includes("\\") || /^[A-Za-z]:/.test(path) || path.split("/").includes("..");
-    if (outside) fail(`verification.evidence_paths entry ${JSON.stringify(path)} is not a relative path inside the evidence directory`);
+    if (outside || /^[A-Za-z][A-Za-z0-9+.-]*:/.test(path) || path.split("/").some((part) => part.length === 0 || part === ".") || /[\x00-\x1f]/.test(path)) fail(`verification.evidence_paths entry ${JSON.stringify(path)} is not a relative path inside the evidence directory`);
   }
 
   if (loader !== UPGRADEABLE_LOADER || program.program_data === null) fail("runtime supports only the accepted upgradeable-loader layout");
@@ -200,9 +206,10 @@ export function parseDeploymentRecord(raw: unknown): Omit<DeploymentRecord, "sha
 
 /**
  * Loads the record at `path`, requires its bytes to hash to the pinned accepted record
- * (`expectedSha256`, by default `ACCEPTED_DEPLOYMENT_RECORD.sha256`), and validates it.
+ * (`ACCEPTED_DEPLOYMENT_RECORD.sha256`), and validates it. Callers cannot override acceptance.
  */
-export function loadDeploymentRecord(path: string, { expectedSha256 = ACCEPTED_DEPLOYMENT_RECORD.sha256 }: { expectedSha256?: string } = {}): DeploymentRecord {
+export function loadDeploymentRecord(path: string): DeploymentRecord {
+  const expectedSha256 = ACCEPTED_DEPLOYMENT_RECORD.sha256;
   let bytes: Buffer;
   try {
     bytes = readFileSync(path);
