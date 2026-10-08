@@ -99,6 +99,18 @@ def active_layout():
     return {'sha': sha, 'root': str(source.RELEASES / sha), 'legacy': False}
 
 
+def merchant_boundary(prefix, required):
+    # No bearer, no payer cookie, nonexistent ID: authenticate before lookup or signing.
+    url = prefix + '/api/orders/' + '0' * 32 + '/actions/beer'
+    status, body, headers = source.response(url, method='POST', data=b'{}',
+                                           headers={'Origin': 'https://capture402.xyz'})
+    payload = json.loads(body)
+    expected = {'error': 'missing bearer token'}
+    source.require(status == 401 and payload == expected
+                   or (not required and status == 503 and payload == {'error': 'merchant operations disabled'}),
+                   'merchant authentication boundary unavailable or bypassed')
+
+
 def health(layout, public=True, orders=True):
     root = Path(layout['root']).resolve(strict=True)
     for service, entry in zip(source.SERVICES, ('devnet-server.ts', 'restaurant-server.ts')):
@@ -120,6 +132,8 @@ def health(layout, public=True, orders=True):
                        and config.get('network') == record['network']['caip2'], 'runtime identity mismatch')
         status, _, headers = source.response(prefix + '/resource')
         source.require(status == 402 and any(k.lower() == 'payment-required' for k in headers), 'missing x402 challenge')
+        if not layout['legacy']:
+            merchant_boundary(prefix, required=layout.get('merchantReady', False))
     status, body, _ = source.response('http://127.0.0.1:8787/supported')
     source.require(status == 200 and isinstance(json.loads(body), dict), 'private facilitator unavailable')
     if public:
@@ -243,10 +257,49 @@ def maintenance():
     atomic_bytes(MAINTENANCE, b'deployment in progress\n')
 
 
+def env_value(path, key):
+    import shlex
+    result = None
+    for line in path.read_text().splitlines():
+        if line.strip().startswith(key + '='):
+            parts = shlex.split(line, comments=True, posix=True)
+            source.require(len(parts) == 1 and parts[0].startswith(key + '='), 'unsupported private environment assignment')
+            source.require(result is None, 'duplicate private environment assignment')
+            result = parts[0].split('=', 1)[1]
+    return result
+
+
+def provision_merchant():
+    """The existing merchant boundary requires a separate private bearer.
+
+    No signer, key, on-chain authority or payer capability changes. Existing
+    credentials are preserved; the generated file is retained even on rollback.
+    """
+    import secrets
+    path = PRIVATE / 'merchant.env'
+    configured = env_value(PRIVATE / 'resource.env', 'SAC006_MERCHANT_TOKEN')
+    source.require(not path.is_symlink(), 'merchant environment is symlink')
+    saved = env_value(path, 'SAC006_MERCHANT_TOKEN') if path.exists() else None
+    source.require(not (configured and saved and configured != saved), 'conflicting merchant credentials')
+    token = configured or saved
+    bearer = env_value(PRIVATE / 'resource.env', 'SAC006_BEARER_TOKEN')
+    if token:
+        source.require(len(token) >= 32 and token.strip() == token and '\r' not in token and '\n' not in token
+                       and token != bearer, 'merchant credential is not independent or invalid')
+        if saved:
+            source.require(path.stat().st_mode & 0o077 == 0, 'merchant environment must be private')
+        return bool(saved)
+    source.require(not path.exists(), 'existing merchant environment has no usable credential')
+    # Never overwrite either original service env; never print or persist the token in evidence.
+    token = secrets.token_urlsafe(48)
+    atomic_bytes(path, ('SAC006_MERCHANT_TOKEN=' + token + '\n').encode(), 0o600)
+    return True
+
+
 GATE_DEPENDENCY = '[Unit]\nRequires=capture402-gate.service\nAfter=capture402-gate.service\n'
 
 
-def install_controls(sha):
+def install_controls(sha, merchant_file=False):
     fragment = (source.RELEASES / sha / 'integration/deploy/nginx-resource.conf').read_bytes()
     source.require(b'location = /api/orders {' in fragment, 'candidate lacks POST order route')
     atomic_bytes(SNIPPET, GUARD.encode() + fragment)
@@ -254,6 +307,8 @@ def install_controls(sha):
         content = GATE_DEPENDENCY
         if p.parent.name != 'nginx.service.d':
             content += f'[Service]\nWorkingDirectory={source.CURRENT}/integration\n'
+            if merchant_file and p.parent.name == 'sac006-resource.service.d':
+                content += f'EnvironmentFile={PRIVATE}/merchant.env\n'
         atomic_bytes(p, content.encode())
     source.switch_to(sha)
     fd = os.open(BASE, os.O_RDONLY | os.O_DIRECTORY)
@@ -395,7 +450,7 @@ def deploy(sha):
                 p = source.RELEASES / sha / name
                 source.require(not p.is_symlink() and digest_file(p) == fingerprint, 'staged source substituted')
         if previous['sha'] == sha and not previous['legacy']:
-            ready(previous)
+            ready({**previous, 'merchantReady': True})
             print('ALREADY_ACTIVE ' + sha, flush=True)
             return
         install_recovery()
@@ -410,10 +465,17 @@ def deploy(sha):
             pending['backup'] = backup(sha + '-' + str(time.time_ns()))
             source.write_json(PENDING, pending)
             preserved = inventory([PRIVATE, STATE])
-            install_controls(sha)
+            merchant_file = provision_merchant()
+            after = inventory([PRIVATE, STATE])
+            source.require(all(after.get(name) == value for name, value in preserved.items()),
+                           'historical private or payment state changed during provisioning')
+            source.require(set(after) - set(preserved) <= {str(PRIVATE / 'merchant.env').lstrip('/')},
+                           'unexpected private state added')
+            preserved = after
+            install_controls(sha, merchant_file)
             source.require(inventory([PRIVATE, STATE]) == preserved, 'private or payment state changed during cutover')
             source.restart()
-            layout = {'sha': sha, 'root': str(source.RELEASES / sha), 'legacy': False}
+            layout = {'sha': sha, 'root': str(source.RELEASES / sha), 'legacy': False, 'merchantReady': True}
             ready(layout, public=False)
             durable_remove(MAINTENANCE)
             ready(layout)

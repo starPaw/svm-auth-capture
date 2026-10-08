@@ -110,8 +110,9 @@ def check_unit_layout() -> None:
                 f"{service}: expected versioned-release WorkingDirectory override")
 
 
-def response(url: str, method: str = "GET", data: bytes | None = None) -> tuple[int, bytes, dict]:
-    request = urllib.request.Request(url, method=method, data=data)
+def response(url: str, method: str = "GET", data: bytes | None = None,
+             headers: dict | None = None) -> tuple[int, bytes, dict]:
+    request = urllib.request.Request(url, method=method, data=data, headers=headers or {})
     if data is not None:
         request.add_header("Content-Type", "application/json")
     try:

@@ -47,7 +47,7 @@ class TransactionTests(unittest.TestCase):
         self.calls = []
         for name, value in (
             ('active_layout', self.previous), ('ready', None), ('install_recovery', None),
-            ('backup', None)):
+            ('backup', None), ('provision_merchant', False)):
             patch = mock.patch.object(host, name, return_value=value)
             obj = patch.start(); self.addCleanup(patch.stop)
             setattr(self, name + '_mock', obj)
@@ -84,6 +84,12 @@ class TransactionTests(unittest.TestCase):
         self.assertFalse(host.MAINTENANCE.exists())
         self.assert_preserved()
         self.assertEqual(json.loads((host.BASE/'last-result.json').read_text())['verdict'], 'DEPLOYED')
+
+    def test_private_merchant_file_is_loaded_by_resource_only(self):
+        host.install_controls(NEW, merchant_file=True)
+        for path in host.control_paths()[1:]:
+            expected = path.parent.name == 'sac006-resource.service.d'
+            self.assertEqual(('EnvironmentFile=' + str(host.PRIVATE/'merchant.env')) in path.read_text(), expected)
 
     def test_public_nginx_misrouting_restores_legacy_units_and_original_state(self):
         self.ready_mock.side_effect = [None, None, RuntimeError('nginx orders 404'), None, None]
@@ -228,6 +234,43 @@ class BackupTests(unittest.TestCase):
             with self.assertRaises(tarfile.ReadError): host.verify_backup(path, {})
 
 
+class CredentialTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.resource = self.root/'resource.env'
+        self.resource.write_text('SAC006_BEARER_TOKEN=' + 'f'*64 + '\n')
+        patch = mock.patch.object(host, 'PRIVATE', self.root)
+        patch.start(); self.addCleanup(patch.stop)
+
+    def test_missing_token_is_provisioned_once_without_changing_existing_env_or_keys(self):
+        original = self.resource.read_bytes()
+        (self.root/'key').write_bytes(b'original key')
+        self.assertTrue(host.provision_merchant())
+        env = self.root/'merchant.env'; token = env.read_bytes()
+        self.assertEqual(env.stat().st_mode & 0o777, 0o600)
+        self.assertTrue(host.provision_merchant())
+        self.assertEqual(env.read_bytes(), token)
+        self.assertEqual(self.resource.read_bytes(), original)
+        self.assertEqual((self.root/'key').read_bytes(), b'original key')
+        self.assertNotIn(b'f'*64, token)
+
+    def test_existing_independent_token_is_preserved(self):
+        self.resource.write_text(self.resource.read_text() + 'SAC006_MERCHANT_TOKEN=' + 'm'*64 + '\n')
+        self.assertFalse(host.provision_merchant())
+        self.assertFalse((self.root/'merchant.env').exists())
+
+    def test_reusing_facilitator_authority_is_rejected(self):
+        self.resource.write_text(self.resource.read_text() + 'SAC006_MERCHANT_TOKEN=' + 'f'*64 + '\n')
+        with self.assertRaisesRegex(RuntimeError, 'independent'): host.provision_merchant()
+        self.assertFalse((self.root/'merchant.env').exists())
+
+    def test_symlinked_private_token_is_rejected(self):
+        (self.root/'merchant.env').symlink_to(self.resource)
+        with self.assertRaisesRegex(RuntimeError, 'symlink'): host.provision_merchant()
+
+
+
 class RetryTests(unittest.TestCase):
     def test_delayed_startup_and_network_errors_are_retried(self):
         with (mock.patch.object(host, 'health', side_effect=[ConnectionRefusedError(), RuntimeError('unprovisioned'), None]) as health,
@@ -256,6 +299,22 @@ class AcceptanceTests(unittest.TestCase):
         review = {'user':{'login':'independent','type':'User'}, 'state':'APPROVED','commit_id':OLD}
         with mock.patch.object(source, 'run', side_effect=[json.dumps([pull]), json.dumps([[review]]), '', 'conflict-change']):
             with self.assertRaisesRegex(RuntimeError, 'merged tree differs'): launcher.require_acceptance(NEW)
+
+
+class MerchantReadinessTests(unittest.TestCase):
+    def test_enabled_merchant_requires_real_application_authentication_rejection(self):
+        with mock.patch.object(source, 'response', return_value=(401, b'{"error":"missing bearer token"}', {})) as response:
+            host.merchant_boundary('https://capture402.xyz', required=True)
+        self.assertEqual(response.call_args.kwargs['headers'], {'Origin':'https://capture402.xyz'})
+        with mock.patch.object(source, 'response', return_value=(503, b'{"error":"merchant operations disabled"}', {})):
+            with self.assertRaisesRegex(RuntimeError, 'authentication boundary'): host.merchant_boundary('https://capture402.xyz', required=True)
+
+    def test_nginx_status_or_order_lookup_cannot_substitute_for_authentication(self):
+        for status, body in [(401, b'<html>nginx</html>'), (409, b'{"error":"order unavailable"}')]:
+            with mock.patch.object(source, 'response', return_value=(status, body, {})):
+                with self.assertRaises((RuntimeError, ValueError)):
+                    host.merchant_boundary('https://capture402.xyz', required=True)
+
 
 
 class LauncherRecoveryTests(unittest.TestCase):
