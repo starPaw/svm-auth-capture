@@ -5,13 +5,10 @@ import ipaddress
 import json
 from pathlib import Path
 import re
-import subprocess
+import secrets
 
 
 ASSETS = Path(__file__).resolve().parents[1] / 'integration/deploy/dev'
-GENESIS = 'EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG'
-
-
 def hostname(value):
     if len(value) > 253 or not re.fullmatch(r'(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}', value):
         raise ValueError('a plain lower-case DNS hostname is required')
@@ -67,14 +64,49 @@ def verify_layout(files):
         raise ValueError('the dev ingress allowlist must fail closed')
 
 
+def private_environments(host, identities, bearer, merchant):
+    """Separate credentials and role identities; never prints the private result."""
+    required = ['sponsor', 'merchant', 'payer', 'mint']
+    for role in required:
+        value = identities.get(role)
+        if not isinstance(value, str) or not re.fullmatch(r'[1-9A-HJ-NP-Za-km-z]{32,44}', value):
+            raise ValueError('four valid public dev identities are required')
+    if len({identities[role] for role in required}) != 4:
+        raise ValueError('dev signer roles and mint must be distinct')
+    if bearer == merchant or any(not re.fullmatch(r'[A-Za-z0-9_-]{43,128}', value) for value in [bearer, merchant]):
+        raise ValueError('independent strong private credentials are required')
+    files = render(host)
+    common = {'SAC006_BEARER_TOKEN': bearer}
+    values = {
+        'facilitator': {**common, 'SAC006_ALLOWLIST_MERCHANT': identities['merchant'], 'SAC006_ALLOWLIST_MINT': identities['mint']},
+        'restaurant': {**common, 'SAC006_MERCHANT_TOKEN': merchant, 'SAC006_FEE_PAYER': identities['sponsor'], 'SAC006_ASSET_MINT': identities['mint']},
+    }
+    result = {}
+    for role in ['facilitator', 'restaurant']:
+        lines = []
+        for line in files[f'{role}.env.example'].splitlines():
+            key = line.split('=', 1)[0]
+            if key in values[role]: line = key + '=' + values[role][key]
+            if '=' in line and not line.startswith('#') and not line.split('=', 1)[1]:
+                raise ValueError('private environment cannot contain a blank required assignment')
+            lines.append(line)
+        result[role+'.env'] = '\n'.join(lines)+'\n'
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--hostname', required=True)
     parser.add_argument('--tester-network', action='append', default=[])
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--private-identities', type=Path,
+                        help='Generate private env files from fresh dev public identities; output stays operator-only.')
     args = parser.parse_args()
     files = render(args.hostname, args.tester_network)
     verify_layout(files)
+    if args.private_identities:
+        identities = json.loads(args.private_identities.read_text())
+        files.update(private_environments(args.hostname, identities, secrets.token_urlsafe(48), secrets.token_urlsafe(48)))
     write_assets(args.output, files)
     print(json.dumps({'hostname': args.hostname, 'files': sorted(files),
                       'ports': {'facilitator': 18887, 'restaurant': 18888},

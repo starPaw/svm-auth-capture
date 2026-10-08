@@ -7,6 +7,18 @@ import dev_environment as dev
 
 
 class DevEnvironmentTests(unittest.TestCase):
+    def test_private_environment_binds_only_dev_roles_and_separate_credentials(self):
+        identities = {role: char*32 for role, char in zip(['sponsor', 'merchant', 'payer', 'mint'], '1234')}
+        files = dev.private_environments('dev.capture402.xyz', identities, 'f'*64, 'm'*64)
+        self.assertIn('SAC006_FEE_PAYER='+identities['sponsor'], files['restaurant.env'])
+        self.assertIn('SAC006_ALLOWLIST_MERCHANT='+identities['merchant'], files['facilitator.env'])
+        self.assertIn('SAC006_MERCHANT_TOKEN='+'m'*64, files['restaurant.env'])
+        self.assertNotIn('SAC006_MERCHANT_TOKEN=', files['facilitator.env'])
+        with self.assertRaises(ValueError): dev.private_environments('dev.capture402.xyz', identities, 'f'*64, 'f'*64)
+        with self.assertRaises(ValueError): dev.private_environments('dev.capture402.xyz', identities, 'weak', 'also-weak')
+        identities['payer'] = identities['sponsor']
+        with self.assertRaises(ValueError): dev.private_environments('dev.capture402.xyz', identities, 'f'*64, 'm'*64)
+
     def test_render_dev_only_ports_and_origin(self):
         files = dev.render('dev.capture402.xyz')
         dev.verify_layout(files)
