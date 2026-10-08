@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import tarfile
 import tempfile
@@ -119,6 +120,112 @@ class ArchiveTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as root:
                 with self.assertRaisesRegex(RuntimeError, "decompressed tar stream exceeds limit"):
                     cd.unpack_archive(payload, Path(root))
+
+
+
+class PrivateSourceTests(unittest.TestCase):
+    """GitHub source authenticity and VPS-only SSH credential constraints."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.key = root / "read-key"
+        self.hosts = root / "known-hosts"
+        self.key.write_text("private fixture")
+        self.hosts.write_text("github.com ssh-ed25519 fixture\n")
+        self.key.chmod(0o600)
+        self.hosts.chmod(0o644)
+        for name, path in [("SOURCE_KEY", self.key),
+                           ("SOURCE_KNOWN_HOSTS", self.hosts),
+                           ("RELEASES", root)]:
+            patch = mock.patch.object(cd, name, path)
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.user = types.SimpleNamespace(
+            pw_uid=os.getuid(), pw_gid=os.getgid(), pw_dir=str(root))
+
+    def config(self):
+        return cd.source_ssh_command(self.user, hosts_owner_uid=os.getuid())
+
+    def test_pinned_host_and_read_only_identity(self):
+        ssh = self.config()
+        self.assertIn(f"-i {self.key}", ssh)
+        self.assertIn(f"UserKnownHostsFile={self.hosts}", ssh)
+        self.assertIn("StrictHostKeyChecking=yes", ssh)
+        self.assertIn("IdentityAgent=none", ssh)
+        self.assertIn("GlobalKnownHostsFile=/dev/null", ssh)
+        self.assertIn("ForwardAgent=no", ssh)
+
+    def test_missing_key_fails_before_clone(self):
+        self.key.unlink()
+        with self.assertRaisesRegex(RuntimeError, "source deploy key missing"):
+            self.config()
+
+    def test_group_readable_key_is_rejected(self):
+        self.key.chmod(0o640)
+        with self.assertRaisesRegex(RuntimeError, "private"):
+            self.config()
+
+    def test_writable_host_pin_is_rejected(self):
+        self.hosts.chmod(0o664)
+        with self.assertRaisesRegex(RuntimeError, "not writable"):
+            self.config()
+
+    def test_symlinked_host_pin_is_rejected(self):
+        real = self.hosts.with_name("real-hosts")
+        self.hosts.rename(real)
+        self.hosts.symlink_to(real)
+        with self.assertRaisesRegex(RuntimeError, "pin.*unsafe"):
+            self.config()
+
+    def test_empty_host_pin_is_rejected(self):
+        self.hosts.write_text("")
+        with self.assertRaisesRegex(RuntimeError, "empty GitHub host"):
+            self.config()
+
+    def test_private_git_clone_uses_exact_sha_and_byte_comparison(self):
+        commands = []
+
+        def run_stub(*args, **kwargs):
+            commands.append(args)
+            return NEW if args[-3:] == ("git", "rev-parse", "HEAD") else ""
+
+        with (mock.patch.object(cd.pwd, "getpwnam", return_value=self.user),
+              mock.patch.object(cd, "source_ssh_command", return_value="ssh pinned"),
+              mock.patch.object(cd.os, "chown"),
+              mock.patch.object(cd, "run", side_effect=run_stub),
+              mock.patch.object(cd.subprocess, "run",
+                                return_value=types.SimpleNamespace(
+                                    stdout=tar(FILES, compressed=False)))):
+            cd.verify_source_against_main(NEW, tar(FILES))
+        self.assertEqual(commands[0][:6], ("runuser", "-u", "capture402-deploy",
+                                          "--", "/usr/bin/env", "-i"))
+        self.assertIn("GIT_TERMINAL_PROMPT=0", commands[0])
+        self.assertIn("core.sshCommand=ssh pinned", commands[0])
+        self.assertIn(cd.SOURCE_REMOTE, commands[0])
+        self.assertNotIn("https://github.com/starPaw/svm-auth-capture.git", commands[0])
+
+    def test_mutated_source_archive_is_rejected(self):
+        with (mock.patch.object(cd.pwd, "getpwnam", return_value=self.user),
+              mock.patch.object(cd, "source_ssh_command", return_value="ssh pinned"),
+              mock.patch.object(cd.os, "chown"),
+              mock.patch.object(cd, "run", side_effect=["", NEW]),
+              mock.patch.object(cd.subprocess, "run", return_value=types.SimpleNamespace(
+                  stdout=tar(FILES, compressed=False)))):
+            with self.assertRaisesRegex(RuntimeError, "differs from exact GitHub"):
+                cd.verify_source_against_main(
+                    NEW, tar({**FILES, "integration/src/devnet-server.ts": b"tamper"}))
+
+    def test_stale_main_sha_fails_before_source_archive(self):
+        with (mock.patch.object(cd.pwd, "getpwnam", return_value=self.user),
+              mock.patch.object(cd, "source_ssh_command", return_value="ssh pinned"),
+              mock.patch.object(cd.os, "chown"),
+              mock.patch.object(cd, "run", side_effect=["", OLD]),
+              mock.patch.object(cd.subprocess, "run") as run_archive):
+            with self.assertRaisesRegex(RuntimeError, "does not match approved SHA"):
+                cd.verify_source_against_main(NEW, tar(FILES))
+            run_archive.assert_not_called()
 
 
 class HealthTests(unittest.TestCase):
