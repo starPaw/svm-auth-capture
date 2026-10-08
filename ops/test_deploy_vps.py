@@ -303,12 +303,26 @@ class RetryTests(unittest.TestCase):
 
 
 class AcceptanceTests(unittest.TestCase):
-    def test_owner_second_account_and_stale_head_cannot_approve(self):
+    def test_owner_and_stale_head_cannot_approve(self):
         pull = {'merged_at':'today', 'merge_commit_sha': NEW, 'base': {'ref':'main'}, 'head':{'sha':OLD}, 'number':1}
-        for login, revision in [('gwinpin', OLD), ('starPaw', OLD), ('independent', NEW)]:
+        for login, revision in [('starPaw', OLD), ('gwinpin', NEW), ('independent', NEW)]:
             review = {'user':{'login':login, 'type':'User'}, 'state':'APPROVED', 'commit_id':revision}
             with mock.patch.object(source, 'run', side_effect=[json.dumps([pull]), json.dumps([[review]])]):
-                with self.assertRaisesRegex(RuntimeError, 'independent exact-head'): launcher.require_acceptance(NEW)
+                with self.assertRaisesRegex(RuntimeError, 'eligible exact-head'): launcher.require_acceptance(NEW)
+
+    def test_gwinpin_agent_approval_on_exact_head_is_eligible(self):
+        pull = {'merged_at':'today', 'merge_commit_sha': NEW, 'base': {'ref':'main'}, 'head':{'sha':OLD}, 'number':1}
+        review = {'user':{'login':'gwinpin','type':'User'}, 'state':'APPROVED', 'commit_id':OLD}
+        with mock.patch.object(source, 'run', side_effect=[json.dumps([pull]), json.dumps([[review]]), '', '']) as run:
+            launcher.require_acceptance(NEW)
+        self.assertEqual(run.call_count, 4)
+
+    def test_latest_gwinpin_changes_requested_blocks_deploy(self):
+        pull = {'merged_at':'today', 'merge_commit_sha': NEW, 'base': {'ref':'main'}, 'head':{'sha':OLD}, 'number':1}
+        base = {'user':{'login':'gwinpin','type':'User'}, 'commit_id':OLD}
+        reviews = [{**base, 'state':'APPROVED'}, {**base, 'state':'CHANGES_REQUESTED'}]
+        with mock.patch.object(source, 'run', side_effect=[json.dumps([pull]), json.dumps([reviews])]):
+            with self.assertRaisesRegex(RuntimeError, 'eligible exact-head'): launcher.require_acceptance(NEW)
 
     def test_accepted_merge_must_preserve_reviewed_tree(self):
         pull = {'merged_at':'today', 'merge_commit_sha': NEW, 'base':{'ref':'main'}, 'head':{'sha':OLD}, 'number':1}
