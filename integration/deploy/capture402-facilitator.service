@@ -1,5 +1,5 @@
 [Unit]
-Description=SAC-006 private Devnet facilitator
+Description=Capture402 private Solana facilitator
 After=network-online.target
 Wants=network-online.target
 
@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 User=sac006
 Group=sac006
-WorkingDirectory=/opt/svm-auth-capture/integration
+WorkingDirectory=/opt/capture402/current/integration
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
 EnvironmentFile=/etc/sac006/facilitator.env
 ExecStart=/usr/bin/env node --experimental-strip-types src/devnet-server.ts

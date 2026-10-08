@@ -30,6 +30,8 @@ GATE = UNITS / 'capture402-gate.service'
 OVERRIDE = 'zz-capture402-release.conf'
 NGINX_SERVICE = 'nginx'
 GUARD = 'if (-f /opt/capture402/maintenance) { return 503; }\n'
+PRODUCT_SERVICES = ('capture402-facilitator', 'capture402-restaurant')
+LEGACY_SERVICES = tuple(source.SERVICES)
 
 
 def durable_remove(path):
@@ -89,6 +91,20 @@ def restore_controls(snapshot):
 
 
 def active_layout():
+    pairs = list(dict.fromkeys((tuple(LEGACY_SERVICES), tuple(PRODUCT_SERVICES))))
+    active = []
+    for pair in pairs:
+        states = []
+        for name in pair:
+            try:
+                states.append(source.run('systemctl', 'show', '-p', 'ActiveState', '--value', name))
+            except subprocess.CalledProcessError:
+                states.append('absent')
+        if any(s == 'active' for s in states):
+            source.require(states == ['active', 'active'], 'partial backend pair; inspect before deployment')
+            active.append(pair)
+    source.require(len(active) == 1, 'expected exactly one active backend pair')
+    source.SERVICES = active[0]
     cwds = [source.run('systemctl', 'show', '-p', 'WorkingDirectory', '--value', s)
             for s in source.SERVICES]
     if cwds == [str(LEGACY / 'integration')] * 2:
@@ -96,10 +112,10 @@ def active_layout():
         source.require(bool(source.SHA_RE.fullmatch(sha)), 'legacy checkout lacks exact SHA')
         source.require(not source.run('git', '-c', f'safe.directory={LEGACY}', '-C', str(LEGACY), 'status', '--porcelain'),
                        'legacy checkout is dirty; preserve and resolve before deployment')
-        return {'sha': sha, 'root': str(LEGACY), 'legacy': True}
+        return {'sha': sha, 'root': str(LEGACY), 'legacy': True, 'services': list(source.SERVICES)}
     source.check_unit_layout()
     sha = source.current_sha()
-    return {'sha': sha, 'root': str(source.RELEASES / sha), 'legacy': False}
+    return {'sha': sha, 'root': str(source.RELEASES / sha), 'legacy': False, 'services': list(source.SERVICES)}
 
 
 def merchant_boundary(prefix, required):
@@ -116,7 +132,7 @@ def merchant_boundary(prefix, required):
 
 def health(layout, public=True, orders=True):
     root = Path(layout['root']).resolve(strict=True)
-    for service, entry in zip(source.SERVICES, ('devnet-server.ts', 'restaurant-server.ts')):
+    for service, entry in zip(layout.get('services', source.SERVICES), ('devnet-server.ts', 'restaurant-server.ts')):
         source.require(source.run('systemctl', 'is-active', service) == 'active', 'service inactive')
         pid = source.run('systemctl', 'show', '-p', 'MainPID', '--value', service)
         source.require(pid.isdecimal() and int(pid) > 0, 'missing process PID')
@@ -232,12 +248,15 @@ def create_backup(archive, expected):
 def backup(transaction):
     directory = BACKUPS / transaction
     directory.mkdir(mode=0o700)
-    roots = [PRIVATE, STATE, LEGACY, Path('/etc/nginx')]
+    roots = [PRIVATE, STATE, LEGACY, Path('/etc/nginx'), Path('/etc/capture402'),
+             Path('/usr/local/sbin/capture402'), Path('/usr/local/sbin/capture402-deploy')]
     if source.CURRENT.is_symlink():
         source.release_name(source.CURRENT)
         roots.append(source.CURRENT.resolve(strict=True))
-    roots += [UNITS / (s + '.service') for s in (*source.SERVICES, NGINX_SERVICE)]
-    roots += [UNITS / (s + '.service.d') for s in (*source.SERVICES, NGINX_SERVICE)]
+    names = tuple(dict.fromkeys((*source.SERVICES, *PRODUCT_SERVICES, NGINX_SERVICE)))
+    roots += [UNITS / (s + '.service') for s in names]
+    roots += [UNITS / (s + '.service.d') for s in names]
+    roots += [UNITS / 'multi-user.target.wants' / (s + '.service') for s in names]
     expected = inventory(roots)
     archive = directory / 'preserved.tar'
     create_backup(archive, expected)
@@ -320,6 +339,118 @@ def prepare_boot_boundary():
         atomic_bytes(path, gate_dependency(data))
 
 
+def migration_snapshot(previous):
+    if not previous.get('services') or tuple(previous['services']) == tuple(PRODUCT_SERVICES):
+        return None
+    result = {'previousServices': previous['services'], 'files': {}, 'enablement': {}}
+    source.require(tuple(previous['services']) == tuple(LEGACY_SERVICES), 'unknown service namespace')
+    for name in (*previous['services'], *PRODUCT_SERVICES):
+        state = source.run('systemctl', 'show', '-p', 'UnitFileState', '--value', name)
+        source.require(state in ('', 'enabled', 'disabled', 'static'), 'unsupported unit enablement; inspect before migration')
+        result['enablement'][name] = state
+    for name in PRODUCT_SERVICES:
+        paths = [UNITS / (name + '.service')]
+        directory = UNITS / (name + '.service.d')
+        source.require(not directory.is_symlink(), 'product drop-in directory is symlink')
+        if directory.exists():
+            source.require(all(p.is_file() and not p.is_symlink() and p.suffix == '.conf' for p in directory.iterdir()),
+                           'unexpected product drop-in entry')
+            paths += list(directory.iterdir())
+        for path in paths:
+            source.require(not path.is_symlink() and (not path.exists() or path.is_file()), 'unsafe product unit file')
+            result['files'][str(path)] = None if not path.exists() else {
+                'bytes': base64.b64encode(path.read_bytes()).decode(), 'mode': path.stat().st_mode & 0o777}
+    # Reject ambiguous source layouts before persisting pending state.
+    for name in previous['services']:
+        path = UNITS / (name + '.service')
+        source.require(path.is_file() and not path.is_symlink(), 'migration requires regular /etc unit files')
+        info = path.stat()
+        source.require(info.st_uid == os.getuid() and not info.st_mode & 0o022, 'unsafe legacy unit ownership/mode')
+        actual = source.run('systemctl', 'show', '-p', 'FragmentPath', '--value', name)
+        source.require(actual == str(path), 'unexpected service fragment; inspect before migration')
+        source.require(not any(line.strip().startswith(('Alias=', 'Also=')) for line in path.read_text().splitlines()),
+                       'unit aliases require a separate migration plan')
+        directory = UNITS / (name + '.service.d')
+        source.require(not directory.is_symlink(), 'legacy drop-in directory is symlink')
+        if directory.exists():
+            source.require(all(p.is_file() and not p.is_symlink() and p.suffix == '.conf' for p in directory.iterdir()),
+                           'unexpected legacy drop-in entry')
+            source.require(all(p.stat().st_uid == os.getuid() and not p.stat().st_mode & 0o022 for p in directory.iterdir()),
+                           'unsafe legacy drop-in ownership/mode')
+        effective = source.run('systemctl', 'show', '-p', 'DropInPaths', '--value', name).split()
+        expected = [] if not directory.exists() else [str(p) for p in directory.iterdir()]
+        source.require(set(effective) == set(expected), 'unmanaged service drop-ins; inspect before migration')
+    return result
+
+
+def renamed_unit(data, mapping, description=None):
+    lines = []
+    section = ''
+    for line in data.decode().splitlines(keepends=True):
+        if line.strip().startswith('['):
+            section = line.strip()
+        key, separator, value = line.partition('=')
+        if section == '[Unit]' and key.strip() in ('After', 'Before', 'Requires', 'Wants', 'BindsTo', 'PartOf', 'Conflicts'):
+            line = key + '=' + ' '.join(mapping.get(word, word) for word in value.split()) + '\n'
+        elif section == '[Unit]' and key.strip() == 'Description' and description:
+            line = 'Description=' + description + '\n'
+        lines.append(line)
+    return gate_dependency(''.join(lines).encode())
+
+
+def migrate_services(snapshot):
+    if snapshot is None:
+        return
+    old = snapshot['previousServices']
+    mapping = {a + '.service': b + '.service' for a, b in zip(old, PRODUCT_SERVICES)}
+    for legacy, product, description in zip(old, PRODUCT_SERVICES,
+            ('Capture402 private Solana facilitator', 'Capture402 restaurant application')):
+        target = UNITS / (product + '.service')
+        atomic_bytes(target, renamed_unit((UNITS / (legacy + '.service')).read_bytes(), mapping, description))
+        target_directory = UNITS / (product + '.service.d')
+        if target_directory.exists():
+            for path in target_directory.iterdir():
+                durable_remove(path)
+        directory = UNITS / (legacy + '.service.d')
+        if directory.exists():
+            for original in directory.iterdir():
+                atomic_bytes(UNITS / (product + '.service.d') / original.name,
+                             renamed_unit(original.read_bytes(), mapping))
+    source.run('systemctl', 'daemon-reload')
+    source.run('systemctl', 'disable', *old)
+    source.run('systemctl', 'enable', *PRODUCT_SERVICES)
+    source.SERVICES = tuple(PRODUCT_SERVICES)
+
+
+def restore_service_names(snapshot):
+    if snapshot is None:
+        return
+    source.require(tuple(snapshot['previousServices']) == tuple(LEGACY_SERVICES), 'invalid rollback service namespace')
+    existing = [name for name in PRODUCT_SERVICES if (UNITS / (name + '.service')).exists()]
+    if existing:
+        source.run('systemctl', 'disable', *existing)
+    for name in PRODUCT_SERVICES:
+        paths = [UNITS / (name + '.service')]
+        directory = UNITS / (name + '.service.d')
+        if directory.exists():
+            paths += list(directory.iterdir())
+        paths += [Path(p) for p in snapshot['files'] if Path(p) == UNITS / (name + '.service')
+                  or Path(p).parent == directory]
+        for path in dict.fromkeys(paths):
+            value = snapshot['files'].get(str(path))
+            if value is None:
+                durable_remove(path)
+            else:
+                atomic_bytes(path, gate_dependency(base64.b64decode(value['bytes'], validate=True)), value['mode'])
+    source.run('systemctl', 'daemon-reload')
+    for name, state in snapshot['enablement'].items():
+        if state == 'enabled':
+            source.run('systemctl', 'enable', name)
+        elif state == 'disabled':
+            source.run('systemctl', 'disable', name)
+    source.SERVICES = tuple(snapshot['previousServices'])
+
+
 
 def install_controls(sha, merchant_file=False):
     fragment = (source.RELEASES / sha / 'integration/deploy/nginx-resource.conf').read_bytes()
@@ -343,24 +474,25 @@ def install_controls(sha, merchant_file=False):
 def install_recovery():
     # Runs offline on reboot; durable controller is installed before this unit.
     controller = Path(__file__).resolve()
+    all_services = tuple(dict.fromkeys((*source.SERVICES, *PRODUCT_SERVICES)))
     atomic_bytes(GATE, f'''[Unit]
 Description=Close Capture402 ingress before booting an interrupted release
-Before={NGINX_SERVICE}.service {' '.join(s + '.service' for s in source.SERVICES)}
+Before={NGINX_SERVICE}.service {' '.join(s + '.service' for s in all_services)}
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/bin/python3 {controller} --gate
+ExecStart=/usr/bin/python3 -B {controller} --gate
 UMask=0077
 [Install]
 WantedBy=multi-user.target
 '''.encode())
     atomic_bytes(RECOVERY, f'''[Unit]
 Description=Recover interrupted Capture402 release without replaying payments
-After=network-online.target {NGINX_SERVICE}.service {' '.join(s + '.service' for s in source.SERVICES)}
+After=network-online.target {NGINX_SERVICE}.service {' '.join(s + '.service' for s in all_services)}
 Wants=network-online.target
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 {controller} --recover
+ExecStart=/usr/bin/python3 -B {controller} --recover
 TimeoutStartSec=300
 UMask=0077
 [Install]
@@ -377,9 +509,20 @@ WantedBy=multi-user.target
     source.run('systemctl', 'reload', NGINX_SERVICE)
 
 
-def stop():
-    source.run('systemctl', 'stop', *source.SERVICES, timeout=45)
-    for service in source.SERVICES:
+def stop(names=None):
+    names = tuple(source.SERVICES if names is None else dict.fromkeys(names))
+    available = []
+    for name in names:
+        try:
+            state = source.run('systemctl', 'show', '-p', 'LoadState', '--value', name)
+        except subprocess.CalledProcessError as error:
+            source.require((error.stdout or '').strip() == 'not-found', 'cannot determine backend load state')
+            state = 'not-found'
+        if state != 'not-found':
+            available.append(name)
+    if available:
+        source.run('systemctl', 'stop', *available, timeout=45)
+    for service in available:
         # A failed boot (e.g. interrupted WorkingDirectory installation) retains
         # failed state after stop. It is quiesced only with BOTH process IDs zero.
         source.require(source.run('systemctl', 'show', '-p', 'ActiveState', '--value', service) in ('inactive', 'failed')
@@ -391,7 +534,7 @@ def stop():
 def fail_closed():
     maintenance()
     try:
-        source.run('systemctl', 'stop', *source.SERVICES, timeout=45)
+        stop((*LEGACY_SERVICES, *PRODUCT_SERVICES))
     except Exception as error:
         raise RuntimeError('ROLLBACK_UNVERIFIED; backend shutdown also unverified') from error
 
@@ -402,11 +545,15 @@ def rollback(pending):
     expected_root = LEGACY if old['legacy'] else source.RELEASES / old['sha']
     source.require(Path(old['root']) == expected_root, 'invalid previous source path')
     maintenance()
-    stop()
+    previous_services = tuple(old.get('services', LEGACY_SERVICES))
+    source.require(previous_services in (tuple(LEGACY_SERVICES), tuple(PRODUCT_SERVICES)), 'invalid rollback services')
+    stop((*previous_services, *pending.get('targetServices', source.SERVICES)))
     if pending.get('backup'):
         archive = Path(pending['backup']['path'])
         source.require(archive.parent.parent == BACKUPS and archive.name == 'preserved.tar', 'invalid backup path')
         source.require(digest_file(archive) == pending['backup']['sha256'], 'verified backup changed')
+    restore_service_names(pending.get('serviceMigration'))
+    source.SERVICES = previous_services
     restore_controls(pending['controls'])
     # restore_controls() atomically retains the guard/dependencies on every file.
     previous_link = pending['current']
@@ -433,7 +580,10 @@ def rollback(pending):
 def locked(recovery_only=False):
     source.require(os.geteuid() == 0, 'requires authorized sudo')
     BASE.mkdir(mode=0o755, exist_ok=True)
-    for directory in (source.RELEASES, source.MANIFESTS): directory.mkdir(exist_ok=True)
+    for directory in (BASE, source.RELEASES, source.MANIFESTS):
+        source.require(not directory.is_symlink(), 'managed release directory is symlink')
+        directory.mkdir(mode=0o755, exist_ok=True)
+        directory.chmod(0o755)
     BACKUPS.mkdir(mode=0o700, exist_ok=True)
     BACKUPS.chmod(0o700)
     fd = os.open(BASE / 'deploy.lock', os.O_CREAT | os.O_RDWR, 0o600)
@@ -472,20 +622,28 @@ def deploy(sha):
             if kind == 'file':
                 p = source.RELEASES / sha / name
                 source.require(not p.is_symlink() and digest_file(p) == fingerprint, 'staged source substituted')
-        if previous['sha'] == sha and not previous['legacy']:
+        source.require_current_main(sha)
+        migration = migration_snapshot(previous)
+        if previous['sha'] == sha and not previous['legacy'] and migration is None:
             ready({**previous, 'merchantReady': True})
             print('ALREADY_ACTIVE ' + sha, flush=True)
             return
         install_recovery()
         pending = {'previous': previous, 'target': sha, 'controls': capture_controls(),
-                   'current': source.current_sha() if source.CURRENT.is_symlink() else None}
+                   'current': source.current_sha() if source.CURRENT.is_symlink() else None,
+                   'serviceMigration': migration,
+                   'targetServices': list(PRODUCT_SERVICES if migration else source.SERVICES), 'stage': 'prepared'}
         # Boot enforcement is already durable and effective. Persist recovery
         # information before stopping services or switching the runtime.
         source.write_json(PENDING, pending)
         try:
             maintenance()
             # Prepared legacy guard also blocks requests on reboot during backup.
+            pending['stage'] = 'quiescing'
+            source.write_json(PENDING, pending)
             stop()
+            pending['stage'] = 'backup'
+            source.write_json(PENDING, pending)
             pending['backup'] = backup(sha + '-' + str(time.time_ns()))
             source.write_json(PENDING, pending)
             preserved = inventory([PRIVATE, STATE])
@@ -496,10 +654,15 @@ def deploy(sha):
             source.require(set(after) - set(preserved) <= {str(PRIVATE / 'merchant.env').lstrip('/')},
                            'unexpected private state added')
             preserved = after
+            source.require_current_main(sha)
+            pending['stage'] = 'controls'
+            source.write_json(PENDING, pending)
+            migrate_services(migration)
             install_controls(sha, merchant_file)
             source.require(inventory([PRIVATE, STATE]) == preserved, 'private or payment state changed during cutover')
             source.restart()
-            layout = {'sha': sha, 'root': str(source.RELEASES / sha), 'legacy': False, 'merchantReady': True}
+            layout = {'sha': sha, 'root': str(source.RELEASES / sha), 'legacy': False,
+                      'merchantReady': True, 'services': list(source.SERVICES)}
             ready(layout, public=False)
             durable_remove(MAINTENANCE)
             ready(layout)
@@ -509,6 +672,11 @@ def deploy(sha):
             durable_remove(PENDING)
             print('DEPLOYED ' + sha, flush=True)
         except Exception as original:
+            try:
+                source.write_json(BASE / 'last-failure.json', {'target': sha, 'stage': pending['stage'],
+                                  'errorType': type(original).__name__})
+            except OSError:
+                pass  # Diagnostic storage failure must not prevent rollback.
             try:
                 rollback(pending)
             except Exception as exc:

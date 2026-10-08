@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")"
-exec python3 ops/launch_deploy.py "$@"
+exec python3 -B ops/launch_deploy.py "$@"

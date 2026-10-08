@@ -5,18 +5,24 @@ import shlex
 import subprocess
 import sys
 import tarfile
+import json
 
 import deploy_demo as source
+import release_policy as policy
 
 # This constant program only installs the explicitly selected controller files.
 # SSH disconnect does not stop the systemd-owned deployment transaction.
 INSTALLER = r'''
-import io, os, pathlib, subprocess, sys, tarfile, tempfile
+import io, os, pathlib, stat, subprocess, sys, tarfile, tempfile
 sha = sys.argv[1]
 assert len(sha) == 40 and all(c in '0123456789abcdef' for c in sha)
 root = pathlib.Path('/opt/capture402/controllers') / sha
-root.mkdir(parents=True, exist_ok=True, mode=0o755)
-allowed = {'ops/deploy_demo.py', 'ops/deploy_vps.py'}
+for directory in (root.parent.parent, root.parent, root):
+    assert not directory.is_symlink(), 'controller directory is symlink'
+    directory.mkdir(exist_ok=True, mode=0o755)
+    assert directory.stat().st_uid == os.geteuid(), 'controller directory owner changed'
+    directory.chmod(0o755)
+allowed = {'ops/deploy_demo.py', 'ops/deploy_vps.py', 'ops/host_cli.py', 'ops/release_policy.py'}
 data = sys.stdin.buffer.read(1024 * 1024)
 with tarfile.open(fileobj=io.BytesIO(data), mode='r:') as archive:
     members = archive.getmembers()
@@ -26,7 +32,10 @@ with tarfile.open(fileobj=io.BytesIO(data), mode='r:') as archive:
         target = root / pathlib.Path(member.name).name
         payload = archive.extractfile(member).read()
         compile(payload, str(target), 'exec')
+        assert not target.is_symlink(), 'controller file is symlink'
         if target.exists():
+            info = target.stat()
+            assert stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and not info.st_mode & 0o022, 'unsafe controller ownership/mode'
             assert target.read_bytes() == payload, 'existing controller changed'
         else:
             fd, temporary = tempfile.mkstemp(prefix='.controller-', dir=root)
@@ -37,12 +46,18 @@ with tarfile.open(fileobj=io.BytesIO(data), mode='r:') as archive:
             directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
             try: os.fsync(directory)
             finally: os.close(directory)
+sys.path.insert(0, str(root))
+import host_cli
+host_cli.install_controllers(sha, {name: (root / name).read_bytes() for name in host_cli.FILES})
+if len(sys.argv) == 3 and sys.argv[2] == '--install-cli':
+    print('CLI_INSTALLED ' + sha, flush=True)
+    sys.exit(0)
 unit = 'capture402-release-' + sha[:12] + '-' + str(os.getpid())
 print('Deployment job: ' + unit, flush=True)
 result = subprocess.run(['systemd-run', '--unit=' + unit, '--wait',
     '--property=Type=exec', '--property=UMask=0077', '--property=RuntimeMaxSec=900',
     '--property=OnFailure=capture402-recovery.service',
-    '/usr/bin/python3', str(root / 'deploy_vps.py'), sha])
+    '/usr/bin/python3', '-B', str(root / 'deploy_vps.py'), sha])
 subprocess.run(['journalctl', '--no-pager', '-u', unit])
 sys.exit(result.returncode)
 '''
@@ -74,52 +89,21 @@ def recover_first():
 
 
 def require_acceptance(sha):
-    import json
-    api = 'repos/starPaw/svm-auth-capture'
-    pulls = json.loads(source.run('gh', 'api', f'{api}/commits/{sha}/pulls'))
-    matched = [p for p in pulls if p.get('merged_at') and p.get('merge_commit_sha') == sha
-               and p['base']['ref'] == 'main']
-    source.require(len(matched) == 1, 'main SHA lacks an unambiguous merged PR')
-    pull = matched[0]
-    reviews = json.loads(source.run('gh', 'api', '--paginate', '--slurp', f"{api}/pulls/{pull['number']}/reviews"))
-    # Owner-approved policy: gwinpin reviews count even when agent-submitted.
-    # An agent approval is not an independent human review.
-    latest = {}
-    for page in reviews:
-        for review in page:
-            user = review['user']
-            if user['login'] == 'starPaw' or user.get('type') != 'User':
-                continue
-            if review['state'] in ('APPROVED', 'CHANGES_REQUESTED', 'DISMISSED'):
-                latest[user['login']] = review
-    accepted = [r for r in latest.values() if r['state'] == 'APPROVED'
-                and r['commit_id'] == pull['head']['sha']]
-    source.require(bool(accepted), 'eligible exact-head reviewer approval missing')
-    # A merge conflict fix must not silently change the accepted application tree.
-    source.run('git', 'fetch', 'origin', pull['head']['sha'], timeout=120)
-    source.require(not source.run('git', 'diff', '--name-only', pull['head']['sha'], sha),
-                   'merged tree differs from independently accepted head')
+    return policy.verify(sha, lambda route: json.loads(source.run('gh', 'api', route)))
 
 
 def main():
-    if len(sys.argv) != 1:
-        raise RuntimeError('usage: ./deploy.sh (deploys the clean, exact current main checkout)')
+    if sys.argv[1:] not in ([], ['--install-cli']):
+        raise RuntimeError('usage: ./deploy.sh [--install-cli] (clean, exact current main checkout)')
     source.require(source.run('git', 'remote', 'get-url', 'origin') == 'https://github.com/starPaw/svm-auth-capture.git', 'wrong repository')
     source.require(not source.run('git', 'status', '--porcelain'), 'deployment requires clean checkout')
     recover_first()
     source.run('git', 'fetch', 'origin', 'main', timeout=120)
     sha = source.run('git', 'rev-parse', 'HEAD')
     source.require(sha == source.run('git', 'rev-parse', 'origin/main'), 'checkout differs from canonical main')
-    # Require successful current-main CI and owner-designated exact-head review.
-    # Invoking this command is the owner's explicit operational authorization.
-    import json
-    runs = json.loads(source.run('gh', 'run', 'list', '--commit', sha, '--workflow', 'components.yml',
-        '--event', 'push', '--json', 'conclusion,headSha,status', '--limit', '1'))
-    source.require(len(runs) == 1 and runs[0]['status'] == 'completed'
-                   and runs[0]['conclusion'] == 'success' and runs[0]['headSha'] == sha,
-                   'current main Components CI has not succeeded')
+    # Shared eligibility policy is identical for local SSH and on-host operation.
     require_acceptance(sha)
-    blob = subprocess.run(['git', 'archive', '--format=tar', sha, 'ops/deploy_demo.py', 'ops/deploy_vps.py'],
+    blob = subprocess.run(['git', 'archive', '--format=tar', sha, 'ops/deploy_demo.py', 'ops/deploy_vps.py', 'ops/host_cli.py', 'ops/release_policy.py'],
                           check=True, capture_output=True).stdout
     # Git adds an ops/ directory; rebuild the small transfer as regular files only.
     output = io.BytesIO()
@@ -127,6 +111,8 @@ def main():
         for member in archive:
             if member.isfile(): packed.addfile(member, archive.extractfile(member))
     command = 'sudo -n python3 -c ' + shlex.quote(INSTALLER) + ' ' + sha
+    if sys.argv[1:]:
+        command += ' --install-cli'
     subprocess.run([*SSH, command],
                    input=output.getvalue(), check=True)
 

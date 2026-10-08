@@ -352,6 +352,18 @@ def clone_main(sha: str, root: Path, user: pwd.struct_passwd) -> Path:
     return repo
 
 
+def require_current_main(sha: str) -> None:
+    """Refresh canonical identity after staging and immediately before cutover."""
+    user = pwd.getpwnam('capture402-deploy')
+    ssh_command = source_ssh_command(user)
+    remote = run('runuser', '-u', 'capture402-deploy', '--', '/usr/bin/env', '-i',
+                 f'HOME={user.pw_dir}', 'PATH=/usr/bin:/bin', 'GIT_TERMINAL_PROMPT=0',
+                 'GIT_CONFIG_NOSYSTEM=1', 'GIT_CONFIG_GLOBAL=/dev/null',
+                 'git', '-c', 'credential.helper=', '-c', f'core.sshCommand={ssh_command}',
+                 'ls-remote', '--exit-code', SOURCE_REMOTE, 'refs/heads/main', timeout=20)
+    require(remote == sha + '\trefs/heads/main', 'canonical main changed before cutover')
+
+
 def git_archive(repo: Path, sha: str) -> bytes:
     """An archive of the exact commit, excluding workflow code and any secrets."""
     return subprocess.run(
@@ -408,6 +420,24 @@ def chown_tree(root: Path, uid: int, gid: int) -> None:
         os.chown(parent, uid, gid, follow_symlinks=False)
 
 
+def seal_runtime_permissions(root: Path) -> None:
+    """Make sealed application bytes readable by sac006 under private UMask.
+
+    Source and dependencies contain no private configuration. Keep only owner
+    write access, preserve executable files, and never follow npm symlinks.
+    """
+    require(root.is_dir() and not root.is_symlink(), "unsafe runtime root")
+    for parent, dirs, files in os.walk(root, followlinks=False):
+        for path in [Path(parent), *(Path(parent) / n for n in dirs + files)]:
+            info = path.lstat()
+            require(info.st_uid == os.geteuid(), "runtime is not owned by deployment user")
+            if stat.S_ISLNK(info.st_mode):
+                continue
+            require(stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode),
+                    "unsupported runtime file type")
+            path.chmod(0o755 if stat.S_ISDIR(info.st_mode) or info.st_mode & 0o100 else 0o644)
+
+
 def prepare_release(sha: str, digest: str, blob: bytes) -> None:
     target = RELEASES / sha
     manifest = MANIFESTS / f"{sha}.json"
@@ -416,6 +446,7 @@ def prepare_release(sha: str, digest: str, blob: bytes) -> None:
         data = json.loads(manifest.read_text())
         require(data["archiveSha256"] == digest and data["sha"] == sha,
                 "same SHA has a different archive digest")
+        seal_runtime_permissions(target)
         return
 
     stage = Path(tempfile.mkdtemp(prefix=".candidate-", dir=RELEASES))
@@ -428,7 +459,7 @@ def prepare_release(sha: str, digest: str, blob: bytes) -> None:
             "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund",
             cwd=stage / "integration", timeout=240)
         chown_tree(stage, 0, 0)
-        stage.chmod(0o755)
+        seal_runtime_permissions(stage)
         write_json(manifest, {"sha": sha, "archiveSha256": digest, "status": "prepared"})
         os.rename(stage, target)
     finally:

@@ -11,6 +11,7 @@ from unittest import mock
 import deploy_demo as source
 import deploy_vps as host
 import launch_deploy as launcher
+from test_deploy_policy import PolicyFixture
 
 INSTALL_RECOVERY = host.install_recovery
 
@@ -53,7 +54,7 @@ class TransactionTests(unittest.TestCase):
             setattr(self, name + '_mock', obj)
         for name, value in (('manually_fetch_archive', b'blob'), ('verify_source_against_main', None),
                             ('prepare_release', None), ('archive_fingerprints', {}),
-                            ('check_unit_layout', None), ('restart', None)):
+                            ('check_unit_layout', None), ('restart', None), ('require_current_main', None)):
             patch = mock.patch.object(source, name, return_value=value)
             obj = patch.start(); self.addCleanup(patch.stop)
             setattr(self, name + '_mock', obj)
@@ -102,6 +103,24 @@ class TransactionTests(unittest.TestCase):
         self.assertFalse(host.PENDING.exists())
         self.assert_preserved()
 
+    def test_main_advance_after_staging_does_not_stop_services(self):
+        self.require_current_main_mock.side_effect = RuntimeError('main advanced')
+        with self.assertRaisesRegex(RuntimeError, 'main advanced'): host.deploy(NEW)
+        self.backup_mock.assert_not_called()
+        self.assertFalse(host.PENDING.exists())
+        self.assertNotIn(('systemctl', 'stop', *source.SERVICES), self.calls)
+
+    def test_diagnostic_disk_failure_does_not_skip_rollback(self):
+        self.restart_mock.side_effect = [RuntimeError('startup failed'), None]
+        original = source.write_json
+        def write(path, value):
+            if path.name == 'last-failure.json': raise OSError('disk unavailable')
+            original(path, value)
+        with mock.patch.object(source, 'write_json', side_effect=write):
+            with self.assertRaisesRegex(RuntimeError, 'verified rollback'): host.deploy(NEW)
+        self.assertFalse(host.PENDING.exists())
+        self.assert_preserved()
+
     def test_backup_failure_never_switches_source_and_rolls_back(self):
         self.backup_mock.side_effect = RuntimeError('backup inventory mismatch')
         with self.assertRaisesRegex(RuntimeError, 'verified rollback'):
@@ -115,7 +134,7 @@ class TransactionTests(unittest.TestCase):
             host.deploy(NEW)
         self.assertTrue(host.PENDING.exists())
         self.assertTrue(host.MAINTENANCE.exists())
-        self.assertEqual(self.calls[-1], ('systemctl', 'stop', *source.SERVICES))
+        self.assertIn(('systemctl', 'stop', *host.LEGACY_SERVICES, *host.PRODUCT_SERVICES), self.calls)
         self.assert_preserved()
 
     def test_kill_between_pending_and_backup_recovers_without_network(self):
@@ -229,6 +248,83 @@ class TransactionTests(unittest.TestCase):
 
 
 
+class ServiceMigrationTests(unittest.TestCase):
+    setUp = TransactionTests.setUp
+    assert_preserved = TransactionTests.assert_preserved
+
+    def migration_fixture(self):
+        patch = mock.patch.object(source, 'SERVICES', tuple(host.LEGACY_SERVICES))
+        patch.start(); self.addCleanup(patch.stop)
+        self.previous['services'] = list(host.LEGACY_SERVICES)
+        for index, name in enumerate(host.LEGACY_SERVICES):
+            (host.UNITS / (name + '.service')).write_text('[Unit]\nDescription=legacy\nAfter=network-online.target sac006-facilitator.service\n[Service]\nUser=sac006\nEnvironmentFile=/etc/sac006/resource.env\nExecStart=/bin/true\n[Install]\nWantedBy=multi-user.target\n')
+        def run(*args, **kwargs):
+            self.calls.append(args)
+            name = args[-1]
+            if 'FragmentPath' in args: return str(host.UNITS / (name + '.service'))
+            if 'DropInPaths' in args:
+                directory = host.UNITS / (name + '.service.d')
+                return ' '.join(str(p) for p in directory.iterdir()) if directory.exists() else ''
+            if 'UnitFileState' in args: return 'enabled' if name in host.LEGACY_SERVICES else ''
+            if 'ActiveState' in args: return 'inactive'
+            if 'MainPID' in args or 'ControlPID' in args: return '0'
+            if 'LoadState' in args: return 'loaded' if (host.UNITS / (name + '.service')).is_file() else 'not-found'
+            return ''
+        self.run_mock.side_effect = run
+
+    def test_names_migrate_only_after_backup_and_keep_user_environment_and_state(self):
+        self.migration_fixture()
+        host.deploy(NEW)
+        self.assertEqual(source.SERVICES, host.PRODUCT_SERVICES)
+        unit = (host.UNITS / (host.PRODUCT_SERVICES[1] + '.service')).read_text()
+        self.assertIn('User=sac006', unit)
+        self.assertIn('EnvironmentFile=/etc/sac006/resource.env', unit)
+        self.assertIn('capture402-facilitator.service', unit)
+        self.assertIn(('systemctl', 'disable', *host.LEGACY_SERVICES), self.calls)
+        self.assertIn(('systemctl', 'enable', *host.PRODUCT_SERVICES), self.calls)
+        self.assert_preserved()
+
+    def test_startup_failure_restores_original_service_names_and_enablement(self):
+        self.migration_fixture()
+        self.restart_mock.side_effect = [RuntimeError('private diagnostic must not be logged'), None]
+        with self.assertRaisesRegex(RuntimeError, 'verified rollback'): host.deploy(NEW)
+        self.assertEqual(source.SERVICES, host.LEGACY_SERVICES)
+        for name in host.PRODUCT_SERVICES: self.assertFalse((host.UNITS / (name + '.service')).exists())
+        for name in host.LEGACY_SERVICES: self.assertIn(('systemctl', 'enable', name), self.calls)
+        self.assertNotIn('private diagnostic', (host.BASE / 'last-failure.json').read_text())
+        self.assert_preserved()
+
+    def test_partial_name_installation_is_guarded_and_recovers_offline(self):
+        self.migration_fixture()
+        original = host.atomic_bytes
+        def interrupted(path, data, mode=0o644):
+            original(path, data, mode)
+            if path == host.UNITS / (host.PRODUCT_SERVICES[0] + '.service'): raise KeyboardInterrupt()
+        with mock.patch.object(host, 'atomic_bytes', side_effect=interrupted):
+            with self.assertRaises(KeyboardInterrupt): host.deploy(NEW)
+        self.assertTrue(host.PENDING.exists())
+        self.assertIn(host.GATE.name, (host.UNITS / (host.PRODUCT_SERVICES[0] + '.service')).read_text())
+        source.SERVICES = host.LEGACY_SERVICES
+        self.manually_fetch_archive_mock.reset_mock()
+        host.main(['--recover'])
+        self.manually_fetch_archive_mock.assert_not_called()
+        self.assertFalse(host.PENDING.exists())
+        self.assert_preserved()
+
+    def test_alias_layout_is_refused_before_service_stop(self):
+        self.migration_fixture()
+        path = host.UNITS / (host.LEGACY_SERVICES[0] + '.service')
+        path.write_text(path.read_text() + 'Alias=external.service\n')
+        with self.assertRaisesRegex(RuntimeError, 'aliases require'): host.deploy(NEW)
+        self.backup_mock.assert_not_called()
+        self.assertFalse(host.PENDING.exists())
+        self.assert_preserved()
+
+    def test_unavailable_systemd_is_not_mistaken_for_absent_service(self):
+        with mock.patch.object(source, 'run', side_effect=subprocess.CalledProcessError(1, ['systemctl'], output='')):
+            with self.assertRaisesRegex(RuntimeError, 'cannot determine backend'): host.stop()
+
+
 class BackupTests(unittest.TestCase):
     def test_backup_round_trip_preserves_busy_symlinks_metadata_and_original_wires(self):
         with tempfile.TemporaryDirectory() as root:
@@ -302,32 +398,25 @@ class RetryTests(unittest.TestCase):
         sleep.assert_not_called()
 
 
-class AcceptanceTests(unittest.TestCase):
+class AcceptanceTests(PolicyFixture):
     def test_owner_and_stale_head_cannot_approve(self):
-        pull = {'merged_at':'today', 'merge_commit_sha': NEW, 'base': {'ref':'main'}, 'head':{'sha':OLD}, 'number':1}
         for login, revision in [('starPaw', OLD), ('gwinpin', NEW), ('independent', NEW)]:
-            review = {'user':{'login':login, 'type':'User'}, 'state':'APPROVED', 'commit_id':revision}
-            with mock.patch.object(source, 'run', side_effect=[json.dumps([pull]), json.dumps([[review]])]):
+            self.reviews = [self.review(login, revision)]
+            with mock.patch.object(source, 'run', side_effect=self.gh):
                 with self.assertRaisesRegex(RuntimeError, 'eligible exact-head'): launcher.require_acceptance(NEW)
 
     def test_gwinpin_agent_approval_on_exact_head_is_eligible(self):
-        pull = {'merged_at':'today', 'merge_commit_sha': NEW, 'base': {'ref':'main'}, 'head':{'sha':OLD}, 'number':1}
-        review = {'user':{'login':'gwinpin','type':'User'}, 'state':'APPROVED', 'commit_id':OLD}
-        with mock.patch.object(source, 'run', side_effect=[json.dumps([pull]), json.dumps([[review]]), '', '']) as run:
-            launcher.require_acceptance(NEW)
-        self.assertEqual(run.call_count, 4)
+        with mock.patch.object(source, 'run', side_effect=self.gh):
+            self.assertEqual(launcher.require_acceptance(NEW)['reviewer'], 'gwinpin')
 
     def test_latest_gwinpin_changes_requested_blocks_deploy(self):
-        pull = {'merged_at':'today', 'merge_commit_sha': NEW, 'base': {'ref':'main'}, 'head':{'sha':OLD}, 'number':1}
-        base = {'user':{'login':'gwinpin','type':'User'}, 'commit_id':OLD}
-        reviews = [{**base, 'state':'APPROVED'}, {**base, 'state':'CHANGES_REQUESTED'}]
-        with mock.patch.object(source, 'run', side_effect=[json.dumps([pull]), json.dumps([reviews])]):
+        self.reviews += [self.review('gwinpin', OLD, 'CHANGES_REQUESTED')]
+        with mock.patch.object(source, 'run', side_effect=self.gh):
             with self.assertRaisesRegex(RuntimeError, 'eligible exact-head'): launcher.require_acceptance(NEW)
 
     def test_accepted_merge_must_preserve_reviewed_tree(self):
-        pull = {'merged_at':'today', 'merge_commit_sha': NEW, 'base':{'ref':'main'}, 'head':{'sha':OLD}, 'number':1}
-        review = {'user':{'login':'independent','type':'User'}, 'state':'APPROVED','commit_id':OLD}
-        with mock.patch.object(source, 'run', side_effect=[json.dumps([pull]), json.dumps([[review]]), '', 'conflict-change']):
+        self.reviewed_tree = 'different'
+        with mock.patch.object(source, 'run', side_effect=self.gh):
             with self.assertRaisesRegex(RuntimeError, 'merged tree differs'): launcher.require_acceptance(NEW)
 
 
