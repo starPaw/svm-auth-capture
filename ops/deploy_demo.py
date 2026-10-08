@@ -131,10 +131,10 @@ def check_health(sha: str) -> None:
             and bool(config.get("sponsor")), "missing authenticated runtime identities")
 
     local_status, _, local_headers = response("http://127.0.0.1:8788/resource")
-    require(local_status == 402 and "PAYMENT-REQUIRED" in local_headers,
+    require(local_status == 402 and any(k.lower() == "payment-required" for k in local_headers),
             "local resource is not an x402 payment challenge")
     remote_status, _, remote_headers = response("https://capture402.xyz/resource")
-    require(remote_status == 402 and "PAYMENT-REQUIRED" in remote_headers,
+    require(remote_status == 402 and any(k.lower() == "payment-required" for k in remote_headers),
             "public resource routing is not an x402 payment challenge")
     order_status, _, _ = response("https://capture402.xyz/api/orders",
                                   method="POST", data=b"{}")
@@ -216,6 +216,59 @@ def unpack_archive(blob: bytes, destination: Path) -> None:
                 f"required app file missing: {relative}")
 
 
+
+def archive_fingerprints(blob: bytes, mode: str) -> dict[str, tuple[str, str]]:
+    """Match the reviewed Git tree, not merely a digest claimed by the SSH key."""
+    output: dict[str, tuple[str, str]] = {}
+    with tarfile.open(fileobj=io.BytesIO(blob), mode=mode) as archive:
+        members = archive.getmembers()
+        require(len(members) <= MAX_MEMBERS, "too many entries for source verification")
+        total = 0
+        for member in members:
+            path = member.name.rstrip("/")
+            require(path not in output, "duplicate source path")
+            require(member.isdir() or member.isfile(), "unsupported Git object type")
+            total += member.size
+            require(total <= MAX_UNPACKED, "source content too large")
+            if member.isdir():
+                output[path] = ("dir", "")
+            else:
+                payload = archive.extractfile(member)
+                require(payload is not None, "missing source bytes")
+                output[path] = ("file", hashlib.sha256(payload.read()).hexdigest())
+    return output
+
+
+def verify_source_against_main(sha: str, blob: bytes) -> None:
+    """Prevent a stolen SSH deploy key from substituting executable source bytes.
+
+    Independently shallow-clone public main *on the VPS*, require its HEAD equals
+    the intended SHA, and compare every archived file to the received artifact.
+    """
+    user = pwd.getpwnam("capture402-deploy")
+    temp = Path(tempfile.mkdtemp(prefix=".verify-", dir=RELEASES))
+    try:
+        os.chown(temp, user.pw_uid, user.pw_gid)
+        repo = temp / "repository"
+        run("runuser", "-u", "capture402-deploy", "--", "/usr/bin/env",
+            "git", "-c", "credential.helper=", "clone", "--depth=1",
+            "--single-branch", "--branch=main", "--no-checkout",
+            "https://github.com/starPaw/svm-auth-capture.git", str(repo),
+            timeout=180)
+        live = run("runuser", "-u", "capture402-deploy", "--",
+                   "git", "rev-parse", "HEAD", cwd=repo)
+        require(live == sha, "remote canonical main does not match approved SHA")
+        archived = subprocess.run(
+            ["runuser", "-u", "capture402-deploy", "--", "git", "archive",
+             "--format=tar", sha, "integration", RECORD],
+            cwd=repo, capture_output=True, check=True, timeout=90,
+        ).stdout
+        require(archive_fingerprints(blob, "r:gz")
+                == archive_fingerprints(archived, "r:"),
+                "received artifact differs from exact GitHub main tree")
+    finally:
+        shutil.rmtree(temp)
+
 def chown_tree(root: Path, uid: int, gid: int) -> None:
     # Never follow npm-created .bin symlinks. Root is owner after final sealing.
     for parent, dirs, files in os.walk(root, followlinks=False):
@@ -246,8 +299,8 @@ def prepare_release(sha: str, digest: str, blob: bytes) -> None:
             cwd=stage / "integration", timeout=240)
         chown_tree(stage, 0, 0)
         stage.chmod(0o755)
-        os.rename(stage, target)
         write_json(manifest, {"sha": sha, "archiveSha256": digest, "status": "prepared"})
+        os.rename(stage, target)
     finally:
         if stage.exists():
             shutil.rmtree(stage)
@@ -269,6 +322,7 @@ def deploy(sha: str, digest: str) -> None:
         require(len(blob) <= MAX_ARCHIVE and len(blob) > 0, "archive empty or over limit")
         require(hashlib.sha256(blob).hexdigest() == digest, "release archive SHA-256 mismatch")
 
+        verify_source_against_main(sha, blob)
         prepare_release(sha, digest, blob)
         if previous == sha:
             ready(sha)
