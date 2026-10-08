@@ -305,8 +305,7 @@ class SwitchingTests(unittest.TestCase):
               mock.patch.object(cd, "restart"),
               mock.patch.object(cd, "run", return_value=""),
               mock.patch.object(cd, "ready",
-                                side_effect=[RuntimeError("resource unhealthy"), None]),
-):
+                                side_effect=[RuntimeError("resource unhealthy"), None])):
             with self.assertRaisesRegex(RuntimeError, "resource unhealthy"):
                 cd.deploy(NEW, digest, payload)
         self.assertEqual(cd.current_sha(), OLD)
@@ -321,8 +320,7 @@ class SwitchingTests(unittest.TestCase):
               mock.patch.object(cd, "verify_source_against_main"),
               mock.patch.object(cd, "prepare_release"),
               mock.patch.object(cd, "restart") as restart,
-              mock.patch.object(cd, "run", side_effect=RuntimeError("nginx -t failed")),
-):
+              mock.patch.object(cd, "run", side_effect=RuntimeError("nginx -t failed"))):
             with self.assertRaisesRegex(RuntimeError, "nginx -t failed"):
                 cd.deploy(NEW, digest, payload)
         restart.assert_not_called()
@@ -346,8 +344,7 @@ class SwitchingTests(unittest.TestCase):
               mock.patch.object(cd, "verify_source_against_main"),
               mock.patch.object(cd, "prepare_release"),
               mock.patch.object(cd, "restart") as restart,
-              mock.patch.object(cd, "ready"),
-):
+              mock.patch.object(cd, "ready")):
             cd.deploy(OLD, digest, payload)
         restart.assert_not_called()
         self.assertEqual(cd.current_sha(), OLD)
