@@ -5,8 +5,10 @@ import shlex
 import subprocess
 import sys
 import tarfile
+import json
 
 import deploy_demo as source
+import release_policy as policy
 
 # This constant program only installs the explicitly selected controller files.
 # SSH disconnect does not stop the systemd-owned deployment transaction.
@@ -16,7 +18,7 @@ sha = sys.argv[1]
 assert len(sha) == 40 and all(c in '0123456789abcdef' for c in sha)
 root = pathlib.Path('/opt/capture402/controllers') / sha
 root.mkdir(parents=True, exist_ok=True, mode=0o755)
-allowed = {'ops/deploy_demo.py', 'ops/deploy_vps.py'}
+allowed = {'ops/deploy_demo.py', 'ops/deploy_vps.py', 'ops/host_cli.py', 'ops/release_policy.py'}
 data = sys.stdin.buffer.read(1024 * 1024)
 with tarfile.open(fileobj=io.BytesIO(data), mode='r:') as archive:
     members = archive.getmembers()
@@ -37,12 +39,15 @@ with tarfile.open(fileobj=io.BytesIO(data), mode='r:') as archive:
             directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
             try: os.fsync(directory)
             finally: os.close(directory)
+sys.path.insert(0, str(root))
+import host_cli
+host_cli.install_controllers(sha, {name: (root / name).read_bytes() for name in host_cli.FILES})
 unit = 'capture402-release-' + sha[:12] + '-' + str(os.getpid())
 print('Deployment job: ' + unit, flush=True)
 result = subprocess.run(['systemd-run', '--unit=' + unit, '--wait',
     '--property=Type=exec', '--property=UMask=0077', '--property=RuntimeMaxSec=900',
     '--property=OnFailure=capture402-recovery.service',
-    '/usr/bin/python3', str(root / 'deploy_vps.py'), sha])
+    '/usr/bin/python3', '-B', str(root / 'deploy_vps.py'), sha])
 subprocess.run(['journalctl', '--no-pager', '-u', unit])
 sys.exit(result.returncode)
 '''
@@ -74,31 +79,7 @@ def recover_first():
 
 
 def require_acceptance(sha):
-    import json
-    api = 'repos/starPaw/svm-auth-capture'
-    pulls = json.loads(source.run('gh', 'api', f'{api}/commits/{sha}/pulls'))
-    matched = [p for p in pulls if p.get('merged_at') and p.get('merge_commit_sha') == sha
-               and p['base']['ref'] == 'main']
-    source.require(len(matched) == 1, 'main SHA lacks an unambiguous merged PR')
-    pull = matched[0]
-    reviews = json.loads(source.run('gh', 'api', '--paginate', '--slurp', f"{api}/pulls/{pull['number']}/reviews"))
-    # Owner-approved policy: gwinpin reviews count even when agent-submitted.
-    # An agent approval is not an independent human review.
-    latest = {}
-    for page in reviews:
-        for review in page:
-            user = review['user']
-            if user['login'] == 'starPaw' or user.get('type') != 'User':
-                continue
-            if review['state'] in ('APPROVED', 'CHANGES_REQUESTED', 'DISMISSED'):
-                latest[user['login']] = review
-    accepted = [r for r in latest.values() if r['state'] == 'APPROVED'
-                and r['commit_id'] == pull['head']['sha']]
-    source.require(bool(accepted), 'eligible exact-head reviewer approval missing')
-    # A merge conflict fix must not silently change the accepted application tree.
-    source.run('git', 'fetch', 'origin', pull['head']['sha'], timeout=120)
-    source.require(not source.run('git', 'diff', '--name-only', pull['head']['sha'], sha),
-                   'merged tree differs from independently accepted head')
+    return policy.verify(sha, lambda route: json.loads(source.run('gh', 'api', route)))
 
 
 def main():
@@ -110,16 +91,9 @@ def main():
     source.run('git', 'fetch', 'origin', 'main', timeout=120)
     sha = source.run('git', 'rev-parse', 'HEAD')
     source.require(sha == source.run('git', 'rev-parse', 'origin/main'), 'checkout differs from canonical main')
-    # Require successful current-main CI and owner-designated exact-head review.
-    # Invoking this command is the owner's explicit operational authorization.
-    import json
-    runs = json.loads(source.run('gh', 'run', 'list', '--commit', sha, '--workflow', 'components.yml',
-        '--event', 'push', '--json', 'conclusion,headSha,status', '--limit', '1'))
-    source.require(len(runs) == 1 and runs[0]['status'] == 'completed'
-                   and runs[0]['conclusion'] == 'success' and runs[0]['headSha'] == sha,
-                   'current main Components CI has not succeeded')
+    # Shared eligibility policy is identical for local SSH and on-host operation.
     require_acceptance(sha)
-    blob = subprocess.run(['git', 'archive', '--format=tar', sha, 'ops/deploy_demo.py', 'ops/deploy_vps.py'],
+    blob = subprocess.run(['git', 'archive', '--format=tar', sha, 'ops/deploy_demo.py', 'ops/deploy_vps.py', 'ops/host_cli.py', 'ops/release_policy.py'],
                           check=True, capture_output=True).stdout
     # Git adds an ops/ directory; rebuild the small transfer as regular files only.
     output = io.BytesIO()

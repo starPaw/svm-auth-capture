@@ -40,6 +40,8 @@ def configure(root):
     host.NGINX_SERVICE = config['prefix']+'-nginx'
     host.GUARD = f'if (-f {host.MAINTENANCE}) {{ return 503; }}\n'
     source.SERVICES = (config['prefix']+'-facilitator', config['prefix']+'-resource')
+    host.LEGACY_SERVICES = tuple(source.SERVICES)
+    host.PRODUCT_SERVICES = (config['prefix']+'-product-facilitator', config['prefix']+'-product-restaurant')
     source.RELEASES = root/'releases'
     source.CURRENT = root/'current'
     source.MANIFESTS = root/'manifests'
@@ -118,6 +120,58 @@ ENABLED = os.environ.get('CAPTURE402_SYSTEMD_TEST') == '1'
 
 @unittest.skipUnless(ENABLED, 'explicit disposable Linux systemd test required')
 class BootBoundaryTests(unittest.TestCase):
+    def rename_transaction(self, fail_public=False, interrupt=False):
+        previous = {**self.snapshot['previous'], 'services': list(host.LEGACY_SERVICES)}
+        def ready(layout, public=True, **kwargs):
+            if fail_public and public and layout.get('services') == list(host.PRODUCT_SERVICES):
+                raise RuntimeError('injected product public readiness failure')
+            wait_for(lambda: request(self.cfg['publicPort'] if public else self.cfg['backendPort']) == 200)
+        real_write = host.atomic_bytes
+        def write(path, data, mode=0o644):
+            real_write(path, data, mode)
+            if interrupt and path == host.UNITS / (host.PRODUCT_SERVICES[0] + '.service'):
+                raise KeyboardInterrupt()
+        with (mock.patch.object(host, 'active_layout', return_value=previous),
+              mock.patch.object(host, 'ready', side_effect=ready),
+              mock.patch.object(source, 'manually_fetch_archive', return_value=b'fixture'),
+              mock.patch.object(source, 'verify_source_against_main'),
+              mock.patch.object(source, 'prepare_release'),
+              mock.patch.object(source, 'archive_fingerprints', return_value={}),
+              mock.patch.object(host, 'backup', return_value=None), mock.patch.object(host, 'provision_merchant', return_value=False),
+              mock.patch.object(host, 'atomic_bytes', side_effect=write)):
+            if interrupt:
+                with self.assertRaises(KeyboardInterrupt): host.deploy('b' * 40)
+            elif fail_public:
+                with self.assertRaisesRegex(RuntimeError, 'verified rollback'): host.deploy('b' * 40)
+            else:
+                host.deploy('b' * 40)
+        self.assertEqual(host.inventory([host.STATE, host.PRIVATE]), self.original_state)
+
+    def test_product_names_replace_actual_units_without_duplicate_backend(self):
+        self.rename_transaction()
+        for name in host.PRODUCT_SERVICES:
+            self.assertEqual(NATIVE_RUN('systemctl', 'show', '-p', 'ActiveState', '--value', name), 'active')
+        for name in host.LEGACY_SERVICES:
+            self.assertEqual(NATIVE_RUN('systemctl', 'show', '-p', 'MainPID', '--value', name), '0')
+        self.assertEqual(request(self.cfg['publicPort']), 200)
+
+    def test_product_startup_failure_restores_actual_legacy_units(self):
+        self.rename_transaction(fail_public=True)
+        for name in host.LEGACY_SERVICES:
+            self.assertEqual(NATIVE_RUN('systemctl', 'show', '-p', 'ActiveState', '--value', name), 'active')
+        for name in host.PRODUCT_SERVICES:
+            self.assertFalse((host.UNITS / (name + '.service')).exists())
+        self.assertEqual(request(self.cfg['publicPort']), 200)
+
+    def test_partial_product_installation_boots_closed_then_recovers_legacy(self):
+        self.rename_transaction(interrupt=True)
+        self.snapshot = json.loads(host.PENDING.read_text())
+        source.SERVICES = host.LEGACY_SERVICES
+        source.run('systemctl', 'stop', host.GATE.name)
+        (self.root / 'events.log').write_text('')
+        self.boot()
+        self.recover()
+
     def test_sealed_release_starts_as_nonroot_under_private_umask(self):
         release = source.RELEASES / ('b' * 40)
         previous_umask = os.umask(0o077)
@@ -189,7 +243,7 @@ http {{ access_log off; server {{ listen 127.0.0.1:{cfg['publicPort']}; include 
             if path in (host.GATE, host.RECOVERY):
                 action = 'gate' if path == host.GATE else 'recovery'
                 argument = '--gate' if action == 'gate' else '--recover'
-                data = data.replace(f'/usr/bin/python3 {Path(host.__file__).resolve()} {argument}'.encode(),
+                data = data.replace(f'/usr/bin/python3 -B {Path(host.__file__).resolve()} {argument}'.encode(),
                                     f'{sys.executable} -B {self.script} --unit {self.root} {action}'.encode())
             real_write(path, data, mode)
         patch = mock.patch.object(host, 'atomic_bytes', side_effect=fixture_entrypoint)
@@ -207,7 +261,7 @@ http {{ access_log off; server {{ listen 127.0.0.1:{cfg['publicPort']}; include 
     def cleanup(self):
         try:
             if hasattr(self,'cfg'):
-                names=[host.RECOVERY.name,host.GATE.name,*[s+'.service' for s in (*source.SERVICES,host.NGINX_SERVICE)]]
+                names=[host.RECOVERY.name,host.GATE.name,*[s+'.service' for s in (*host.LEGACY_SERVICES,*host.PRODUCT_SERVICES,host.NGINX_SERVICE)]]
                 result = getattr(self._outcome, 'result', None)
                 if result and any(case is self for case, _ in result.failures + result.errors):
                     journal = subprocess.run(['journalctl','--no-pager','-n','120',*[a for name in names for a in ('-u',name)]],capture_output=True,text=True,timeout=10)
