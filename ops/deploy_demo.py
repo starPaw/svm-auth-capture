@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Root-owned, manually provisioned Capture402 Devnet release activator.
 
-Called ONLY through the forced-command SSH key and a narrowly scoped sudo rule.
-stdin: a gzip-compressed git archive of the exact, CI-approved main commit.
-No Solana program upgrade, secret mutation, journal modification or payment submission.
+Called ONLY by the authorized VPS operator after inspecting successful exact-SHA
+GitHub CI. Builds the release archive directly from privately authenticated,
+read-only GitHub main; independently re-fetches and verifies each archived file.
+No Actions deploy secrets, network SSH deploy entrypoint, Solana program upgrade,
+secret mutation, journal modification or payment submission.
 """
 from __future__ import annotations
 
@@ -329,39 +331,66 @@ def source_ssh_command(user: pwd.struct_passwd, *, hosts_owner_uid: int = 0) -> 
     )
 
 
-def verify_source_against_main(sha: str, blob: bytes) -> None:
-    """Verify a private GitHub main checkout independently of the upload.
+def clone_main(sha: str, root: Path, user: pwd.struct_passwd) -> Path:
+    """Resolve only the current private main, with an isolated SSH identity."""
+    require(bool(SHA_RE.fullmatch(sha)), "invalid canonical main SHA")
+    ssh_command = source_ssh_command(user)
+    repo = root / "repository"
+    run("runuser", "-u", "capture402-deploy", "--", "/usr/bin/env", "-i",
+        f"HOME={user.pw_dir}", "PATH=/usr/bin:/bin", "GIT_TERMINAL_PROMPT=0",
+        "/usr/bin/git", "-c", "credential.helper=",
+        "-c", f"core.sshCommand={ssh_command}", "clone", "--depth=1",
+        "--single-branch", "--branch=main", "--no-checkout",
+        SOURCE_REMOTE, str(repo), timeout=180)
+    live = run("runuser", "-u", "capture402-deploy", "--",
+               "git", "rev-parse", "HEAD", cwd=repo)
+    require(live == sha, "remote canonical main does not match approved SHA")
+    return repo
 
-    Clone as the unprivileged deploy user using a VPS-only, repository-scoped
-    read-only GitHub key. Root-owned known_hosts prevents key substitution by
-    the deploy account. Require exact current main SHA and byte-exact archive
-    parity before activating any release.
+
+def git_archive(repo: Path, sha: str) -> bytes:
+    """An archive of the exact commit, excluding workflow code and any secrets."""
+    return subprocess.run(
+        ["runuser", "-u", "capture402-deploy", "--", "git", "archive",
+         "--format=tar", sha, "integration", RECORD],
+        cwd=repo, capture_output=True, check=True, timeout=90,
+    ).stdout
+
+
+def manually_fetch_archive(sha: str) -> bytes:
+    """Run on VPS only after independent human approval of the exact green SHA."""
+    require(os.geteuid() == 0, "manual release requires authorized local sudo")
+    require(bool(SHA_RE.fullmatch(sha)), "exact lowercase main SHA required")
+    require(RELEASES.is_dir(), "release directory not provisioned")
+    user = pwd.getpwnam("capture402-deploy")
+    with tempfile.TemporaryDirectory(prefix=".manual-", dir=RELEASES) as path:
+        temp = Path(path)
+        os.chown(temp, user.pw_uid, user.pw_gid)
+        repo = clone_main(sha, temp, user)
+        tar = git_archive(repo, sha)
+        require(0 < len(tar) <= MAX_TAR_STREAM, "source tar over limit")
+        # git archive must contain supported regular files/directories only.
+        archive_fingerprints(tar, "r:")
+        blob = gzip.compress(tar, compresslevel=9, mtime=0)
+        require(0 < len(blob) <= MAX_ARCHIVE, "compressed source archive over limit")
+        return blob
+
+
+def verify_source_against_main(sha: str, blob: bytes) -> None:
+    """An independently fetched Git tree must match the locally staged archive.
+
+    Even in manual deployment, a compromised checkout or substituted artifact
+    cannot bypass current main-SHA and byte-exact content verification.
     """
     user = pwd.getpwnam("capture402-deploy")
-    ssh_command = source_ssh_command(user)
-    temp = Path(tempfile.mkdtemp(prefix=".verify-", dir=RELEASES))
-    try:
+    with tempfile.TemporaryDirectory(prefix=".verify-", dir=RELEASES) as path:
+        temp = Path(path)
         os.chown(temp, user.pw_uid, user.pw_gid)
-        repo = temp / "repository"
-        run("runuser", "-u", "capture402-deploy", "--", "/usr/bin/env", "-i",
-            f"HOME={user.pw_dir}", "PATH=/usr/bin:/bin", "GIT_TERMINAL_PROMPT=0",
-            "/usr/bin/git", "-c", "credential.helper=",
-            "-c", f"core.sshCommand={ssh_command}", "clone", "--depth=1",
-            "--single-branch", "--branch=main", "--no-checkout",
-            SOURCE_REMOTE, str(repo), timeout=180)
-        live = run("runuser", "-u", "capture402-deploy", "--",
-                   "git", "rev-parse", "HEAD", cwd=repo)
-        require(live == sha, "remote canonical main does not match approved SHA")
-        archived = subprocess.run(
-            ["runuser", "-u", "capture402-deploy", "--", "git", "archive",
-             "--format=tar", sha, "integration", RECORD],
-            cwd=repo, capture_output=True, check=True, timeout=90,
-        ).stdout
+        repo = clone_main(sha, temp, user)
+        archived = git_archive(repo, sha)
         require(archive_fingerprints(blob, "r:gz")
                 == archive_fingerprints(archived, "r:"),
                 "received artifact differs from exact GitHub main tree")
-    finally:
-        shutil.rmtree(temp)
 
 
 def chown_tree(root: Path, uid: int, gid: int) -> None:
@@ -401,7 +430,7 @@ def prepare_release(sha: str, digest: str, blob: bytes) -> None:
             shutil.rmtree(stage)
 
 
-def deploy(sha: str, digest: str) -> None:
+def deploy(sha: str, digest: str, blob: bytes) -> None:
     require(os.geteuid() == 0, "root-owned helper must be invoked via restricted sudo")
     require(bool(SHA_RE.fullmatch(sha)) and bool(HASH_RE.fullmatch(digest)),
             "expected exact 40-hex Git SHA and 64-hex SHA-256")
@@ -413,8 +442,7 @@ def deploy(sha: str, digest: str) -> None:
         check_unit_layout()
         recover_pending()
         previous = current_sha()
-        blob = sys.stdin.buffer.read(MAX_ARCHIVE + 1)
-        require(len(blob) <= MAX_ARCHIVE and len(blob) > 0, "archive empty or over limit")
+        require(0 < len(blob) <= MAX_ARCHIVE, "archive empty or over limit")
         require(hashlib.sha256(blob).hexdigest() == digest, "release archive SHA-256 mismatch")
 
         verify_source_against_main(sha, blob)
@@ -454,10 +482,12 @@ def deploy(sha: str, digest: str) -> None:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        raise SystemExit("usage: deploy_demo.py <40-hex-main-sha> <64-hex-archive-sha256>")
+    if len(sys.argv) != 3 or sys.argv[1] != "--manual":
+        raise SystemExit("usage: capture402-deploy --manual <40-hex-current-main-sha>")
     try:
-        deploy(sys.argv[1], sys.argv[2])
+        sha = sys.argv[2]
+        blob = manually_fetch_archive(sha)
+        deploy(sha, hashlib.sha256(blob).hexdigest(), blob)
     except Exception as error:
         print(f"DEPLOY_BLOCKED: {error}", file=sys.stderr, flush=True)
         raise SystemExit(1) from error
