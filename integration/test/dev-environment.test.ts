@@ -3,6 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, expect } from "vitest";
 import { prepareKeys, reserveOperation } from "../operators/dev-environment.ts";
+import { validateSmokeView } from "../operators/dev-smoke.ts";
+import type { Address } from "@solana/kit";
 
 test("dev identities are distinct, private and never overwritten on a second preparation", () => {
   const directory = mkdtempSync(join(tmpdir(), "capture402-dev-keys-"));
@@ -26,4 +28,16 @@ test.each(["funding", "asset-preparation"])("an unresolved %s reservation blocks
 
 test("dev preparation refuses arbitrary journal operation names", () => {
   expect(() => reserveOperation(tmpdir(), "../../live", {})).toThrow(/unknown/);
+});
+
+test("dev smoke requires both original finalized signatures and exact released budget", () => {
+  const view = { status: "closed", payment: "unused-public-address" as Address, authorized: 100, captured: 0, refunded: 0, released: 100, remaining: 0,
+    events: ["authorize", "void"].map(action => ({ action, status: "finalized", signature: `original-${action}`, chainStatus: { commitment: "finalized", err: null } })) };
+  expect(() => validateSmokeView(view)).not.toThrow();
+  expect(() => validateSmokeView({ ...view, remaining: 1 })).toThrow();
+  expect(() => validateSmokeView({ ...view, events: view.events.slice(0, 1) })).toThrow();
+  for (const commitment of ["confirmed", "unknown", undefined]) {
+    expect(() => validateSmokeView({ ...view, events: [{ ...view.events[0]!, chainStatus: { commitment, err: null } }, view.events[1]!] })).toThrow();
+  }
+  expect(() => validateSmokeView({ ...view, events: [{ ...view.events[0]!, chainStatus: { commitment: "finalized", err: "failed" } }, view.events[1]!] })).toThrow();
 });
