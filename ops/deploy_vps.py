@@ -28,6 +28,7 @@ BACKUPS = BASE / 'backups'
 RECOVERY = UNITS / 'capture402-recovery.service'
 GATE = UNITS / 'capture402-gate.service'
 OVERRIDE = 'zz-capture402-release.conf'
+NGINX_SERVICE = 'nginx'
 GUARD = 'if (-f /opt/capture402/maintenance) { return 503; }\n'
 
 
@@ -63,7 +64,7 @@ def atomic_bytes(path, data, mode=0o644):
 
 
 def control_paths():
-    return [SNIPPET] + [UNITS / (s + '.service.d') / OVERRIDE for s in (*source.SERVICES, 'nginx')]
+    return [SNIPPET] + [UNITS / (s + '.service.d') / OVERRIDE for s in (*source.SERVICES, NGINX_SERVICE)]
 
 
 def capture_controls():
@@ -79,10 +80,12 @@ def restore_controls(snapshot):
     source.require(set(snapshot) == {str(p) for p in control_paths()}, 'invalid rollback control paths')
     for name, value in snapshot.items():
         p = Path(name)
-        if value is None:
-            durable_remove(p)
-        else:
-            atomic_bytes(p, base64.b64decode(value['bytes'], validate=True), value['mode'])
+        data = b'' if value is None else base64.b64decode(value['bytes'], validate=True)
+        mode = 0o644 if value is None else value['mode']
+        # Never publish an unguarded intermediate file, even when the legacy
+        # snapshot predates migration. A reboot may happen after ANY replace.
+        data = guarded(data) if p == SNIPPET else gate_dependency(data)
+        atomic_bytes(p, data, mode)
 
 
 def active_layout():
@@ -233,8 +236,8 @@ def backup(transaction):
     if source.CURRENT.is_symlink():
         source.release_name(source.CURRENT)
         roots.append(source.CURRENT.resolve(strict=True))
-    roots += [UNITS / (s + '.service') for s in (*source.SERVICES, 'nginx')]
-    roots += [UNITS / (s + '.service.d') for s in (*source.SERVICES, 'nginx')]
+    roots += [UNITS / (s + '.service') for s in (*source.SERVICES, NGINX_SERVICE)]
+    roots += [UNITS / (s + '.service.d') for s in (*source.SERVICES, NGINX_SERVICE)]
     expected = inventory(roots)
     archive = directory / 'preserved.tar'
     create_backup(archive, expected)
@@ -250,7 +253,7 @@ def backup(transaction):
 def reload_config():
     source.run('systemctl', 'daemon-reload')
     source.run('nginx', '-t')
-    source.run('systemctl', 'reload', 'nginx')
+    source.run('systemctl', 'reload', NGINX_SERVICE)
 
 
 def maintenance():
@@ -296,18 +299,37 @@ def provision_merchant():
     return True
 
 
-GATE_DEPENDENCY = '[Unit]\nRequires=capture402-gate.service\nAfter=capture402-gate.service\n'
+def guarded(data):
+    return data if data.startswith(GUARD.encode()) else GUARD.encode() + data
+
+
+def gate_dependency(data=b''):
+    name = GATE.name
+    prefix = f'[Unit]\nRequires={name}\nAfter={name}\n'.encode()
+    return data if f'Requires={name}'.encode() in data else prefix + data
+
+
+def prepare_boot_boundary():
+    # This is safety preflight, before transaction.json or service shutdown.
+    # No source/environment switch and no requests are blocked without marker.
+    atomic_bytes(SNIPPET, guarded(SNIPPET.read_bytes()))
+    source.run('nginx', '-t')
+    for path in control_paths()[1:]:
+        source.require(not path.is_symlink(), 'managed dependency override is symlink')
+        data = path.read_bytes() if path.exists() else b''
+        atomic_bytes(path, gate_dependency(data))
+
 
 
 def install_controls(sha, merchant_file=False):
     fragment = (source.RELEASES / sha / 'integration/deploy/nginx-resource.conf').read_bytes()
     source.require(b'location = /api/orders {' in fragment, 'candidate lacks POST order route')
-    atomic_bytes(SNIPPET, GUARD.encode() + fragment)
+    atomic_bytes(SNIPPET, guarded(fragment))
     for p in control_paths()[1:]:
-        content = GATE_DEPENDENCY
-        if p.parent.name != 'nginx.service.d':
+        content = gate_dependency().decode()
+        if p.parent.name != NGINX_SERVICE + '.service.d':
             content += f'[Service]\nWorkingDirectory={source.CURRENT}/integration\n'
-            if merchant_file and p.parent.name == 'sac006-resource.service.d':
+            if merchant_file and p.parent.name == source.SERVICES[1] + '.service.d':
                 content += f'EnvironmentFile={PRIVATE}/merchant.env\n'
         atomic_bytes(p, content.encode())
     source.switch_to(sha)
@@ -323,7 +345,7 @@ def install_recovery():
     controller = Path(__file__).resolve()
     atomic_bytes(GATE, f'''[Unit]
 Description=Close Capture402 ingress before booting an interrupted release
-Before=nginx.service sac006-facilitator.service sac006-resource.service
+Before={NGINX_SERVICE}.service {' '.join(s + '.service' for s in source.SERVICES)}
 [Service]
 Type=oneshot
 RemainAfterExit=yes
@@ -334,7 +356,7 @@ WantedBy=multi-user.target
 '''.encode())
     atomic_bytes(RECOVERY, f'''[Unit]
 Description=Recover interrupted Capture402 release without replaying payments
-After=network-online.target nginx.service sac006-facilitator.service sac006-resource.service
+After=network-online.target {NGINX_SERVICE}.service {' '.join(s + '.service' for s in source.SERVICES)}
 Wants=network-online.target
 [Service]
 Type=oneshot
@@ -344,9 +366,15 @@ UMask=0077
 [Install]
 WantedBy=multi-user.target
 '''.encode())
+    prepare_boot_boundary()
     source.run('systemctl', 'daemon-reload')
-    source.run('systemctl', 'enable', 'capture402-gate.service', 'capture402-recovery.service')
-    source.run('systemctl', 'start', 'capture402-gate.service')
+    for service in (*source.SERVICES, NGINX_SERVICE):
+        requires = source.run('systemctl', 'show', '-p', 'Requires', '--value', service).split()
+        source.require(GATE.name in requires, 'boot gate dependency is not effective')
+    source.run('systemctl', 'enable', GATE.name, RECOVERY.name)
+    source.run('systemctl', 'start', GATE.name)
+    # Activate the legacy guard before persisting a deployment transaction.
+    source.run('systemctl', 'reload', NGINX_SERVICE)
 
 
 def stop():
@@ -377,15 +405,7 @@ def rollback(pending):
         source.require(archive.parent.parent == BACKUPS and archive.name == 'preserved.tar', 'invalid backup path')
         source.require(digest_file(archive) == pending['backup']['sha256'], 'verified backup changed')
     restore_controls(pending['controls'])
-    # Keep a maintenance guard on the legacy layout too: rollback failure must
-    # never expose a partially started old resource process. TLS site is untouched.
-    fragment = SNIPPET.read_bytes()
-    if not fragment.startswith(GUARD.encode()):
-        atomic_bytes(SNIPPET, GUARD.encode() + fragment)
-    for path in control_paths()[1:]:
-        original = path.read_bytes() if path.exists() else b''
-        if b'Requires=capture402-gate.service' not in original:
-            atomic_bytes(path, GATE_DEPENDENCY.encode() + original)
+    # restore_controls() atomically retains the guard/dependencies on every file.
     previous_link = pending['current']
     if previous_link is None:
         durable_remove(source.CURRENT)
@@ -456,11 +476,12 @@ def deploy(sha):
         install_recovery()
         pending = {'previous': previous, 'target': sha, 'controls': capture_controls(),
                    'current': source.current_sha() if source.CURRENT.is_symlink() else None}
-        # Persist recovery information BEFORE stopping anything or changing ingress.
+        # Boot enforcement is already durable and effective. Persist recovery
+        # information before stopping services or switching the runtime.
         source.write_json(PENDING, pending)
         try:
             maintenance()
-            # Legacy snippet has no maintenance guard. Backend shutdown quiesces writes.
+            # Prepared legacy guard also blocks requests on reboot during backup.
             stop()
             pending['backup'] = backup(sha + '-' + str(time.time_ns()))
             source.write_json(PENDING, pending)
@@ -495,7 +516,11 @@ def deploy(sha):
 
 def main(argv):
     if argv == ['--gate']:
-        if PENDING.exists() or source.PENDING.exists(): maintenance()
+        if PENDING.exists() or source.PENDING.exists():
+            maintenance()
+            # Defend retained pending records from the previous helper as well.
+            atomic_bytes(SNIPPET, guarded(SNIPPET.read_bytes()))
+            source.run('nginx', '-t')
     elif argv == ['--recover']:
         with locked(recovery_only=True): pass
     elif len(argv) == 1:

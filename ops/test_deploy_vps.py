@@ -61,6 +61,7 @@ class TransactionTests(unittest.TestCase):
             self.calls.append(args)
             if 'ActiveState' in args: return 'inactive'
             if 'MainPID' in args: return '0'
+            if 'Requires' in args: return host.GATE.name
             return ''
         patch = mock.patch.object(source, 'run', side_effect=run)
         self.run_mock = patch.start(); self.addCleanup(patch.stop)
@@ -181,6 +182,7 @@ class TransactionTests(unittest.TestCase):
         source.write_json(host.PENDING, self.pending())
         host.main(['--gate'])
         self.assertTrue(host.MAINTENANCE.exists())
+        self.assertTrue(host.SNIPPET.read_bytes().startswith(host.GUARD.encode()))
         self.manually_fetch_archive_mock.assert_not_called()
 
     def test_recovery_units_have_valid_ordering_and_no_cycle(self):
