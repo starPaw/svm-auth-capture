@@ -202,9 +202,24 @@ class PrivateSourceTests(unittest.TestCase):
         self.assertEqual(commands[0][:6], ("runuser", "-u", "capture402-deploy",
                                           "--", "/usr/bin/env", "-i"))
         self.assertIn("GIT_TERMINAL_PROMPT=0", commands[0])
+        for cmd in commands:
+            self.assertIn("GIT_CONFIG_NOSYSTEM=1", cmd)
+            self.assertIn("GIT_CONFIG_GLOBAL=/dev/null", cmd)
+            self.assertIn("/usr/bin/env", cmd)
         self.assertIn("core.sshCommand=ssh pinned", commands[0])
         self.assertIn(cd.SOURCE_REMOTE, commands[0])
         self.assertNotIn("https://github.com/starPaw/svm-auth-capture.git", commands[0])
+
+    def test_archive_source_isolated_from_global_git_config(self):
+        with (mock.patch.object(cd.pwd, "getpwnam", return_value=self.user),
+              mock.patch.object(cd.subprocess, "run",
+                                return_value=types.SimpleNamespace(stdout=b"")) as run):
+            cd.git_archive(Path(self.tmp.name), NEW)
+        args = run.call_args.args[0]
+        self.assertIn("GIT_CONFIG_NOSYSTEM=1", args)
+        self.assertIn("GIT_CONFIG_GLOBAL=/dev/null", args)
+        self.assertIn("/usr/bin/env", args)
+        self.assertIn("archive", args)
 
     def test_mutated_source_archive_is_rejected(self):
         with (mock.patch.object(cd.pwd, "getpwnam", return_value=self.user),
