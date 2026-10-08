@@ -364,5 +364,40 @@ class SwitchingTests(unittest.TestCase):
         self.assertTrue(cd.PENDING.exists())
 
 
+
+class FreePlanReleaseGateTests(unittest.TestCase):
+    """Manual GitHub Free private release cannot silently pretend environment approval."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.workflow = (
+            Path(__file__).resolve().parents[1] /
+            ".github/workflows/deploy-demo.yml"
+        ).read_text(encoding="utf-8")
+
+    def test_only_manual_dispatch_and_no_unavailable_environment(self):
+        self.assertIn("  workflow_dispatch:", self.workflow)
+        self.assertNotIn("    environment: devnet-demo", self.workflow)
+        self.assertNotIn("  push:", self.workflow)
+
+    def test_initial_and_rerun_actor_must_be_owner(self):
+        self.assertIn("github.actor == 'starPaw'", self.workflow)
+        self.assertIn("github.triggering_actor == 'starPaw'", self.workflow)
+        self.assertIn("github.ref == 'refs/heads/main'", self.workflow)
+
+    def test_release_must_equal_dispatched_workflow_revision(self):
+        self.assertIn('[ "$GITHUB_SHA" == "$RELEASE_SHA" ]', self.workflow.replace("[[", "[").replace("]]", "]"))
+        self.assertIn('[[ "$current" == "$RELEASE_SHA" ]]', self.workflow)
+        self.assertIn('.event == "push"', self.workflow)
+        self.assertIn('SBF build and component checks', self.workflow)
+        self.assertIn('x402 integration, typecheck and wallet build', self.workflow)
+
+    def test_restricted_ssh_deploy_still_enabled(self):
+        self.assertIn('StrictHostKeyChecking=yes', self.workflow)
+        self.assertIn('IdentitiesOnly=yes', self.workflow)
+        self.assertIn('"capture402-deploy@$DEPLOY_HOST"', self.workflow)
+        self.assertIn("secrets.CAPTURE402_DEPLOY_SSH_KEY", self.workflow)
+
+
 if __name__ == "__main__":
     unittest.main()
