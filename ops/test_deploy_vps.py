@@ -1,8 +1,6 @@
 """Adversarial tests for the first migration and subsequent release transactions."""
-import base64
-import hashlib
 import json
-import os
+import shutil
 from pathlib import Path
 import subprocess
 import tarfile
@@ -13,6 +11,8 @@ from unittest import mock
 import deploy_demo as source
 import deploy_vps as host
 import launch_deploy as launcher
+
+INSTALL_RECOVERY = host.install_recovery
 
 OLD = 'a' * 40
 NEW = 'b' * 40
@@ -29,7 +29,7 @@ class TransactionTests(unittest.TestCase):
                     'PRIVATE': root/'private', 'SNIPPET': root/'nginx/snippet',
                     'UNITS': root/'units', 'PENDING': root/'transaction.json',
                     'MAINTENANCE': root/'maintenance', 'BACKUPS': root/'backups',
-                    'RECOVERY': root/'units/recovery.service', 'GATE': root/'units/gate.service'}),
+                    'RECOVERY': root/'units/capture402-recovery.service', 'GATE': root/'units/capture402-gate.service'}),
             (source, {'BASE': root, 'RELEASES': root/'releases', 'CURRENT': root/'current',
                       'MANIFESTS': root/'manifests', 'PENDING': root/'old-pending.json'})):
             for name, value in values.items():
@@ -177,6 +177,35 @@ class TransactionTests(unittest.TestCase):
         self.assertTrue(host.MAINTENANCE.exists())
         self.manually_fetch_archive_mock.assert_not_called()
 
+    def test_recovery_units_have_valid_ordering_and_no_cycle(self):
+        self.install_recovery_mock.side_effect = None
+        # Exercise the real file writer; isolate all systemd commands.
+        # Access the original function captured before setUp replaces it.
+        INSTALL_RECOVERY()
+        gate = host.GATE.read_text(); recovery = host.RECOVERY.read_text()
+        self.assertIn('Before=nginx.service sac006-facilitator.service sac006-resource.service', gate)
+        self.assertIn('--gate', gate)
+        self.assertIn('After=network-online.target nginx.service sac006-facilitator.service sac006-resource.service', recovery)
+        self.assertIn('--recover', recovery)
+        if shutil.which('systemd-analyze'):
+            for name in (*source.SERVICES, 'nginx'):
+                (host.UNITS/(name+'.service')).write_text('[Unit]\nRequires=capture402-gate.service\nAfter=capture402-gate.service\n[Service]\nExecStart=/usr/bin/sleep 1\n')
+            subprocess.run(['systemd-analyze', 'verify', str(host.GATE), str(host.RECOVERY),
+                *[str(host.UNITS/(name+'.service')) for name in (*source.SERVICES, 'nginx')]],
+                check=True, capture_output=True, text=True)
+
+
+    def test_correct_cwd_cannot_hide_an_unapproved_absolute_entrypoint(self):
+        original_readlink = host.os.readlink
+        def readlink(path, *args, **kwargs):
+            return str(host.LEGACY/'integration') if str(path).startswith('/proc/') else original_readlink(path, *args, **kwargs)
+        with (mock.patch.object(source, 'run', side_effect=['active', '123']),
+              mock.patch.object(host.os, 'readlink', side_effect=readlink),
+              mock.patch.object(Path, 'read_bytes', return_value=b'node\0--experimental-strip-types\0/other/runtime.ts\0')):
+            with self.assertRaisesRegex(RuntimeError, 'entrypoint differs'):
+                host.health(self.previous)
+
+
 
 class BackupTests(unittest.TestCase):
     def test_backup_round_trip_preserves_busy_symlinks_metadata_and_original_wires(self):
@@ -227,6 +256,30 @@ class AcceptanceTests(unittest.TestCase):
         review = {'user':{'login':'independent','type':'User'}, 'state':'APPROVED','commit_id':OLD}
         with mock.patch.object(source, 'run', side_effect=[json.dumps([pull]), json.dumps([[review]]), '', 'conflict-change']):
             with self.assertRaisesRegex(RuntimeError, 'merged tree differs'): launcher.require_acceptance(NEW)
+
+
+class LauncherRecoveryTests(unittest.TestCase):
+    def test_offline_recovery_runs_before_any_github_fetch(self):
+        calls = []
+        def run(*args, **kwargs):
+            calls.append(args)
+            if args == ('git', 'remote', 'get-url', 'origin'):
+                return 'https://github.com/starPaw/svm-auth-capture.git'
+            if args == ('git', 'status', '--porcelain'): return ''
+            raise RuntimeError('network unavailable')
+        with (mock.patch.object(source, 'run', side_effect=run),
+              mock.patch.object(launcher.sys, 'argv', ['deploy.sh']),
+              mock.patch.object(launcher.subprocess, 'run', return_value=type('Result', (), {'stdout':'RECOVERED'})()) as remote):
+            with self.assertRaisesRegex(RuntimeError, 'recovered offline'): launcher.main()
+        self.assertEqual(len(calls), 2)
+        self.assertIn('capture402-recovery.service', remote.call_args.args[0][-1])
+
+    def test_disconnect_does_not_request_pipe_or_remote_payment_execution(self):
+        self.assertNotIn('--pipe', launcher.INSTALLER)
+        self.assertIn('RuntimeMaxSec=900', launcher.INSTALLER)
+        self.assertIn('OnFailure=capture402-recovery.service', launcher.INSTALLER)
+        self.assertNotIn('SOLANA_RPC_URL', launcher.INSTALLER)
+
 
 
 if __name__ == '__main__': unittest.main()

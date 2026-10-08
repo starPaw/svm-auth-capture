@@ -11,7 +11,7 @@ import deploy_demo as source
 # This constant program only installs the explicitly selected controller files.
 # SSH disconnect does not stop the systemd-owned deployment transaction.
 INSTALLER = r'''
-import io, os, pathlib, subprocess, sys, tarfile
+import io, os, pathlib, subprocess, sys, tarfile, tempfile
 sha = sys.argv[1]
 assert len(sha) == 40 and all(c in '0123456789abcdef' for c in sha)
 root = pathlib.Path('/opt/capture402/controllers') / sha
@@ -29,9 +29,14 @@ with tarfile.open(fileobj=io.BytesIO(data), mode='r:') as archive:
         if target.exists():
             assert target.read_bytes() == payload, 'existing controller changed'
         else:
-            fd = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            fd, temporary = tempfile.mkstemp(prefix='.controller-', dir=root)
+            os.fchmod(fd, 0o644)
             with os.fdopen(fd, 'wb') as out:
                 out.write(payload); out.flush(); os.fsync(out.fileno())
+            os.replace(temporary, target)
+            directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try: os.fsync(directory)
+            finally: os.close(directory)
 unit = 'capture402-release-' + sha[:12] + '-' + str(os.getpid())
 print('Deployment job: ' + unit, flush=True)
 result = subprocess.run(['systemd-run', '--unit=' + unit, '--wait',
@@ -41,6 +46,31 @@ result = subprocess.run(['systemd-run', '--unit=' + unit, '--wait',
 subprocess.run(['journalctl', '--no-pager', '-u', unit])
 sys.exit(result.returncode)
 '''
+
+
+# Use the already installed, approved recovery unit before any GitHub access.
+RECOVER = r"""
+from pathlib import Path
+import subprocess
+pending = any(Path(p).exists() for p in ('/opt/capture402/transaction.json', '/opt/capture402/pending.json'))
+if pending:
+    assert Path('/etc/systemd/system/capture402-recovery.service').is_file(), 'pending deployment lacks approved recovery unit'
+    subprocess.run(['systemctl', 'start', 'capture402-recovery.service'], check=True)
+    assert not any(Path(p).exists() for p in ('/opt/capture402/transaction.json', '/opt/capture402/pending.json')), 'rollback remains unverified'
+    print('RECOVERED')
+else:
+    print('NO_PENDING')
+"""
+SSH = ['ssh', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes',
+       '-o', 'ForwardAgent=no', '-o', 'ConnectTimeout=10', 'ubuntu@89.168.83.156']
+
+
+def recover_first():
+    result = subprocess.run([*SSH, 'sudo -n python3 -c ' + shlex.quote(RECOVER)],
+                            check=True, capture_output=True, text=True, timeout=330)
+    if result.stdout.strip() == 'RECOVERED':
+        raise RuntimeError('interrupted deployment recovered offline; invoke ./deploy.sh again')
+    source.require(result.stdout.strip() == 'NO_PENDING', 'unexpected recovery result')
 
 
 def require_acceptance(sha):
@@ -74,6 +104,7 @@ def main():
         raise RuntimeError('usage: ./deploy.sh (deploys the clean, exact current main checkout)')
     source.require(source.run('git', 'remote', 'get-url', 'origin') == 'https://github.com/starPaw/svm-auth-capture.git', 'wrong repository')
     source.require(not source.run('git', 'status', '--porcelain'), 'deployment requires clean checkout')
+    recover_first()
     source.run('git', 'fetch', 'origin', 'main', timeout=120)
     sha = source.run('git', 'rev-parse', 'HEAD')
     source.require(sha == source.run('git', 'rev-parse', 'origin/main'), 'checkout differs from canonical main')
@@ -94,8 +125,7 @@ def main():
         for member in archive:
             if member.isfile(): packed.addfile(member, archive.extractfile(member))
     command = 'sudo -n python3 -c ' + shlex.quote(INSTALLER) + ' ' + sha
-    subprocess.run(['ssh', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes',
-                    '-o', 'ConnectTimeout=10', 'ubuntu@89.168.83.156', command],
+    subprocess.run([*SSH, command],
                    input=output.getvalue(), check=True)
 
 

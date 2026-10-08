@@ -101,12 +101,16 @@ def active_layout():
 
 def health(layout, public=True, orders=True):
     root = Path(layout['root']).resolve(strict=True)
-    for service in source.SERVICES:
+    for service, entry in zip(source.SERVICES, ('devnet-server.ts', 'restaurant-server.ts')):
         source.require(source.run('systemctl', 'is-active', service) == 'active', 'service inactive')
         pid = source.run('systemctl', 'show', '-p', 'MainPID', '--value', service)
         source.require(pid.isdecimal() and int(pid) > 0, 'missing process PID')
         source.require(Path(os.readlink(f'/proc/{pid}/cwd')).resolve() == root / 'integration',
                        'actual process source differs from expected SHA')
+        argv = Path(f'/proc/{pid}/cmdline').read_bytes().rstrip(b'\0').split(b'\0')
+        source.require(len(argv) == 3 and Path(os.fsdecode(argv[0])).name == 'node'
+                       and argv[1:] == [b'--experimental-strip-types', ('src/' + entry).encode()],
+                       'actual process entrypoint differs from reviewed source')
     record = json.loads((root / source.RECORD).read_text())
     for prefix in (['http://127.0.0.1:8788', 'https://capture402.xyz'] if public else ['http://127.0.0.1:8788']):
         status, body, _ = source.response(prefix + '/api/config')
@@ -297,10 +301,17 @@ def stop():
 
 def fail_closed():
     maintenance()
-    source.run('systemctl', 'stop', *source.SERVICES, timeout=45)
+    try:
+        source.run('systemctl', 'stop', *source.SERVICES, timeout=45)
+    except Exception as error:
+        raise RuntimeError('ROLLBACK_UNVERIFIED; backend shutdown also unverified') from error
 
 
 def rollback(pending):
+    old = pending['previous']
+    source.require(bool(source.SHA_RE.fullmatch(old['sha'])), 'invalid previous SHA')
+    expected_root = LEGACY if old['legacy'] else source.RELEASES / old['sha']
+    source.require(Path(old['root']) == expected_root, 'invalid previous source path')
     maintenance()
     stop()
     if pending.get('backup'):
