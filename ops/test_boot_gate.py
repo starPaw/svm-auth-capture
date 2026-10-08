@@ -121,6 +121,8 @@ ENABLED = os.environ.get('CAPTURE402_SYSTEMD_TEST') == '1'
 @unittest.skipUnless(ENABLED, 'explicit disposable Linux systemd test required')
 class BootBoundaryTests(unittest.TestCase):
     def rename_transaction(self, fail_public=False, interrupt=False):
+        source.run('systemctl', 'start', *host.LEGACY_SERVICES, host.NGINX_SERVICE)
+        wait_for(lambda: request(self.cfg['publicPort']) == 200)
         previous = {**self.snapshot['previous'], 'services': list(host.LEGACY_SERVICES)}
         def ready(layout, public=True, **kwargs):
             if fail_public and public and layout.get('services') == list(host.PRODUCT_SERVICES):

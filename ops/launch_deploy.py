@@ -42,6 +42,9 @@ with tarfile.open(fileobj=io.BytesIO(data), mode='r:') as archive:
 sys.path.insert(0, str(root))
 import host_cli
 host_cli.install_controllers(sha, {name: (root / name).read_bytes() for name in host_cli.FILES})
+if len(sys.argv) == 3 and sys.argv[2] == '--install-cli':
+    print('CLI_INSTALLED ' + sha, flush=True)
+    sys.exit(0)
 unit = 'capture402-release-' + sha[:12] + '-' + str(os.getpid())
 print('Deployment job: ' + unit, flush=True)
 result = subprocess.run(['systemd-run', '--unit=' + unit, '--wait',
@@ -83,8 +86,8 @@ def require_acceptance(sha):
 
 
 def main():
-    if len(sys.argv) != 1:
-        raise RuntimeError('usage: ./deploy.sh (deploys the clean, exact current main checkout)')
+    if sys.argv[1:] not in ([], ['--install-cli']):
+        raise RuntimeError('usage: ./deploy.sh [--install-cli] (clean, exact current main checkout)')
     source.require(source.run('git', 'remote', 'get-url', 'origin') == 'https://github.com/starPaw/svm-auth-capture.git', 'wrong repository')
     source.require(not source.run('git', 'status', '--porcelain'), 'deployment requires clean checkout')
     recover_first()
@@ -101,6 +104,8 @@ def main():
         for member in archive:
             if member.isfile(): packed.addfile(member, archive.extractfile(member))
     command = 'sudo -n python3 -c ' + shlex.quote(INSTALLER) + ' ' + sha
+    if sys.argv[1:]:
+        command += ' --install-cli'
     subprocess.run([*SSH, command],
                    input=output.getvalue(), check=True)
 
