@@ -90,6 +90,68 @@ class ArchiveTests(unittest.TestCase):
                             cd.archive_fingerprints(tar(changed, compressed=False), "r:"))
 
 
+    def test_archive_member_limit_stops_streaming_in_both_paths(self):
+        payload = tar({f"integration/item-{n}": b"x" for n in range(25)})
+        original_next = tarfile.TarFile.next
+        for operation in ("fingerprint", "unpack"):
+            parsed = 0
+
+            def tracked_next(archive):
+                nonlocal parsed
+                parsed += 1
+                return original_next(archive)
+
+            with tempfile.TemporaryDirectory() as root:
+                with (mock.patch.object(cd, "MAX_MEMBERS", 2),
+                      mock.patch.object(tarfile.TarFile, "next", tracked_next)):
+                    with self.assertRaisesRegex(RuntimeError, "too many entries"):
+                        if operation == "fingerprint":
+                            cd.archive_fingerprints(payload, "r:gz")
+                        else:
+                            cd.unpack_archive(payload, Path(root))
+            self.assertLessEqual(parsed, 4, "parser inspected rejected trailing entries")
+
+    def test_decompressed_tar_is_bounded_in_both_paths(self):
+        payload = tar({"integration/large": b"x" * 20000})
+        with mock.patch.object(cd, "MAX_TAR_STREAM", 2048):
+            with self.assertRaisesRegex(RuntimeError, "decompressed tar stream exceeds limit"):
+                cd.archive_fingerprints(payload, "r:gz")
+            with tempfile.TemporaryDirectory() as root:
+                with self.assertRaisesRegex(RuntimeError, "decompressed tar stream exceeds limit"):
+                    cd.unpack_archive(payload, Path(root))
+
+
+class HealthTests(unittest.TestCase):
+    def test_html_nginx_403_is_not_a_healthy_post_route(self):
+        with mock.patch.object(cd, "response", return_value=(
+            403, b"<html>nginx denied</html>", {"Content-Type": "text/html"}
+        )):
+            with self.assertRaisesRegex(RuntimeError, "application JSON"):
+                cd.check_order_routes()
+
+    def test_both_local_and_public_routes_return_application_error(self):
+        requested = []
+
+        def fake_response(url, method="GET", data=None):
+            requested.append((url, method, data))
+            return (403, b'{"error":"same-origin demo action required"}',
+                    {"Content-Type": "application/json; charset=UTF-8"})
+
+        with mock.patch.object(cd, "response", side_effect=fake_response):
+            cd.check_order_routes()
+        self.assertEqual(requested, [
+            ("http://127.0.0.1:8788/api/orders", "POST", b"{}"),
+            ("https://capture402.xyz/api/orders", "POST", b"{}"),
+        ])
+
+    def test_json_proxy_403_with_wrong_body_is_rejected(self):
+        with mock.patch.object(cd, "response", return_value=(
+            403, b'{"error":"nginx policy"}', {"Content-Type": "application/json"}
+        )):
+            with self.assertRaisesRegex(RuntimeError, "Origin guard"):
+                cd.check_order_routes()
+
+
 class SwitchingTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -141,6 +203,24 @@ class SwitchingTests(unittest.TestCase):
               mock.patch.object(cd.sys, "stdin", stdin)):
             with self.assertRaisesRegex(RuntimeError, "resource unhealthy"):
                 cd.deploy(NEW, digest)
+        self.assertEqual(cd.current_sha(), OLD)
+        self.assertFalse(cd.PENDING.exists())
+
+
+    def test_failed_nginx_preflight_does_not_touch_current_services(self):
+        payload = b"test archive"
+        digest = hashlib.sha256(payload).hexdigest()
+        stdin = types.SimpleNamespace(buffer=io.BytesIO(payload))
+        with (mock.patch.object(cd.os, "geteuid", return_value=0),
+              mock.patch.object(cd, "check_unit_layout"),
+              mock.patch.object(cd, "verify_source_against_main"),
+              mock.patch.object(cd, "prepare_release"),
+              mock.patch.object(cd, "restart") as restart,
+              mock.patch.object(cd, "run", side_effect=RuntimeError("nginx -t failed")),
+              mock.patch.object(cd.sys, "stdin", stdin)):
+            with self.assertRaisesRegex(RuntimeError, "nginx -t failed"):
+                cd.deploy(NEW, digest)
+        restart.assert_not_called()
         self.assertEqual(cd.current_sha(), OLD)
         self.assertFalse(cd.PENDING.exists())
 

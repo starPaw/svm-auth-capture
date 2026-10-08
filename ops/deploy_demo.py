@@ -7,7 +7,9 @@ No Solana program upgrade, secret mutation, journal modification or payment subm
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 import fcntl
+import gzip
 import hashlib
 import io
 import json
@@ -36,6 +38,7 @@ HASH_RE = re.compile(r"[0-9a-f]{64}\Z")
 MAX_ARCHIVE = 75 * 1024 * 1024
 MAX_UNPACKED = 180 * 1024 * 1024
 MAX_MEMBERS = 14000
+MAX_TAR_STREAM = 256 * 1024 * 1024
 
 
 def require(condition: bool, message: str) -> None:
@@ -109,6 +112,51 @@ def response(url: str, method: str = "GET", data: bytes | None = None) -> tuple[
         return error.code, error.read(32 * 1024), dict(error.headers)
 
 
+def check_order_routes() -> None:
+    # A missing Origin fails in application middleware before mutable work.
+    # Insist on that JSON response, never only a proxy-supplied status.
+    for url in ("http://127.0.0.1:8788/api/orders",
+                "https://capture402.xyz/api/orders"):
+        status, body, headers = response(url, method="POST", data=b"{}")
+        content_type = next((v for k, v in headers.items()
+                             if k.lower() == "content-type"), "")
+        require(status == 403, f"order POST routing HTTP {status}: {url}")
+        require(content_type.split(";", 1)[0].strip().lower() == "application/json",
+                f"order POST did not return application JSON: {url}")
+        try:
+            payload = json.loads(body)
+        except (ValueError, UnicodeError) as error:
+            raise RuntimeError(f"order POST returned invalid JSON: {url}") from error
+        require(payload == {"error": "same-origin demo action required"},
+                f"order POST did not reach the application's Origin guard: {url}")
+
+
+class BoundedTarReader:
+    """Bound decompressed bytes, including tar/PAX metadata and padding."""
+
+    def __init__(self, stream):
+        self.stream = stream
+        self.total = 0
+
+    def read(self, size: int = -1) -> bytes:
+        require(size >= 0, "unbounded tar read not permitted")
+        chunk = self.stream.read(min(size, MAX_TAR_STREAM - self.total + 1))
+        self.total += len(chunk)
+        require(self.total <= MAX_TAR_STREAM, "decompressed tar stream exceeds limit")
+        return chunk
+
+
+@contextmanager
+def bounded_tar(blob: bytes, mode: str):
+    require(mode in ("r:gz", "r:"), "unsupported archive read mode")
+    source = (gzip.GzipFile(fileobj=io.BytesIO(blob), mode="rb")
+              if mode == "r:gz" else io.BytesIO(blob))
+    with source:
+        # Streaming mode does not pre-scan all archive entries.
+        with tarfile.open(fileobj=BoundedTarReader(source), mode="r|") as archive:
+            yield archive
+
+
 def check_health(sha: str) -> None:
     expected_release = (RELEASES / sha).resolve(strict=True)
     for service in SERVICES:
@@ -136,10 +184,7 @@ def check_health(sha: str) -> None:
     remote_status, _, remote_headers = response("https://capture402.xyz/resource")
     require(remote_status == 402 and any(k.lower() == "payment-required" for k in remote_headers),
             "public resource routing is not an x402 payment challenge")
-    order_status, _, _ = response("https://capture402.xyz/api/orders",
-                                  method="POST", data=b"{}")
-    require(order_status in (400, 401, 403, 415, 422),
-            f"order POST routing/origin guard unexpected HTTP {order_status}")
+    check_order_routes()
 
 
 def ready(sha: str, seconds: int = 60) -> None:
@@ -180,10 +225,9 @@ def recover_pending() -> None:
 def unpack_archive(blob: bytes, destination: Path) -> None:
     total = 0
     seen: set[str] = set()
-    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as archive:
-        members = archive.getmembers()
-        require(len(members) <= MAX_MEMBERS, "archive contains too many entries")
-        for member in members:
+    with bounded_tar(blob, "r:gz") as archive:
+        for count, member in enumerate(archive, 1):
+            require(count <= MAX_MEMBERS, "archive contains too many entries")
             raw = member.name.rstrip("/")
             parts = PurePosixPath(raw).parts
             require(bool(parts) and not raw.startswith("/")
@@ -220,11 +264,10 @@ def unpack_archive(blob: bytes, destination: Path) -> None:
 def archive_fingerprints(blob: bytes, mode: str) -> dict[str, tuple[str, str]]:
     """Match the reviewed Git tree, not merely a digest claimed by the SSH key."""
     output: dict[str, tuple[str, str]] = {}
-    with tarfile.open(fileobj=io.BytesIO(blob), mode=mode) as archive:
-        members = archive.getmembers()
-        require(len(members) <= MAX_MEMBERS, "too many entries for source verification")
+    with bounded_tar(blob, mode) as archive:
         total = 0
-        for member in members:
+        for count, member in enumerate(archive, 1):
+            require(count <= MAX_MEMBERS, "too many entries for source verification")
             path = member.name.rstrip("/")
             require(path not in output, "duplicate source path")
             require(member.isdir() or member.isfile(), "unsupported Git object type")
@@ -235,7 +278,13 @@ def archive_fingerprints(blob: bytes, mode: str) -> dict[str, tuple[str, str]]:
             else:
                 payload = archive.extractfile(member)
                 require(payload is not None, "missing source bytes")
-                output[path] = ("file", hashlib.sha256(payload.read()).hexdigest())
+                digest = hashlib.sha256()
+                while True:
+                    chunk = payload.read(128 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                output[path] = ("file", digest.hexdigest())
     return output
 
 
@@ -329,10 +378,11 @@ def deploy(sha: str, digest: str) -> None:
             print(f"ALREADY_ACTIVE {sha}", flush=True)
             return
 
+        # Failed preflight cannot create pending state or restart live services.
+        run("nginx", "-t")
         write_json(PENDING, {"previous": previous, "target": sha,
                              "archiveSha256": digest})
         try:
-            run("nginx", "-t")
             switch_to(sha)
             restart()
             ready(sha)
