@@ -63,14 +63,22 @@ describe("merchant application authority", () => {
     const files = readdirSync(join(dir, "orders")).sort();
     const submitted = h.ledger.submissions.length, simulated = h.ledger.simulated.length;
     const sign = vi.fn(c.server.signTransactions);
-    app = createRestaurantApp({ ...c, server: { ...c.server, signTransactions: sign } });
-    for (const token of [undefined, "incorrect", merchantToken.slice(0, -1) + "X", c.bearerToken, s.cookie.split("=")[1]]) {
-      const headers: Record<string, string> = { cookie: s.cookie, origin, "content-type": "application/json" };
-      if (token) headers.authorization = `Bearer ${token}`;
-      const r = await app.request(`${origin}/api/orders/${s.id}/actions/${a}`, {
-        method: "POST", headers, body: JSON.stringify({ role: "merchant", merchant: true }),
-      });
-      expect(r.status).toBe(401);
+    for (const restarted of [false, true]) {
+      const orders = restarted ? new RestaurantOrders(join(dir, "orders")) : c.orders;
+      const read = vi.spyOn(orders, "read"), reserve = vi.spyOn(orders, "reserve");
+      const backend = createRestaurantApp({ ...c, orders, server: { ...c.server, signTransactions: sign } });
+      app = createPresentationApp({ programId: c.programId, network: c.network, configured: true }, backend);
+      for (const token of [undefined, "incorrect", merchantToken.slice(0, -1) + "X", c.bearerToken, s.cookie.split("=")[1]]) {
+        const headers: Record<string, string> = { cookie: s.cookie, origin, "content-type": "application/json" };
+        if (token) headers.authorization = `Bearer ${token}`;
+        const r = await app.request(`${origin}/api/orders/${s.id}/actions/${a}`, {
+          method: "POST", headers, body: JSON.stringify({ role: "merchant", merchant: true }),
+        });
+        expect(r.status).toBe(401);
+      }
+      expect(read).not.toHaveBeenCalled();
+      expect(reserve).not.toHaveBeenCalled();
+      read.mockRestore(); reserve.mockRestore();
     }
     expect(sign).not.toHaveBeenCalled();
     expect(h.ledger.submissions).toHaveLength(submitted);
@@ -81,13 +89,36 @@ describe("merchant application authority", () => {
   });
   test("missing configuration fails closed, including across restart", async () => {
     const s = await offer(); await authorize(s);
+    const disk = readFileSync(c.orders.path(s.id), "utf8");
+    const files = readdirSync(join(dir, "orders")).sort();
+    const simulated = h.ledger.simulated.length;
+    const sign = vi.fn(c.server.signTransactions);
     for (const a of ["beer", "salmon", "finish", "void", "refund"]) {
-      app = createRestaurantApp({ ...c, merchantToken: undefined, orders: new RestaurantOrders(join(dir, "orders")) });
+      app = createRestaurantApp({ ...c, merchantToken: undefined, orders: new RestaurantOrders(join(dir, "orders")), server: { ...c.server, signTransactions: sign } });
       expect((await action(s, a)).status).toBe(503);
       expect(c.orders.attempted(s.id, a as any)).toBe(false);
     }
+    expect(sign).not.toHaveBeenCalled();
+    expect(h.ledger.simulated).toHaveLength(simulated);
     expect(h.ledger.submissions).toHaveLength(1);
+    expect(readFileSync(c.orders.path(s.id), "utf8")).toBe(disk);
+    expect(readdirSync(join(dir, "orders")).sort()).toEqual(files);
     expect(c.orders.busy(s.id)).toBe(false);
+  });
+  test("mounted presentation and payer session never disclose merchant or facilitator credentials", async () => {
+    app = createPresentationApp({ programId: c.programId, network: c.network, configured: true, sponsor: c.feePayer, merchant: c.server.address, mint: c.asset }, app);
+    const s = await offer();
+    const publicResponses = [JSON.stringify(s)];
+    for (const route of ["/api/config", "/", "/customer", "/merchant", "/assets/app.js", "/assets/wallet.js", `/api/orders/${s.id}`]) {
+      const r = await app.request(origin + route, { headers: { cookie: s.cookie } });
+      expect(r.status).toBe(200);
+      publicResponses.push(await r.text());
+    }
+    for (const body of publicResponses) {
+      expect(body).not.toContain(merchantToken);
+      expect(body).not.toContain(c.bearerToken);
+    }
+    expect(h.ledger.submissions).toHaveLength(0);
   });
   test("merchant authentication precedes order lookup and survives restart", async () => {
     expect((await app.request(`${origin}/api/orders/missing/actions/beer`, { method: "POST", headers: { origin } })).status).toBe(401);
@@ -153,8 +184,10 @@ describe("restaurant budget lifecycle", () => {
     expect(h.ledger.submissions).toHaveLength(2);
   });
   test("unavailable merchant: deadline enforced; payer alone signs direct reclaim without facilitator", async () => {
+    c.merchantToken = undefined;
+    app = createRestaurantApp(c);
     const before = h.tokens(await h.payerAta()); const s = await offer("unavailable"); await authorize(s);
-    expect((await action(s,"beer")).status).toBe(409);
+    expect((await action(s,"beer")).status).toBe(503);
     const prepare = () => app.request(`${origin}/api/orders/${s.id}/reclaim`, { headers: { cookie: s.cookie } });
     expect((await prepare()).status).toBe(409); h.setTime(NOW + 150n);
     c.getLatestBlockhash = async () => ({ ...h.lifetime(), blockhashSlot: 1n });
