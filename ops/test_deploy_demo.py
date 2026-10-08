@@ -1,9 +1,11 @@
 """Offline failure, trust-boundary, and rollback tests for the Devnet CD helper."""
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import tarfile
 import tempfile
@@ -121,6 +123,127 @@ class ArchiveTests(unittest.TestCase):
                     cd.unpack_archive(payload, Path(root))
 
 
+
+class PrivateSourceTests(unittest.TestCase):
+    """GitHub source authenticity and VPS-only SSH credential constraints."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.key = root / "read-key"
+        self.hosts = root / "known-hosts"
+        self.key.write_text("private fixture")
+        self.hosts.write_text("github.com ssh-ed25519 fixture\n")
+        self.key.chmod(0o600)
+        self.hosts.chmod(0o644)
+        for name, path in [("SOURCE_KEY", self.key),
+                           ("SOURCE_KNOWN_HOSTS", self.hosts),
+                           ("RELEASES", root)]:
+            patch = mock.patch.object(cd, name, path)
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.user = types.SimpleNamespace(
+            pw_uid=os.getuid(), pw_gid=os.getgid(), pw_dir=str(root))
+
+    def config(self):
+        return cd.source_ssh_command(self.user, hosts_owner_uid=os.getuid())
+
+    def test_pinned_host_and_read_only_identity(self):
+        ssh = self.config()
+        self.assertIn(f"-i {self.key}", ssh)
+        self.assertIn(f"UserKnownHostsFile={self.hosts}", ssh)
+        self.assertIn("StrictHostKeyChecking=yes", ssh)
+        self.assertIn("IdentityAgent=none", ssh)
+        self.assertIn("GlobalKnownHostsFile=/dev/null", ssh)
+        self.assertIn("ForwardAgent=no", ssh)
+
+    def test_missing_key_fails_before_clone(self):
+        self.key.unlink()
+        with self.assertRaisesRegex(RuntimeError, "source deploy key missing"):
+            self.config()
+
+    def test_group_readable_key_is_rejected(self):
+        self.key.chmod(0o640)
+        with self.assertRaisesRegex(RuntimeError, "private"):
+            self.config()
+
+    def test_writable_host_pin_is_rejected(self):
+        self.hosts.chmod(0o664)
+        with self.assertRaisesRegex(RuntimeError, "not writable"):
+            self.config()
+
+    def test_symlinked_host_pin_is_rejected(self):
+        real = self.hosts.with_name("real-hosts")
+        self.hosts.rename(real)
+        self.hosts.symlink_to(real)
+        with self.assertRaisesRegex(RuntimeError, "pin.*unsafe"):
+            self.config()
+
+    def test_empty_host_pin_is_rejected(self):
+        self.hosts.write_text("")
+        with self.assertRaisesRegex(RuntimeError, "empty GitHub host"):
+            self.config()
+
+    def test_private_git_clone_uses_exact_sha_and_byte_comparison(self):
+        commands = []
+
+        def run_stub(*args, **kwargs):
+            commands.append(args)
+            return NEW if args[-3:] == ("git", "rev-parse", "HEAD") else ""
+
+        with (mock.patch.object(cd.pwd, "getpwnam", return_value=self.user),
+              mock.patch.object(cd, "source_ssh_command", return_value="ssh pinned"),
+              mock.patch.object(cd.os, "chown"),
+              mock.patch.object(cd, "run", side_effect=run_stub),
+              mock.patch.object(cd.subprocess, "run",
+                                return_value=types.SimpleNamespace(
+                                    stdout=tar(FILES, compressed=False)))):
+            cd.verify_source_against_main(NEW, tar(FILES))
+        self.assertEqual(commands[0][:6], ("runuser", "-u", "capture402-deploy",
+                                          "--", "/usr/bin/env", "-i"))
+        self.assertIn("GIT_TERMINAL_PROMPT=0", commands[0])
+        for cmd in commands:
+            self.assertIn("GIT_CONFIG_NOSYSTEM=1", cmd)
+            self.assertIn("GIT_CONFIG_GLOBAL=/dev/null", cmd)
+            self.assertIn("/usr/bin/env", cmd)
+        self.assertIn("core.sshCommand=ssh pinned", commands[0])
+        self.assertIn(cd.SOURCE_REMOTE, commands[0])
+        self.assertNotIn("https://github.com/starPaw/svm-auth-capture.git", commands[0])
+
+    def test_archive_source_isolated_from_global_git_config(self):
+        with (mock.patch.object(cd.pwd, "getpwnam", return_value=self.user),
+              mock.patch.object(cd.subprocess, "run",
+                                return_value=types.SimpleNamespace(stdout=b"")) as run):
+            cd.git_archive(Path(self.tmp.name), NEW)
+        args = run.call_args.args[0]
+        self.assertIn("GIT_CONFIG_NOSYSTEM=1", args)
+        self.assertIn("GIT_CONFIG_GLOBAL=/dev/null", args)
+        self.assertIn("/usr/bin/env", args)
+        self.assertIn("archive", args)
+
+    def test_mutated_source_archive_is_rejected(self):
+        with (mock.patch.object(cd.pwd, "getpwnam", return_value=self.user),
+              mock.patch.object(cd, "source_ssh_command", return_value="ssh pinned"),
+              mock.patch.object(cd.os, "chown"),
+              mock.patch.object(cd, "run", side_effect=["", NEW]),
+              mock.patch.object(cd.subprocess, "run", return_value=types.SimpleNamespace(
+                  stdout=tar(FILES, compressed=False)))):
+            with self.assertRaisesRegex(RuntimeError, "differs from exact GitHub"):
+                cd.verify_source_against_main(
+                    NEW, tar({**FILES, "integration/src/devnet-server.ts": b"tamper"}))
+
+    def test_stale_main_sha_fails_before_source_archive(self):
+        with (mock.patch.object(cd.pwd, "getpwnam", return_value=self.user),
+              mock.patch.object(cd, "source_ssh_command", return_value="ssh pinned"),
+              mock.patch.object(cd.os, "chown"),
+              mock.patch.object(cd, "run", side_effect=["", OLD]),
+              mock.patch.object(cd.subprocess, "run") as run_archive):
+            with self.assertRaisesRegex(RuntimeError, "does not match approved SHA"):
+                cd.verify_source_against_main(NEW, tar(FILES))
+            run_archive.assert_not_called()
+
+
 class HealthTests(unittest.TestCase):
     def test_html_nginx_403_is_not_a_healthy_post_route(self):
         with mock.patch.object(cd, "response", return_value=(
@@ -191,7 +314,6 @@ class SwitchingTests(unittest.TestCase):
     def test_failed_activation_restores_old_version(self):
         payload = b"test compressed archive"
         digest = hashlib.sha256(payload).hexdigest()
-        stdin = types.SimpleNamespace(buffer=io.BytesIO(payload))
         with (mock.patch.object(cd.os, "geteuid", return_value=0),
               mock.patch.object(cd, "check_unit_layout"),
               mock.patch.object(cd, "verify_source_against_main"),
@@ -199,10 +321,9 @@ class SwitchingTests(unittest.TestCase):
               mock.patch.object(cd, "restart"),
               mock.patch.object(cd, "run", return_value=""),
               mock.patch.object(cd, "ready",
-                                side_effect=[RuntimeError("resource unhealthy"), None]),
-              mock.patch.object(cd.sys, "stdin", stdin)):
+                                side_effect=[RuntimeError("resource unhealthy"), None])):
             with self.assertRaisesRegex(RuntimeError, "resource unhealthy"):
-                cd.deploy(NEW, digest)
+                cd.deploy(NEW, digest, payload)
         self.assertEqual(cd.current_sha(), OLD)
         self.assertFalse(cd.PENDING.exists())
 
@@ -210,16 +331,14 @@ class SwitchingTests(unittest.TestCase):
     def test_failed_nginx_preflight_does_not_touch_current_services(self):
         payload = b"test archive"
         digest = hashlib.sha256(payload).hexdigest()
-        stdin = types.SimpleNamespace(buffer=io.BytesIO(payload))
         with (mock.patch.object(cd.os, "geteuid", return_value=0),
               mock.patch.object(cd, "check_unit_layout"),
               mock.patch.object(cd, "verify_source_against_main"),
               mock.patch.object(cd, "prepare_release"),
               mock.patch.object(cd, "restart") as restart,
-              mock.patch.object(cd, "run", side_effect=RuntimeError("nginx -t failed")),
-              mock.patch.object(cd.sys, "stdin", stdin)):
+              mock.patch.object(cd, "run", side_effect=RuntimeError("nginx -t failed"))):
             with self.assertRaisesRegex(RuntimeError, "nginx -t failed"):
-                cd.deploy(NEW, digest)
+                cd.deploy(NEW, digest, payload)
         restart.assert_not_called()
         self.assertEqual(cd.current_sha(), OLD)
         self.assertFalse(cd.PENDING.exists())
@@ -236,15 +355,13 @@ class SwitchingTests(unittest.TestCase):
     def test_duplicate_exact_sha_no_restart(self):
         payload = b"test archive"
         digest = hashlib.sha256(payload).hexdigest()
-        stdin = types.SimpleNamespace(buffer=io.BytesIO(payload))
         with (mock.patch.object(cd.os, "geteuid", return_value=0),
               mock.patch.object(cd, "check_unit_layout"),
               mock.patch.object(cd, "verify_source_against_main"),
               mock.patch.object(cd, "prepare_release"),
               mock.patch.object(cd, "restart") as restart,
-              mock.patch.object(cd, "ready"),
-              mock.patch.object(cd.sys, "stdin", stdin)):
-            cd.deploy(OLD, digest)
+              mock.patch.object(cd, "ready")):
+            cd.deploy(OLD, digest, payload)
         restart.assert_not_called()
         self.assertEqual(cd.current_sha(), OLD)
 
@@ -255,6 +372,209 @@ class SwitchingTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "service failed"):
                 cd.recover_pending()
         self.assertTrue(cd.PENDING.exists())
+
+
+
+class LocalManualReleaseTests(unittest.TestCase):
+    """No CI runner can deploy. The VPS operator must select current main."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        releases = root / "releases"
+        releases.mkdir()
+        (releases / OLD).mkdir()
+        (releases / NEW).mkdir()
+        manifests = root / "manifests"
+        manifests.mkdir()
+        (root / "current").symlink_to(releases / OLD)
+        for name, value in (
+            ("BASE", root), ("RELEASES", releases),
+            ("MANIFESTS", manifests), ("CURRENT", root / "current"),
+            ("PENDING", root / "pending.json"),
+        ):
+            patch = mock.patch.object(cd, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.user = types.SimpleNamespace(
+            pw_uid=os.getuid(), pw_gid=os.getgid(), pw_dir=self.tmp.name)
+
+    def test_manual_fetch_rejects_unprivileged_invocation(self):
+        with mock.patch.object(cd.os, "geteuid", return_value=1000):
+            with self.assertRaisesRegex(RuntimeError, "authorized local sudo"):
+                cd.manually_fetch_archive(NEW)
+
+    def test_manual_fetch_rejects_invalid_sha_before_clone(self):
+        with (mock.patch.object(cd.os, "geteuid", return_value=0),
+              mock.patch.object(cd, "clone_main") as clone):
+            with self.assertRaisesRegex(RuntimeError, "exact lowercase main SHA"):
+                cd.manually_fetch_archive("not-a-sha")
+            clone.assert_not_called()
+
+    def test_manual_fetch_produces_local_archive_of_exact_main(self):
+        expected = tar(FILES, compressed=False)
+        with (mock.patch.object(cd.os, "geteuid", return_value=0),
+              mock.patch.object(cd.pwd, "getpwnam", return_value=self.user),
+              mock.patch.object(cd.os, "chown"),
+              mock.patch.object(cd, "clone_main", return_value=Path(self.tmp.name)),
+              mock.patch.object(cd, "git_archive", return_value=expected)):
+            blob = cd.manually_fetch_archive(NEW)
+        self.assertEqual(cd.archive_fingerprints(blob, "r:gz"),
+                         cd.archive_fingerprints(expected, "r:"))
+
+    def test_manual_fetch_rejects_unsafe_source_tar(self):
+        invalid = tar(FILES, link=True, compressed=False)
+        with (mock.patch.object(cd.os, "geteuid", return_value=0),
+              mock.patch.object(cd.pwd, "getpwnam", return_value=self.user),
+              mock.patch.object(cd.os, "chown"),
+              mock.patch.object(cd, "clone_main", return_value=Path(self.tmp.name)),
+              mock.patch.object(cd, "git_archive", return_value=invalid)):
+            with self.assertRaisesRegex(RuntimeError, "unsupported Git object"):
+                cd.manually_fetch_archive(NEW)
+
+    def test_failed_stale_main_clone_does_not_create_archive(self):
+        with (mock.patch.object(cd.os, "geteuid", return_value=0),
+              mock.patch.object(cd.pwd, "getpwnam", return_value=self.user),
+              mock.patch.object(cd.os, "chown"),
+              mock.patch.object(cd, "source_ssh_command", return_value="ssh pinned"),
+              mock.patch.object(cd, "run", side_effect=["", OLD]),
+              mock.patch.object(cd, "git_archive") as archive):
+            with self.assertRaisesRegex(RuntimeError, "does not match approved SHA"):
+                cd.manually_fetch_archive(NEW)
+            archive.assert_not_called()
+
+    def test_no_workflow_or_remote_deploy_entrypoint(self):
+        root = Path(__file__).resolve().parents[1]
+        self.assertFalse((root / ".github/workflows/deploy-demo.yml").exists())
+        self.assertFalse((root / "ops/ssh-deploy.sh").exists())
+
+    def test_manual_deploy_root_validates_exact_digest_before_restart(self):
+        with (mock.patch.object(cd.os, "geteuid", return_value=0),
+              mock.patch.object(cd, "check_unit_layout"),
+              mock.patch.object(cd, "restart") as restart):
+            with self.assertRaisesRegex(RuntimeError, "archive SHA-256 mismatch"):
+                cd.deploy(NEW, "0" * 64, b"artifact")
+            restart.assert_not_called()
+
+
+    def test_cli_recovers_pending_offline_before_attempting_github(self):
+        """P1 reproduction: next CLI invocation rolls back without network."""
+        cd.switch_to(NEW)
+        cd.write_json(cd.PENDING, {
+            "previous": OLD, "target": NEW, "archiveSha256": "c" * 64,
+        })
+        with (mock.patch.object(cd.os, "geteuid", return_value=0),
+              mock.patch.object(cd, "check_unit_layout"),
+              mock.patch.object(cd, "restart") as restart,
+              mock.patch.object(cd, "ready") as ready,
+              mock.patch.object(cd, "manually_fetch_archive",
+                                side_effect=RuntimeError("GitHub unavailable")) as fetch):
+            with self.assertRaisesRegex(RuntimeError, "retry to deploy"):
+                cd.main(["capture402-deploy", "--manual", NEW])
+            self.assertEqual(restart.call_count, 1)
+            ready.assert_called_once_with(OLD)
+            fetch.assert_not_called()
+        self.assertEqual(cd.current_sha(), OLD)
+        self.assertFalse(cd.PENDING.exists())
+
+    def test_cli_recovers_pending_before_rejecting_invalid_new_sha(self):
+        cd.switch_to(NEW)
+        cd.write_json(cd.PENDING, {"previous": OLD, "target": NEW})
+        with (mock.patch.object(cd.os, "geteuid", return_value=0),
+              mock.patch.object(cd, "check_unit_layout"),
+              mock.patch.object(cd, "restart") as restart,
+              mock.patch.object(cd, "ready"),
+              mock.patch.object(cd, "manually_fetch_archive") as fetch):
+            with self.assertRaisesRegex(RuntimeError, "retry to deploy"):
+                cd.main(["capture402-deploy", "--manual", "not-a-sha"])
+            restart.assert_called_once()
+            fetch.assert_not_called()
+        self.assertEqual(cd.current_sha(), OLD)
+        self.assertFalse(cd.PENDING.exists())
+
+    def test_cli_failed_recovery_keeps_pending_without_github_fetch(self):
+        cd.switch_to(NEW)
+        cd.write_json(cd.PENDING, {"previous": OLD, "target": NEW})
+        with (mock.patch.object(cd.os, "geteuid", return_value=0),
+              mock.patch.object(cd, "check_unit_layout"),
+              mock.patch.object(cd, "restart") as restart,
+              mock.patch.object(cd, "ready", side_effect=RuntimeError("rollback unhealthy")),
+              mock.patch.object(cd, "manually_fetch_archive") as fetch):
+            with self.assertRaisesRegex(RuntimeError, "rollback unhealthy"):
+                cd.main(["capture402-deploy", "--manual", NEW])
+            restart.assert_called_once()
+            fetch.assert_not_called()
+        self.assertEqual(cd.current_sha(), OLD)
+        self.assertTrue(cd.PENDING.exists())
+
+    def test_cli_no_pending_and_github_outage_leaves_old_version(self):
+        with (mock.patch.object(cd.os, "geteuid", return_value=0),
+              mock.patch.object(cd, "check_unit_layout"),
+              mock.patch.object(cd, "restart") as restart,
+              mock.patch.object(cd, "ready") as ready,
+              mock.patch.object(cd, "manually_fetch_archive",
+                                side_effect=RuntimeError("GitHub unavailable")) as fetch):
+            with self.assertRaisesRegex(RuntimeError, "GitHub unavailable"):
+                cd.main(["capture402-deploy", "--manual", NEW])
+            fetch.assert_called_once_with(NEW)
+            restart.assert_not_called()
+            ready.assert_not_called()
+        self.assertEqual(cd.current_sha(), OLD)
+        self.assertFalse(cd.PENDING.exists())
+
+    def test_cli_fetch_and_activation_hold_the_same_exclusive_lock(self):
+        """Never release the lock between a verified recovery and network fetch."""
+        checked = []
+
+        def assert_lock(*_args):
+            probe = os.open(self.tmp.name + "/deploy.lock", os.O_RDWR)
+            try:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(probe)
+            checked.append(True)
+
+        def fetch(_sha):
+            assert_lock()
+            return b"source-archive"
+
+        def activate(_sha, _digest, _blob):
+            assert_lock()
+
+        with (mock.patch.object(cd.os, "geteuid", return_value=0),
+              mock.patch.object(cd, "check_unit_layout"),
+              mock.patch.object(cd, "manually_fetch_archive", side_effect=fetch),
+              mock.patch.object(cd, "activate_locked", side_effect=activate)):
+            cd.main(["capture402-deploy", "--manual", NEW])
+        self.assertEqual(checked, [True, True])
+        self.assertEqual(cd.current_sha(), OLD)
+
+    def test_cli_concurrent_manual_deploy_fails_before_fetch(self):
+        fd = os.open(self.tmp.name + "/deploy.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with (mock.patch.object(cd.os, "geteuid", return_value=0),
+                  mock.patch.object(cd, "manually_fetch_archive") as fetch):
+                with self.assertRaises(BlockingIOError):
+                    cd.main(["capture402-deploy", "--manual", NEW])
+                fetch.assert_not_called()
+        finally:
+            os.close(fd)
+        self.assertEqual(cd.current_sha(), OLD)
+
+    def test_cli_bad_unit_layout_fails_before_fetch(self):
+        with (mock.patch.object(cd.os, "geteuid", return_value=0),
+              mock.patch.object(cd, "check_unit_layout",
+                                side_effect=RuntimeError("wrong WorkingDirectory")),
+              mock.patch.object(cd, "manually_fetch_archive") as fetch,
+              mock.patch.object(cd, "restart") as restart):
+            with self.assertRaisesRegex(RuntimeError, "wrong WorkingDirectory"):
+                cd.main(["capture402-deploy", "--manual", NEW])
+            fetch.assert_not_called()
+            restart.assert_not_called()
+
 
 
 if __name__ == "__main__":

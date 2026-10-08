@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Root-owned, manually provisioned Capture402 Devnet release activator.
 
-Called ONLY through the forced-command SSH key and a narrowly scoped sudo rule.
-stdin: a gzip-compressed git archive of the exact, CI-approved main commit.
-No Solana program upgrade, secret mutation, journal modification or payment submission.
+Called ONLY by the authorized VPS operator after inspecting successful exact-SHA
+GitHub CI. Builds the release archive directly from privately authenticated,
+read-only GitHub main; independently re-fetches and verifies each archived file.
+No Actions deploy secrets, network SSH deploy entrypoint, Solana program upgrade,
+secret mutation, journal modification or payment submission.
 """
 from __future__ import annotations
 
@@ -18,6 +20,7 @@ from pathlib import Path, PurePosixPath
 import pwd
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -39,6 +42,12 @@ MAX_ARCHIVE = 75 * 1024 * 1024
 MAX_UNPACKED = 180 * 1024 * 1024
 MAX_MEMBERS = 14000
 MAX_TAR_STREAM = 256 * 1024 * 1024
+
+# A repository-scoped READ-ONLY GitHub deploy key, held on the VPS only.
+# This key is unrelated to Actions -> VPS SSH or Solana economic authorities.
+SOURCE_KEY = Path("/home/capture402-deploy/.ssh/github-source-readonly")
+SOURCE_KNOWN_HOSTS = Path("/etc/capture402/github_known_hosts")
+SOURCE_REMOTE = "ssh://git@github.com/starPaw/svm-auth-capture.git"
 
 
 def require(condition: bool, message: str) -> None:
@@ -288,35 +297,106 @@ def archive_fingerprints(blob: bytes, mode: str) -> dict[str, tuple[str, str]]:
     return output
 
 
-def verify_source_against_main(sha: str, blob: bytes) -> None:
-    """Prevent a stolen SSH deploy key from substituting executable source bytes.
+def source_ssh_command(user: pwd.struct_passwd, *, hosts_owner_uid: int = 0) -> str:
+    """Use exactly one repository-scoped key and independently pinned GitHub host.
 
-    Independently shallow-clone public main *on the VPS*, require its HEAD equals
-    the intended SHA, and compare every archived file to the received artifact.
+    Fail closed if a secret is absent, world-readable, substituted by a
+    symlink, or if the trusted host pin is writable by the deploy user.
+    """
+    require(SOURCE_KEY.is_file() and not SOURCE_KEY.is_symlink(),
+            "private GitHub source deploy key missing or unsafe")
+    key_info = SOURCE_KEY.lstat()
+    require(stat.S_ISREG(key_info.st_mode) and key_info.st_uid == user.pw_uid
+            and (key_info.st_mode & 0o077) == 0,
+            "source deploy key must be owned by deploy user and private (0600)")
+    require(SOURCE_KNOWN_HOSTS.is_file() and not SOURCE_KNOWN_HOSTS.is_symlink(),
+            "root-pinned GitHub known_hosts missing or unsafe")
+    hosts_info = SOURCE_KNOWN_HOSTS.lstat()
+    require(stat.S_ISREG(hosts_info.st_mode)
+            and hosts_info.st_uid == hosts_owner_uid
+            and (hosts_info.st_mode & 0o022) == 0,
+            "GitHub host key pin must be root-owned and not writable by deploy user")
+    require(bool(SOURCE_KNOWN_HOSTS.read_text().strip()),
+            "empty GitHub host key pin")
+    return (
+        "ssh -F /dev/null"
+        f" -i {SOURCE_KEY}"
+        " -o BatchMode=yes -o IdentitiesOnly=yes -o IdentityAgent=none"
+        " -o StrictHostKeyChecking=yes"
+        f" -o UserKnownHostsFile={SOURCE_KNOWN_HOSTS}"
+        " -o GlobalKnownHostsFile=/dev/null -o UpdateHostKeys=no"
+        " -o ForwardAgent=no -o ClearAllForwardings=yes"
+        " -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no"
+        " -o ConnectTimeout=10"
+    )
+
+
+def clone_main(sha: str, root: Path, user: pwd.struct_passwd) -> Path:
+    """Resolve only the current private main, with an isolated SSH identity."""
+    require(bool(SHA_RE.fullmatch(sha)), "invalid canonical main SHA")
+    ssh_command = source_ssh_command(user)
+    repo = root / "repository"
+    run("runuser", "-u", "capture402-deploy", "--", "/usr/bin/env", "-i",
+        f"HOME={user.pw_dir}", "PATH=/usr/bin:/bin", "GIT_TERMINAL_PROMPT=0",
+        "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null",
+        "/usr/bin/git", "-c", "credential.helper=",
+        "-c", f"core.sshCommand={ssh_command}", "clone", "--depth=1",
+        "--single-branch", "--branch=main", "--no-checkout",
+        SOURCE_REMOTE, str(repo), timeout=180)
+    live = run("runuser", "-u", "capture402-deploy", "--", "/usr/bin/env", "-i",
+               f"HOME={user.pw_dir}", "PATH=/usr/bin:/bin",
+               "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null",
+               "git", "rev-parse", "HEAD", cwd=repo)
+    require(live == sha, "remote canonical main does not match approved SHA")
+    return repo
+
+
+def git_archive(repo: Path, sha: str) -> bytes:
+    """An archive of the exact commit, excluding workflow code and any secrets."""
+    return subprocess.run(
+        ["runuser", "-u", "capture402-deploy", "--", "/usr/bin/env", "-i",
+         f"HOME={pwd.getpwnam('capture402-deploy').pw_dir}", "PATH=/usr/bin:/bin",
+         "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null",
+         "git", "archive", "--format=tar", sha, "integration", RECORD],
+        cwd=repo, capture_output=True, check=True, timeout=90,
+    ).stdout
+
+
+def manually_fetch_archive(sha: str) -> bytes:
+    """Run on VPS only after independent human approval of the exact green SHA."""
+    require(os.geteuid() == 0, "manual release requires authorized local sudo")
+    require(bool(SHA_RE.fullmatch(sha)), "exact lowercase main SHA required")
+    require(RELEASES.is_dir(), "release directory not provisioned")
+    user = pwd.getpwnam("capture402-deploy")
+    with tempfile.TemporaryDirectory(prefix=".manual-", dir=RELEASES) as path:
+        temp = Path(path)
+        os.chown(temp, user.pw_uid, user.pw_gid)
+        repo = clone_main(sha, temp, user)
+        tar = git_archive(repo, sha)
+        require(0 < len(tar) <= MAX_TAR_STREAM, "source tar over limit")
+        # git archive must contain supported regular files/directories only.
+        archive_fingerprints(tar, "r:")
+        blob = gzip.compress(tar, compresslevel=9, mtime=0)
+        require(0 < len(blob) <= MAX_ARCHIVE, "compressed source archive over limit")
+        return blob
+
+
+def verify_source_against_main(sha: str, blob: bytes) -> None:
+    """An independently fetched Git tree must match the locally staged archive.
+
+    Even in manual deployment, a compromised checkout or substituted artifact
+    cannot bypass current main-SHA and byte-exact content verification.
     """
     user = pwd.getpwnam("capture402-deploy")
-    temp = Path(tempfile.mkdtemp(prefix=".verify-", dir=RELEASES))
-    try:
+    with tempfile.TemporaryDirectory(prefix=".verify-", dir=RELEASES) as path:
+        temp = Path(path)
         os.chown(temp, user.pw_uid, user.pw_gid)
-        repo = temp / "repository"
-        run("runuser", "-u", "capture402-deploy", "--", "/usr/bin/env",
-            "git", "-c", "credential.helper=", "clone", "--depth=1",
-            "--single-branch", "--branch=main", "--no-checkout",
-            "https://github.com/starPaw/svm-auth-capture.git", str(repo),
-            timeout=180)
-        live = run("runuser", "-u", "capture402-deploy", "--",
-                   "git", "rev-parse", "HEAD", cwd=repo)
-        require(live == sha, "remote canonical main does not match approved SHA")
-        archived = subprocess.run(
-            ["runuser", "-u", "capture402-deploy", "--", "git", "archive",
-             "--format=tar", sha, "integration", RECORD],
-            cwd=repo, capture_output=True, check=True, timeout=90,
-        ).stdout
+        repo = clone_main(sha, temp, user)
+        archived = git_archive(repo, sha)
         require(archive_fingerprints(blob, "r:gz")
                 == archive_fingerprints(archived, "r:"),
                 "received artifact differs from exact GitHub main tree")
-    finally:
-        shutil.rmtree(temp)
+
 
 def chown_tree(root: Path, uid: int, gid: int) -> None:
     # Never follow npm-created .bin symlinks. Root is owner after final sealing.
@@ -355,63 +435,93 @@ def prepare_release(sha: str, digest: str, blob: bytes) -> None:
             shutil.rmtree(stage)
 
 
-def deploy(sha: str, digest: str) -> None:
-    require(os.geteuid() == 0, "root-owned helper must be invoked via restricted sudo")
-    require(bool(SHA_RE.fullmatch(sha)) and bool(HASH_RE.fullmatch(digest)),
-            "expected exact 40-hex Git SHA and 64-hex SHA-256")
+@contextmanager
+def locked_release():
+    """Own the one deployment lock through recovery, network fetch and switch.
+
+    A previous interrupted activation must be recovered *offline*, before any
+    GitHub access. Do not drop the lock between recovery and archive fetching:
+    another manual release must not race us to switch the current symlink.
+    """
+    require(os.geteuid() == 0, "root-owned helper requires local sudo")
     require(BASE.is_dir() and RELEASES.is_dir() and MANIFESTS.is_dir(),
             "versioned release directories not provisioned")
     lock = os.open(BASE / "deploy.lock", os.O_CREAT | os.O_RDWR, 0o600)
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         check_unit_layout()
-        recover_pending()
-        previous = current_sha()
-        blob = sys.stdin.buffer.read(MAX_ARCHIVE + 1)
-        require(len(blob) <= MAX_ARCHIVE and len(blob) > 0, "archive empty or over limit")
-        require(hashlib.sha256(blob).hexdigest() == digest, "release archive SHA-256 mismatch")
-
-        verify_source_against_main(sha, blob)
-        prepare_release(sha, digest, blob)
-        if previous == sha:
-            ready(sha)
-            print(f"ALREADY_ACTIVE {sha}", flush=True)
-            return
-
-        # Failed preflight cannot create pending state or restart live services.
-        run("nginx", "-t")
-        write_json(PENDING, {"previous": previous, "target": sha,
-                             "archiveSha256": digest})
-        try:
-            switch_to(sha)
-            restart()
-            ready(sha)
-            write_json(MANIFESTS / f"{sha}.json",
-                       {"sha": sha, "archiveSha256": digest, "status": "deployed"})
-            PENDING.unlink()
-            print(f"DEPLOYED {sha}; previous={previous}", flush=True)
-        except Exception as original:
-            print(f"Release failed; restoring {previous}: {original}", file=sys.stderr,
-                  flush=True)
-            try:
-                switch_to(previous)
-                restart()
-                ready(previous)
-                PENDING.unlink()
-                print(f"ROLLED_BACK {previous}", file=sys.stderr, flush=True)
-            except Exception as recovery:
-                raise RuntimeError(
-                    f"ROLLBACK_UNVERIFIED previous={previous}: {recovery}") from original
-            raise
+        recover_pending()  # Requires no source network or deploy credential.
+        yield
     finally:
         os.close(lock)
 
 
-if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        raise SystemExit("usage: deploy_demo.py <40-hex-main-sha> <64-hex-archive-sha256>")
+def activate_locked(sha: str, digest: str, blob: bytes) -> None:
+    """Use only under locked_release(), after its recovery-first preflight."""
+    require(bool(SHA_RE.fullmatch(sha)) and bool(HASH_RE.fullmatch(digest)),
+            "expected exact 40-hex Git SHA and 64-hex SHA-256")
+    previous = current_sha()
+    require(0 < len(blob) <= MAX_ARCHIVE, "archive empty or over limit")
+    require(hashlib.sha256(blob).hexdigest() == digest, "release archive SHA-256 mismatch")
+
+    verify_source_against_main(sha, blob)
+    prepare_release(sha, digest, blob)
+    if previous == sha:
+        ready(sha)
+        print(f"ALREADY_ACTIVE {sha}", flush=True)
+        return
+
+    # Failed preflight cannot create pending state or restart live services.
+    run("nginx", "-t")
+    write_json(PENDING, {"previous": previous, "target": sha,
+                         "archiveSha256": digest})
     try:
-        deploy(sys.argv[1], sys.argv[2])
+        switch_to(sha)
+        restart()
+        ready(sha)
+        write_json(MANIFESTS / f"{sha}.json",
+                   {"sha": sha, "archiveSha256": digest, "status": "deployed"})
+        PENDING.unlink()
+        print(f"DEPLOYED {sha}; previous={previous}", flush=True)
+    except Exception as original:
+        print(f"Release failed; restoring {previous}: {original}", file=sys.stderr,
+              flush=True)
+        try:
+            switch_to(previous)
+            restart()
+            ready(previous)
+            PENDING.unlink()
+            print(f"ROLLED_BACK {previous}", file=sys.stderr, flush=True)
+        except Exception as recovery:
+            raise RuntimeError(
+                f"ROLLBACK_UNVERIFIED previous={previous}: {recovery}") from original
+        raise
+
+
+def deploy(sha: str, digest: str, blob: bytes) -> None:
+    """Offline test seam: activation with an explicitly supplied archive."""
+    with locked_release():
+        activate_locked(sha, digest, blob)
+
+
+def manual_release(sha: str) -> None:
+    """Real on-host entrypoint: rollback first, fetch only with lock held."""
+    with locked_release():
+        require(bool(SHA_RE.fullmatch(sha)), "exact lowercase main SHA required")
+        blob = manually_fetch_archive(sha)
+        activate_locked(sha, hashlib.sha256(blob).hexdigest(), blob)
+
+
+def main(argv: list[str]) -> None:
+    """The exact CLI path is regression-tested, not just recover_pending()."""
+    if len(argv) != 3 or argv[1] != "--manual":
+        raise SystemExit("usage: capture402-deploy --manual <40-hex-current-main-sha>")
+    manual_release(argv[2])
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv)
     except Exception as error:
         print(f"DEPLOY_BLOCKED: {error}", file=sys.stderr, flush=True)
         raise SystemExit(1) from error
