@@ -1,0 +1,232 @@
+"""Adversarial tests for the first migration and subsequent release transactions."""
+import base64
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import tarfile
+import tempfile
+import unittest
+from unittest import mock
+
+import deploy_demo as source
+import deploy_vps as host
+import launch_deploy as launcher
+
+OLD = 'a' * 40
+NEW = 'b' * 40
+
+
+class TransactionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.root = root
+        for module, values in (
+            (host, {'BASE': root, 'LEGACY': root/'legacy', 'STATE': root/'state',
+                    'PRIVATE': root/'private', 'SNIPPET': root/'nginx/snippet',
+                    'UNITS': root/'units', 'PENDING': root/'transaction.json',
+                    'MAINTENANCE': root/'maintenance', 'BACKUPS': root/'backups',
+                    'RECOVERY': root/'units/recovery.service', 'GATE': root/'units/gate.service'}),
+            (source, {'BASE': root, 'RELEASES': root/'releases', 'CURRENT': root/'current',
+                      'MANIFESTS': root/'manifests', 'PENDING': root/'old-pending.json'})):
+            for name, value in values.items():
+                patch = mock.patch.object(module, name, value)
+                patch.start(); self.addCleanup(patch.stop)
+        for directory in (host.LEGACY, host.STATE, host.PRIVATE, host.SNIPPET.parent, host.UNITS,
+                          source.RELEASES/NEW/'integration/deploy', source.RELEASES/OLD, source.MANIFESTS):
+            directory.mkdir(parents=True, exist_ok=True)
+        host.SNIPPET.write_bytes(b'# legacy TLS include\nlocation /api/ { return 404; }\n')
+        (source.RELEASES/NEW/'integration/deploy/nginx-resource.conf').write_bytes(b'location = /api/orders {\n}\n')
+        (host.STATE/'pending.json').write_bytes(b'{"state":"pending","wire":"original"}')
+        (host.STATE/'pending.json.busy').write_bytes(b'original reservation')
+        (host.PRIVATE/'key').write_bytes(b'private original key')
+        self.previous = {'sha': OLD, 'root': str(host.LEGACY), 'legacy': True}
+        self.calls = []
+        for name, value in (
+            ('active_layout', self.previous), ('ready', None), ('install_recovery', None),
+            ('backup', None)):
+            patch = mock.patch.object(host, name, return_value=value)
+            obj = patch.start(); self.addCleanup(patch.stop)
+            setattr(self, name + '_mock', obj)
+        for name, value in (('manually_fetch_archive', b'blob'), ('verify_source_against_main', None),
+                            ('prepare_release', None), ('archive_fingerprints', {}),
+                            ('check_unit_layout', None), ('restart', None)):
+            patch = mock.patch.object(source, name, return_value=value)
+            obj = patch.start(); self.addCleanup(patch.stop)
+            setattr(self, name + '_mock', obj)
+        def run(*args, **kwargs):
+            self.calls.append(args)
+            if 'ActiveState' in args: return 'inactive'
+            if 'MainPID' in args: return '0'
+            return ''
+        patch = mock.patch.object(source, 'run', side_effect=run)
+        self.run_mock = patch.start(); self.addCleanup(patch.stop)
+        patch = mock.patch.object(source.os, 'geteuid', return_value=0)
+        patch.start(); self.addCleanup(patch.stop)
+        self.before = host.inventory([host.PRIVATE, host.STATE])
+
+    def pending(self):
+        return {'previous': self.previous, 'target': NEW, 'controls': host.capture_controls(), 'current': None}
+
+    def assert_preserved(self):
+        self.assertEqual(host.inventory([host.PRIVATE, host.STATE]), self.before)
+
+    def test_first_migration_installs_route_and_units_in_one_transaction(self):
+        host.deploy(NEW)
+        self.assertEqual(source.current_sha(), NEW)
+        self.assertIn(b'location = /api/orders', host.SNIPPET.read_bytes())
+        for path in host.control_paths()[1:-1]:
+            self.assertIn(str(source.CURRENT).encode(), path.read_bytes())
+        self.assertFalse(host.PENDING.exists())
+        self.assertFalse(host.MAINTENANCE.exists())
+        self.assert_preserved()
+        self.assertEqual(json.loads((host.BASE/'last-result.json').read_text())['verdict'], 'DEPLOYED')
+
+    def test_public_nginx_misrouting_restores_legacy_units_and_original_state(self):
+        self.ready_mock.side_effect = [None, None, RuntimeError('nginx orders 404'), None, None]
+        with self.assertRaisesRegex(RuntimeError, 'verified rollback'):
+            host.deploy(NEW)
+        self.assertFalse(source.CURRENT.exists())
+        self.assertIn(b'location /api/ { return 404; }', host.SNIPPET.read_bytes())
+        self.assertTrue(host.SNIPPET.read_text().startswith(host.GUARD))
+        self.assertFalse(host.PENDING.exists())
+        self.assert_preserved()
+
+    def test_backup_failure_never_switches_source_and_rolls_back(self):
+        self.backup_mock.side_effect = RuntimeError('backup inventory mismatch')
+        with self.assertRaisesRegex(RuntimeError, 'verified rollback'):
+            host.deploy(NEW)
+        self.assertFalse(source.CURRENT.exists())
+        self.assert_preserved()
+
+    def test_rollback_failure_retains_pending_and_stops_services(self):
+        self.ready_mock.side_effect = [None, RuntimeError('failed startup'), RuntimeError('rollback delayed beyond deadline')]
+        with self.assertRaisesRegex(RuntimeError, 'ROLLBACK_UNVERIFIED'):
+            host.deploy(NEW)
+        self.assertTrue(host.PENDING.exists())
+        self.assertTrue(host.MAINTENANCE.exists())
+        self.assertEqual(self.calls[-1], ('systemctl', 'stop', *source.SERVICES))
+        self.assert_preserved()
+
+    def test_kill_between_pending_and_backup_recovers_without_network(self):
+        self.backup_mock.side_effect = KeyboardInterrupt()
+        with self.assertRaises(KeyboardInterrupt): host.deploy(NEW)
+        self.assertTrue(host.PENDING.exists())
+        self.manually_fetch_archive_mock.reset_mock()
+        host.main(['--recover'])
+        self.manually_fetch_archive_mock.assert_not_called()
+        self.assertFalse(host.PENDING.exists())
+        self.assertFalse(source.CURRENT.exists())
+        self.assert_preserved()
+
+    def test_kill_after_switch_recovery_restores_current_and_overrides(self):
+        self.ready_mock.side_effect = [None, KeyboardInterrupt()]
+        with self.assertRaises(KeyboardInterrupt): host.deploy(NEW)
+        self.assertEqual(source.current_sha(), NEW)
+        self.ready_mock.side_effect = None
+        host.main(['--recover'])
+        self.assertFalse(source.CURRENT.exists())
+        self.assert_preserved()
+
+    def test_recovery_failure_blocks_new_fetch(self):
+        source.write_json(host.PENDING, self.pending())
+        self.ready_mock.side_effect = RuntimeError('rollback failed')
+        with self.assertRaisesRegex(RuntimeError, 'ROLLBACK_UNVERIFIED'): host.deploy(NEW)
+        self.manually_fetch_archive_mock.assert_not_called()
+        self.assertTrue(host.PENDING.exists())
+        self.assertTrue(host.MAINTENANCE.exists())
+
+    def test_corrupt_verified_backup_fails_closed(self):
+        directory = host.BACKUPS/'original'; directory.mkdir(parents=True)
+        archive = directory/'preserved.tar'; archive.write_bytes(b'corrupted')
+        pending = self.pending()
+        pending['backup'] = {'path':str(archive), 'sha256': '0'*64}
+        source.write_json(host.PENDING, pending)
+        with self.assertRaisesRegex(RuntimeError, 'ROLLBACK_UNVERIFIED'): host.main(['--recover'])
+        self.restart_mock.assert_not_called()
+        self.assertTrue(host.PENDING.exists())
+
+    def test_service_that_did_not_stop_prevents_backup(self):
+        self.run_mock.side_effect = lambda *args, **kwargs: 'active' if 'ActiveState' in args else ''
+        with self.assertRaisesRegex(RuntimeError, 'ROLLBACK_UNVERIFIED'): host.deploy(NEW)
+        self.backup_mock.assert_not_called()
+        self.assertFalse(source.CURRENT.exists())
+
+    def test_versioned_failed_cutover_rolls_back_exact_previous_release(self):
+        source.CURRENT.symlink_to(source.RELEASES/OLD)
+        self.previous.update(root=str(source.RELEASES/OLD), legacy=False)
+        self.ready_mock.side_effect = [None, RuntimeError('startup failed'), None, None]
+        with self.assertRaisesRegex(RuntimeError, 'verified rollback'): host.deploy(NEW)
+        self.assertEqual(source.current_sha(), OLD)
+        self.assert_preserved()
+
+    def test_staged_source_tampering_blocks_before_downtime(self):
+        self.archive_fingerprints_mock.return_value = {'integration/deploy/nginx-resource.conf': ('file', '0'*64)}
+        with self.assertRaisesRegex(RuntimeError, 'staged source substituted'): host.deploy(NEW)
+        self.backup_mock.assert_not_called()
+        self.assertFalse(host.PENDING.exists())
+        self.assertNotIn(('systemctl', 'stop', *source.SERVICES), self.calls)
+
+
+    def test_boot_gate_blocks_public_routes_before_recovery(self):
+        source.write_json(host.PENDING, self.pending())
+        host.main(['--gate'])
+        self.assertTrue(host.MAINTENANCE.exists())
+        self.manually_fetch_archive_mock.assert_not_called()
+
+
+class BackupTests(unittest.TestCase):
+    def test_backup_round_trip_preserves_busy_symlinks_metadata_and_original_wires(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = Path(root); directory = base/'state'; directory.mkdir()
+            (directory/'wire.json').write_bytes(b'{"wire":"original"}')
+            (directory/'order.busy').write_bytes(b'original lock'); (directory/'order.busy').chmod(0o600)
+            (directory/'link').symlink_to('wire.json')
+            expected = host.inventory([directory])
+            archive = base/'backup.tar'
+            host.create_backup(archive, expected)
+            host.verify_backup(archive, expected)
+            (directory/'order.busy').write_bytes(b'tampered')
+            with self.assertRaisesRegex(RuntimeError, 'backup differs'):
+                host.verify_backup(archive, host.inventory([directory]))
+
+    def test_unverified_tar_bytes_do_not_count_as_backup(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root)/'bad.tar'; path.write_bytes(b'broken')
+            with self.assertRaises(tarfile.ReadError): host.verify_backup(path, {})
+
+
+class RetryTests(unittest.TestCase):
+    def test_delayed_startup_and_network_errors_are_retried(self):
+        with (mock.patch.object(host, 'health', side_effect=[ConnectionRefusedError(), RuntimeError('unprovisioned'), None]) as health,
+              mock.patch.object(host.time, 'sleep') as sleep):
+            host.ready({'sha': OLD})
+        self.assertEqual(health.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_rollback_readiness_deadline_is_bounded(self):
+        with (mock.patch.object(host, 'health', side_effect=RuntimeError('still booting')),
+              mock.patch.object(host.time, 'monotonic', side_effect=[0, 91]), mock.patch.object(host.time, 'sleep') as sleep):
+            with self.assertRaisesRegex(RuntimeError, 'readiness exhausted'): host.ready({'sha': OLD})
+        sleep.assert_not_called()
+
+
+class AcceptanceTests(unittest.TestCase):
+    def test_owner_second_account_and_stale_head_cannot_approve(self):
+        pull = {'merged_at':'today', 'merge_commit_sha': NEW, 'base': {'ref':'main'}, 'head':{'sha':OLD}, 'number':1}
+        for login, revision in [('gwinpin', OLD), ('starPaw', OLD), ('independent', NEW)]:
+            review = {'user':{'login':login, 'type':'User'}, 'state':'APPROVED', 'commit_id':revision}
+            with mock.patch.object(source, 'run', side_effect=[json.dumps([pull]), json.dumps([[review]])]):
+                with self.assertRaisesRegex(RuntimeError, 'independent exact-head'): launcher.require_acceptance(NEW)
+
+    def test_accepted_merge_must_preserve_reviewed_tree(self):
+        pull = {'merged_at':'today', 'merge_commit_sha': NEW, 'base':{'ref':'main'}, 'head':{'sha':OLD}, 'number':1}
+        review = {'user':{'login':'independent','type':'User'}, 'state':'APPROVED','commit_id':OLD}
+        with mock.patch.object(source, 'run', side_effect=[json.dumps([pull]), json.dumps([[review]]), '', 'conflict-change']):
+            with self.assertRaisesRegex(RuntimeError, 'merged tree differs'): launcher.require_acceptance(NEW)
+
+
+if __name__ == '__main__': unittest.main()
