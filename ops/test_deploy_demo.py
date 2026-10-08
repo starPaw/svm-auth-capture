@@ -298,7 +298,6 @@ class SwitchingTests(unittest.TestCase):
     def test_failed_activation_restores_old_version(self):
         payload = b"test compressed archive"
         digest = hashlib.sha256(payload).hexdigest()
-        stdin = types.SimpleNamespace(buffer=io.BytesIO(payload))
         with (mock.patch.object(cd.os, "geteuid", return_value=0),
               mock.patch.object(cd, "check_unit_layout"),
               mock.patch.object(cd, "verify_source_against_main"),
@@ -307,9 +306,9 @@ class SwitchingTests(unittest.TestCase):
               mock.patch.object(cd, "run", return_value=""),
               mock.patch.object(cd, "ready",
                                 side_effect=[RuntimeError("resource unhealthy"), None]),
-              mock.patch.object(cd.sys, "stdin", stdin)):
+):
             with self.assertRaisesRegex(RuntimeError, "resource unhealthy"):
-                cd.deploy(NEW, digest)
+                cd.deploy(NEW, digest, payload)
         self.assertEqual(cd.current_sha(), OLD)
         self.assertFalse(cd.PENDING.exists())
 
@@ -317,16 +316,15 @@ class SwitchingTests(unittest.TestCase):
     def test_failed_nginx_preflight_does_not_touch_current_services(self):
         payload = b"test archive"
         digest = hashlib.sha256(payload).hexdigest()
-        stdin = types.SimpleNamespace(buffer=io.BytesIO(payload))
         with (mock.patch.object(cd.os, "geteuid", return_value=0),
               mock.patch.object(cd, "check_unit_layout"),
               mock.patch.object(cd, "verify_source_against_main"),
               mock.patch.object(cd, "prepare_release"),
               mock.patch.object(cd, "restart") as restart,
               mock.patch.object(cd, "run", side_effect=RuntimeError("nginx -t failed")),
-              mock.patch.object(cd.sys, "stdin", stdin)):
+):
             with self.assertRaisesRegex(RuntimeError, "nginx -t failed"):
-                cd.deploy(NEW, digest)
+                cd.deploy(NEW, digest, payload)
         restart.assert_not_called()
         self.assertEqual(cd.current_sha(), OLD)
         self.assertFalse(cd.PENDING.exists())
@@ -343,15 +341,14 @@ class SwitchingTests(unittest.TestCase):
     def test_duplicate_exact_sha_no_restart(self):
         payload = b"test archive"
         digest = hashlib.sha256(payload).hexdigest()
-        stdin = types.SimpleNamespace(buffer=io.BytesIO(payload))
         with (mock.patch.object(cd.os, "geteuid", return_value=0),
               mock.patch.object(cd, "check_unit_layout"),
               mock.patch.object(cd, "verify_source_against_main"),
               mock.patch.object(cd, "prepare_release"),
               mock.patch.object(cd, "restart") as restart,
               mock.patch.object(cd, "ready"),
-              mock.patch.object(cd.sys, "stdin", stdin)):
-            cd.deploy(OLD, digest)
+):
+            cd.deploy(OLD, digest, payload)
         restart.assert_not_called()
         self.assertEqual(cd.current_sha(), OLD)
 
@@ -365,38 +362,74 @@ class SwitchingTests(unittest.TestCase):
 
 
 
-class FreePlanReleaseGateTests(unittest.TestCase):
-    """Manual GitHub Free private release cannot silently pretend environment approval."""
+class LocalManualReleaseTests(unittest.TestCase):
+    """No CI runner can deploy. The VPS operator must select current main."""
 
-    @classmethod
-    def setUpClass(cls):
-        cls.workflow = (
-            Path(__file__).resolve().parents[1] /
-            ".github/workflows/deploy-demo.yml"
-        ).read_text(encoding="utf-8")
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        patch = mock.patch.object(cd, "RELEASES", Path(self.tmp.name))
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.user = types.SimpleNamespace(
+            pw_uid=os.getuid(), pw_gid=os.getgid(), pw_dir=self.tmp.name)
 
-    def test_only_manual_dispatch_and_no_unavailable_environment(self):
-        self.assertIn("  workflow_dispatch:", self.workflow)
-        self.assertNotIn("    environment: devnet-demo", self.workflow)
-        self.assertNotIn("  push:", self.workflow)
+    def test_manual_fetch_rejects_unprivileged_invocation(self):
+        with mock.patch.object(cd.os, "geteuid", return_value=1000):
+            with self.assertRaisesRegex(RuntimeError, "authorized local sudo"):
+                cd.manually_fetch_archive(NEW)
 
-    def test_initial_and_rerun_actor_must_be_owner(self):
-        self.assertIn("github.actor == 'starPaw'", self.workflow)
-        self.assertIn("github.triggering_actor == 'starPaw'", self.workflow)
-        self.assertIn("github.ref == 'refs/heads/main'", self.workflow)
+    def test_manual_fetch_rejects_invalid_sha_before_clone(self):
+        with (mock.patch.object(cd.os, "geteuid", return_value=0),
+              mock.patch.object(cd, "clone_main") as clone):
+            with self.assertRaisesRegex(RuntimeError, "exact lowercase main SHA"):
+                cd.manually_fetch_archive("not-a-sha")
+            clone.assert_not_called()
 
-    def test_release_must_equal_dispatched_workflow_revision(self):
-        self.assertIn('[ "$GITHUB_SHA" == "$RELEASE_SHA" ]', self.workflow.replace("[[", "[").replace("]]", "]"))
-        self.assertIn('[[ "$current" == "$RELEASE_SHA" ]]', self.workflow)
-        self.assertIn('.event == "push"', self.workflow)
-        self.assertIn('SBF build and component checks', self.workflow)
-        self.assertIn('x402 integration, typecheck and wallet build', self.workflow)
+    def test_manual_fetch_produces_local_archive_of_exact_main(self):
+        expected = tar(FILES, compressed=False)
+        with (mock.patch.object(cd.os, "geteuid", return_value=0),
+              mock.patch.object(cd.pwd, "getpwnam", return_value=self.user),
+              mock.patch.object(cd.os, "chown"),
+              mock.patch.object(cd, "clone_main", return_value=Path(self.tmp.name)),
+              mock.patch.object(cd, "git_archive", return_value=expected)):
+            blob = cd.manually_fetch_archive(NEW)
+        self.assertEqual(cd.archive_fingerprints(blob, "r:gz"),
+                         cd.archive_fingerprints(expected, "r:"))
 
-    def test_restricted_ssh_deploy_still_enabled(self):
-        self.assertIn('StrictHostKeyChecking=yes', self.workflow)
-        self.assertIn('IdentitiesOnly=yes', self.workflow)
-        self.assertIn('"capture402-deploy@$DEPLOY_HOST"', self.workflow)
-        self.assertIn("secrets.CAPTURE402_DEPLOY_SSH_KEY", self.workflow)
+    def test_manual_fetch_rejects_unsafe_source_tar(self):
+        invalid = tar(FILES, link=True, compressed=False)
+        with (mock.patch.object(cd.os, "geteuid", return_value=0),
+              mock.patch.object(cd.pwd, "getpwnam", return_value=self.user),
+              mock.patch.object(cd.os, "chown"),
+              mock.patch.object(cd, "clone_main", return_value=Path(self.tmp.name)),
+              mock.patch.object(cd, "git_archive", return_value=invalid)):
+            with self.assertRaisesRegex(RuntimeError, "unsupported Git object"):
+                cd.manually_fetch_archive(NEW)
+
+    def test_failed_stale_main_clone_does_not_create_archive(self):
+        with (mock.patch.object(cd.os, "geteuid", return_value=0),
+              mock.patch.object(cd.pwd, "getpwnam", return_value=self.user),
+              mock.patch.object(cd.os, "chown"),
+              mock.patch.object(cd, "source_ssh_command", return_value="ssh pinned"),
+              mock.patch.object(cd, "run", side_effect=["", OLD]),
+              mock.patch.object(cd, "git_archive") as archive):
+            with self.assertRaisesRegex(RuntimeError, "does not match approved SHA"):
+                cd.manually_fetch_archive(NEW)
+            archive.assert_not_called()
+
+    def test_no_workflow_or_remote_deploy_entrypoint(self):
+        root = Path(__file__).resolve().parents[1]
+        self.assertFalse((root / ".github/workflows/deploy-demo.yml").exists())
+        self.assertFalse((root / "ops/ssh-deploy.sh").exists())
+
+    def test_manual_deploy_root_validates_exact_digest_before_restart(self):
+        with (mock.patch.object(cd.os, "geteuid", return_value=0),
+              mock.patch.object(cd, "check_unit_layout"),
+              mock.patch.object(cd, "restart") as restart):
+            with self.assertRaisesRegex(RuntimeError, "archive SHA-256 mismatch"):
+                cd.deploy(NEW, "0" * 64, b"artifact")
+            restart.assert_not_called()
 
 
 if __name__ == "__main__":
