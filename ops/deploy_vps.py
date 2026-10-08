@@ -380,8 +380,11 @@ WantedBy=multi-user.target
 def stop():
     source.run('systemctl', 'stop', *source.SERVICES, timeout=45)
     for service in source.SERVICES:
-        source.require(source.run('systemctl', 'show', '-p', 'ActiveState', '--value', service) == 'inactive'
-                       and source.run('systemctl', 'show', '-p', 'MainPID', '--value', service) == '0',
+        # A failed boot (e.g. interrupted WorkingDirectory installation) retains
+        # failed state after stop. It is quiesced only with BOTH process IDs zero.
+        source.require(source.run('systemctl', 'show', '-p', 'ActiveState', '--value', service) in ('inactive', 'failed')
+                       and source.run('systemctl', 'show', '-p', 'MainPID', '--value', service) == '0'
+                       and source.run('systemctl', 'show', '-p', 'ControlPID', '--value', service) == '0',
                        'service did not quiesce; no backup or cutover permitted')
 
 

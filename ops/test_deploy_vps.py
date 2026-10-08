@@ -60,7 +60,7 @@ class TransactionTests(unittest.TestCase):
         def run(*args, **kwargs):
             self.calls.append(args)
             if 'ActiveState' in args: return 'inactive'
-            if 'MainPID' in args: return '0'
+            if 'MainPID' in args or 'ControlPID' in args: return '0'
             if 'Requires' in args: return host.GATE.name
             return ''
         patch = mock.patch.object(source, 'run', side_effect=run)
@@ -161,6 +161,20 @@ class TransactionTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'ROLLBACK_UNVERIFIED'): host.deploy(NEW)
         self.backup_mock.assert_not_called()
         self.assertFalse(source.CURRENT.exists())
+
+    def test_failed_unit_with_no_main_or_control_process_can_be_recovered(self):
+        self.run_mock.side_effect = lambda *args, **kwargs: 'failed' if 'ActiveState' in args else '0'
+        host.stop()
+        self.assert_preserved()
+
+    def test_failed_unit_with_a_live_control_process_blocks_backup(self):
+        def run(*args, **kwargs):
+            if 'ActiveState' in args: return 'failed'
+            if 'ControlPID' in args: return '123'
+            return '0'
+        self.run_mock.side_effect = run
+        with self.assertRaisesRegex(RuntimeError, 'service did not quiesce'): host.stop()
+        self.backup_mock.assert_not_called()
 
     def test_versioned_failed_cutover_rolls_back_exact_previous_release(self):
         source.CURRENT.symlink_to(source.RELEASES/OLD)
