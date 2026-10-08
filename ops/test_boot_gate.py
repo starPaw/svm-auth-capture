@@ -187,6 +187,10 @@ http {{ access_log off; server {{ listen 127.0.0.1:{cfg['publicPort']}; include 
         try:
             if hasattr(self,'cfg'):
                 names=[host.RECOVERY.name,host.GATE.name,*[s+'.service' for s in (*source.SERVICES,host.NGINX_SERVICE)]]
+                result = getattr(self._outcome, 'result', None)
+                if result and any(case is self for case, _ in result.failures + result.errors):
+                    journal = subprocess.run(['journalctl','--no-pager','-n','120',*[a for name in names for a in ('-u',name)]],capture_output=True,text=True,timeout=10)
+                    print(journal.stdout, flush=True)  # Fixtures contain no credentials/payment data.
                 subprocess.run(['systemctl','stop',*names],capture_output=True,timeout=20)
                 # Names were randomized and are confined to /run/systemd/system.
                 for name in names:
@@ -201,7 +205,7 @@ http {{ access_log off; server {{ listen 127.0.0.1:{cfg['publicPort']}; include 
             source.run=NATIVE_RUN
             self.tmp.cleanup()
 
-    def boot(self, failed=False):
+    def boot(self, failed=False, partial=False):
         source.run('systemctl','stop',*source.SERVICES,host.NGINX_SERVICE,host.GATE.name)
         source.write_json(host.PENDING,self.snapshot)
         result=subprocess.run(['systemctl','start','--no-block',*[s+'.service' for s in (*source.SERVICES,host.NGINX_SERVICE)],host.RECOVERY.name],capture_output=True,text=True,timeout=10)
@@ -212,11 +216,16 @@ http {{ access_log off; server {{ listen 127.0.0.1:{cfg['publicPort']}; include 
             self.assertFalse(any('-start' in s and not s.startswith('gate-') and not s.startswith('recovery-')
                                  for s in (self.root/'events.log').read_text().splitlines()))
             return
+        expected = ('resource-start','nginx-start','recovery-start')
+        if not partial: expected += ('facilitator-start',)
         wait_for(lambda: all(name in (self.root/'events.log').read_text().splitlines()
-                            for name in ('resource-start','facilitator-start','nginx-start','recovery-start')))
+                            for name in expected))
         events=(self.root/'events.log').read_text().splitlines()
         for name in ('resource-start','facilitator-start','nginx-start','recovery-start'):
-            self.assertLess(events.index('gate-closed'),events.index(name),events)
+            # A partial candidate override can prevent a backend entrypoint
+            # from running. Any process that starts must follow the gate.
+            if name in events:
+                self.assertLess(events.index('gate-closed'),events.index(name),events)
         wait_for(lambda: request(self.cfg['publicPort'])==503)
         for _ in range(10):
             self.assertEqual(request(self.cfg['publicPort']),503)
@@ -283,7 +292,7 @@ http {{ access_log off; server {{ listen 127.0.0.1:{cfg['publicPort']}; include 
             if path==host.control_paths()[1]: raise KeyboardInterrupt()
         with mock.patch.object(host,'atomic_bytes',side_effect=interrupted):
             with self.assertRaises(KeyboardInterrupt): host.install_controls('b'*40)
-        self.boot(); self.recover()
+        self.boot(partial=True); self.recover()
 
     def test_interruption_after_restoring_legacy_snippet(self):
         # Retained snapshots from the original helper may be unguarded.
