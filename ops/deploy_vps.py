@@ -216,8 +216,11 @@ def backup(transaction):
     directory = BACKUPS / transaction
     directory.mkdir(mode=0o700)
     roots = [PRIVATE, STATE, LEGACY, Path('/etc/nginx')]
-    roots += [UNITS / (s + '.service') for s in source.SERVICES]
-    roots += [UNITS / (s + '.service.d') for s in source.SERVICES]
+    if source.CURRENT.is_symlink():
+        source.release_name(source.CURRENT)
+        roots.append(source.CURRENT.resolve(strict=True))
+    roots += [UNITS / (s + '.service') for s in (*source.SERVICES, 'nginx')]
+    roots += [UNITS / (s + '.service.d') for s in (*source.SERVICES, 'nginx')]
     expected = inventory(roots)
     archive = directory / 'preserved.tar'
     create_backup(archive, expected)
@@ -354,6 +357,7 @@ def locked(recovery_only=False):
     BASE.mkdir(mode=0o755, exist_ok=True)
     for directory in (source.RELEASES, source.MANIFESTS): directory.mkdir(exist_ok=True)
     BACKUPS.mkdir(mode=0o700, exist_ok=True)
+    BACKUPS.chmod(0o700)
     fd = os.open(BASE / 'deploy.lock', os.O_CREAT | os.O_RDWR, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
