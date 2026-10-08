@@ -338,11 +338,14 @@ def clone_main(sha: str, root: Path, user: pwd.struct_passwd) -> Path:
     repo = root / "repository"
     run("runuser", "-u", "capture402-deploy", "--", "/usr/bin/env", "-i",
         f"HOME={user.pw_dir}", "PATH=/usr/bin:/bin", "GIT_TERMINAL_PROMPT=0",
+        "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null",
         "/usr/bin/git", "-c", "credential.helper=",
         "-c", f"core.sshCommand={ssh_command}", "clone", "--depth=1",
         "--single-branch", "--branch=main", "--no-checkout",
         SOURCE_REMOTE, str(repo), timeout=180)
-    live = run("runuser", "-u", "capture402-deploy", "--",
+    live = run("runuser", "-u", "capture402-deploy", "--", "/usr/bin/env", "-i",
+               f"HOME={user.pw_dir}", "PATH=/usr/bin:/bin",
+               "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null",
                "git", "rev-parse", "HEAD", cwd=repo)
     require(live == sha, "remote canonical main does not match approved SHA")
     return repo
@@ -351,8 +354,10 @@ def clone_main(sha: str, root: Path, user: pwd.struct_passwd) -> Path:
 def git_archive(repo: Path, sha: str) -> bytes:
     """An archive of the exact commit, excluding workflow code and any secrets."""
     return subprocess.run(
-        ["runuser", "-u", "capture402-deploy", "--", "git", "archive",
-         "--format=tar", sha, "integration", RECORD],
+        ["runuser", "-u", "capture402-deploy", "--", "/usr/bin/env", "-i",
+         f"HOME={pwd.getpwnam('capture402-deploy').pw_dir}", "PATH=/usr/bin:/bin",
+         "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null",
+         "git", "archive", "--format=tar", sha, "integration", RECORD],
         cwd=repo, capture_output=True, check=True, timeout=90,
     ).stdout
 
