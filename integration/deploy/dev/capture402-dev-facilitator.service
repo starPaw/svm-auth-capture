@@ -19,6 +19,7 @@ Nice=10
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
+ProtectProc=invisible
 PrivateTmp=true
 PrivateDevices=true
 ProtectKernelTunables=true

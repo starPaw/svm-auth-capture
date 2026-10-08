@@ -9,6 +9,7 @@ import secrets
 
 
 ASSETS = Path(__file__).resolve().parents[1] / 'integration/deploy/dev'
+PROJECT = Path(__file__).resolve().parents[1]
 def hostname(value):
     if len(value) > 253 or not re.fullmatch(r'(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}', value):
         raise ValueError('a plain lower-case DNS hostname is required')
@@ -43,6 +44,11 @@ def write_assets(output, files):
         with destination.open('x') as file:
             file.write(content)
         destination.chmod(0o600)
+
+
+def validate_private_output(output):
+    if output.resolve().is_relative_to(PROJECT.resolve()):
+        raise ValueError('private generated environment must be outside the Git checkout')
 
 
 def verify_layout(files):
@@ -105,6 +111,7 @@ def main():
     files = render(args.hostname, args.tester_network)
     verify_layout(files)
     if args.private_identities:
+        validate_private_output(args.output)
         identities = json.loads(args.private_identities.read_text())
         files.update(private_environments(args.hostname, identities, secrets.token_urlsafe(48), secrets.token_urlsafe(48)))
     write_assets(args.output, files)

@@ -42,14 +42,19 @@ export function prepareKeys(directory: string): Record<string, string> {
   return identities;
 }
 
-async function context() {
+async function rpcContext() {
   const record = loadDeploymentRecord(RECORD);
   const ledger = new RpcLedger({ deployment: record, network: record.network.caip2, genesisHash: record.network.genesisHash,
     rpcUrl: RPC_URL, confirmTimeoutMs: 90_000 });
   await ledger.verifyGenesis();
+  return { record, ledger, rpc: createSolanaRpc(RPC_URL) };
+}
+
+async function context() {
+  const { record, ledger, rpc } = await rpcContext();
   const [sponsor, merchant, payer, mint] = await Promise.all(ROLES.map(role => loadKeypair(join(PRIVATE, "keys", `${role}.json`))));
   if (new Set([sponsor!.address, merchant!.address, payer!.address, mint!.address]).size !== 4) throw new Error("distinct dev identities required");
-  return { record, ledger, rpc: createSolanaRpc(RPC_URL), sponsor: sponsor!, merchant: merchant!, payer: payer!, mint: mint! };
+  return { record, ledger, rpc, sponsor: sponsor!, merchant: merchant!, payer: payer!, mint: mint! };
 }
 
 async function fund(): Promise<void> {
@@ -102,16 +107,17 @@ async function prepareAsset(): Promise<void> {
 }
 
 async function observe(): Promise<void> {
-  const c = await context();
+  const { ledger, rpc } = await rpcContext();
+  const identities = JSON.parse(readFileSync(join(PRIVATE, "identities.json"), "utf8")) as Record<string, import("@solana/kit").Address>;
   const signatures: Signature[] = [];
   for (const name of ["funding-response", "asset-preparation"]) {
     const file = join(SETUP, `${name}.json`);
     if (existsSync(file)) signatures.push(JSON.parse(readFileSync(file, "utf8")).signature as Signature);
   }
-  const statuses = signatures.length ? await c.rpc.getSignatureStatuses(signatures, { searchTransactionHistory: true })
+  const statuses = signatures.length ? await rpc.getSignatureStatuses(signatures, { searchTransactionHistory: true })
     .send({ abortSignal: AbortSignal.timeout(10_000) }) : null;
-  console.log(JSON.stringify({ sponsor: c.sponsor.address, payer: c.payer.address, merchant: c.merchant.address, mint: c.mint.address,
-    sponsorLamports: String((await c.ledger.getAccount(c.sponsor.address))?.lamports ?? 0n),
+  console.log(JSON.stringify({ ...identities,
+    sponsorLamports: String((await ledger.getAccount(identities.sponsor!))?.lamports ?? 0n),
     originalSignatures: signatures, statuses }, (_key, value) => typeof value === "bigint" ? value.toString() : value));
 }
 

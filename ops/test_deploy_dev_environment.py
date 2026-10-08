@@ -2,11 +2,19 @@
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 import dev_environment as dev
 
 
 class DevEnvironmentTests(unittest.TestCase):
+    def test_private_generation_cannot_write_secrets_into_git(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(dev, 'PROJECT', root/'checkout'):
+                with self.assertRaises(ValueError): dev.validate_private_output(root/'checkout/private')
+                dev.validate_private_output(root/'operator-private')
+
     def test_private_environment_binds_only_dev_roles_and_separate_credentials(self):
         identities = {role: char*32 for role, char in zip(['sponsor', 'merchant', 'payer', 'mint'], '1234')}
         files = dev.private_environments('dev.capture402.xyz', identities, 'f'*64, 'm'*64)
