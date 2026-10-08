@@ -352,6 +352,18 @@ def clone_main(sha: str, root: Path, user: pwd.struct_passwd) -> Path:
     return repo
 
 
+def require_current_main(sha: str) -> None:
+    """Refresh canonical identity after staging and immediately before cutover."""
+    user = pwd.getpwnam('capture402-deploy')
+    ssh_command = source_ssh_command(user)
+    remote = run('runuser', '-u', 'capture402-deploy', '--', '/usr/bin/env', '-i',
+                 f'HOME={user.pw_dir}', 'PATH=/usr/bin:/bin', 'GIT_TERMINAL_PROMPT=0',
+                 'GIT_CONFIG_NOSYSTEM=1', 'GIT_CONFIG_GLOBAL=/dev/null',
+                 'git', '-c', 'credential.helper=', '-c', f'core.sshCommand={ssh_command}',
+                 'ls-remote', '--exit-code', SOURCE_REMOTE, 'refs/heads/main', timeout=20)
+    require(remote == sha + '\trefs/heads/main', 'canonical main changed before cutover')
+
+
 def git_archive(repo: Path, sha: str) -> bytes:
     """An archive of the exact commit, excluding workflow code and any secrets."""
     return subprocess.run(

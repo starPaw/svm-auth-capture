@@ -54,7 +54,7 @@ class TransactionTests(unittest.TestCase):
             setattr(self, name + '_mock', obj)
         for name, value in (('manually_fetch_archive', b'blob'), ('verify_source_against_main', None),
                             ('prepare_release', None), ('archive_fingerprints', {}),
-                            ('check_unit_layout', None), ('restart', None)):
+                            ('check_unit_layout', None), ('restart', None), ('require_current_main', None)):
             patch = mock.patch.object(source, name, return_value=value)
             obj = patch.start(); self.addCleanup(patch.stop)
             setattr(self, name + '_mock', obj)
@@ -100,6 +100,24 @@ class TransactionTests(unittest.TestCase):
         self.assertFalse(source.CURRENT.exists())
         self.assertIn(b'location /api/ { return 404; }', host.SNIPPET.read_bytes())
         self.assertTrue(host.SNIPPET.read_text().startswith(host.GUARD))
+        self.assertFalse(host.PENDING.exists())
+        self.assert_preserved()
+
+    def test_main_advance_after_staging_does_not_stop_services(self):
+        self.require_current_main_mock.side_effect = RuntimeError('main advanced')
+        with self.assertRaisesRegex(RuntimeError, 'main advanced'): host.deploy(NEW)
+        self.backup_mock.assert_not_called()
+        self.assertFalse(host.PENDING.exists())
+        self.assertNotIn(('systemctl', 'stop', *source.SERVICES), self.calls)
+
+    def test_diagnostic_disk_failure_does_not_skip_rollback(self):
+        self.restart_mock.side_effect = [RuntimeError('startup failed'), None]
+        original = source.write_json
+        def write(path, value):
+            if path.name == 'last-failure.json': raise OSError('disk unavailable')
+            original(path, value)
+        with mock.patch.object(source, 'write_json', side_effect=write):
+            with self.assertRaisesRegex(RuntimeError, 'verified rollback'): host.deploy(NEW)
         self.assertFalse(host.PENDING.exists())
         self.assert_preserved()
 

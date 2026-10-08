@@ -248,7 +248,8 @@ def create_backup(archive, expected):
 def backup(transaction):
     directory = BACKUPS / transaction
     directory.mkdir(mode=0o700)
-    roots = [PRIVATE, STATE, LEGACY, Path('/etc/nginx')]
+    roots = [PRIVATE, STATE, LEGACY, Path('/etc/nginx'), Path('/etc/capture402'),
+             Path('/usr/local/sbin/capture402'), Path('/usr/local/sbin/capture402-deploy')]
     if source.CURRENT.is_symlink():
         source.release_name(source.CURRENT)
         roots.append(source.CURRENT.resolve(strict=True))
@@ -621,6 +622,7 @@ def deploy(sha):
             if kind == 'file':
                 p = source.RELEASES / sha / name
                 source.require(not p.is_symlink() and digest_file(p) == fingerprint, 'staged source substituted')
+        source.require_current_main(sha)
         migration = migration_snapshot(previous)
         if previous['sha'] == sha and not previous['legacy'] and migration is None:
             ready({**previous, 'merchantReady': True})
@@ -637,7 +639,11 @@ def deploy(sha):
         try:
             maintenance()
             # Prepared legacy guard also blocks requests on reboot during backup.
+            pending['stage'] = 'quiescing'
+            source.write_json(PENDING, pending)
             stop()
+            pending['stage'] = 'backup'
+            source.write_json(PENDING, pending)
             pending['backup'] = backup(sha + '-' + str(time.time_ns()))
             source.write_json(PENDING, pending)
             preserved = inventory([PRIVATE, STATE])
@@ -648,6 +654,7 @@ def deploy(sha):
             source.require(set(after) - set(preserved) <= {str(PRIVATE / 'merchant.env').lstrip('/')},
                            'unexpected private state added')
             preserved = after
+            source.require_current_main(sha)
             pending['stage'] = 'controls'
             source.write_json(PENDING, pending)
             migrate_services(migration)
@@ -665,8 +672,11 @@ def deploy(sha):
             durable_remove(PENDING)
             print('DEPLOYED ' + sha, flush=True)
         except Exception as original:
-            source.write_json(BASE / 'last-failure.json', {'target': sha, 'stage': pending['stage'],
-                              'errorType': type(original).__name__})
+            try:
+                source.write_json(BASE / 'last-failure.json', {'target': sha, 'stage': pending['stage'],
+                                  'errorType': type(original).__name__})
+            except OSError:
+                pass  # Diagnostic storage failure must not prevent rollback.
             try:
                 rollback(pending)
             except Exception as exc:
