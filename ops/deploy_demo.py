@@ -506,8 +506,8 @@ def deploy(sha: str, digest: str, blob: bytes) -> None:
 
 def manual_release(sha: str) -> None:
     """Real on-host entrypoint: rollback first, fetch only with lock held."""
-    require(bool(SHA_RE.fullmatch(sha)), "exact lowercase main SHA required")
     with locked_release():
+        require(bool(SHA_RE.fullmatch(sha)), "exact lowercase main SHA required")
         blob = manually_fetch_archive(sha)
         activate_locked(sha, hashlib.sha256(blob).hexdigest(), blob)
 
