@@ -18,6 +18,7 @@ from pathlib import Path, PurePosixPath
 import pwd
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -39,6 +40,12 @@ MAX_ARCHIVE = 75 * 1024 * 1024
 MAX_UNPACKED = 180 * 1024 * 1024
 MAX_MEMBERS = 14000
 MAX_TAR_STREAM = 256 * 1024 * 1024
+
+# A repository-scoped READ-ONLY GitHub deploy key, held on the VPS only.
+# This key is unrelated to Actions -> VPS SSH or Solana economic authorities.
+SOURCE_KEY = Path("/home/capture402-deploy/.ssh/github-source-readonly")
+SOURCE_KNOWN_HOSTS = Path("/etc/capture402/github_known_hosts")
+SOURCE_REMOTE = "ssh://git@github.com/starPaw/svm-auth-capture.git"
 
 
 def require(condition: bool, message: str) -> None:
@@ -288,22 +295,60 @@ def archive_fingerprints(blob: bytes, mode: str) -> dict[str, tuple[str, str]]:
     return output
 
 
-def verify_source_against_main(sha: str, blob: bytes) -> None:
-    """Prevent a stolen SSH deploy key from substituting executable source bytes.
+def source_ssh_command(user: pwd.struct_passwd, *, hosts_owner_uid: int = 0) -> str:
+    """Use exactly one repository-scoped key and independently pinned GitHub host.
 
-    Independently shallow-clone public main *on the VPS*, require its HEAD equals
-    the intended SHA, and compare every archived file to the received artifact.
+    Fail closed if a secret is absent, world-readable, substituted by a
+    symlink, or if the trusted host pin is writable by the deploy user.
+    """
+    require(SOURCE_KEY.is_file() and not SOURCE_KEY.is_symlink(),
+            "private GitHub source deploy key missing or unsafe")
+    key_info = SOURCE_KEY.lstat()
+    require(stat.S_ISREG(key_info.st_mode) and key_info.st_uid == user.pw_uid
+            and (key_info.st_mode & 0o077) == 0,
+            "source deploy key must be owned by deploy user and private (0600)")
+    require(SOURCE_KNOWN_HOSTS.is_file() and not SOURCE_KNOWN_HOSTS.is_symlink(),
+            "root-pinned GitHub known_hosts missing or unsafe")
+    hosts_info = SOURCE_KNOWN_HOSTS.lstat()
+    require(stat.S_ISREG(hosts_info.st_mode)
+            and hosts_info.st_uid == hosts_owner_uid
+            and (hosts_info.st_mode & 0o022) == 0,
+            "GitHub host key pin must be root-owned and not writable by deploy user")
+    require(bool(SOURCE_KNOWN_HOSTS.read_text().strip()),
+            "empty GitHub host key pin")
+    return (
+        "ssh -F /dev/null"
+        f" -i {SOURCE_KEY}"
+        " -o BatchMode=yes -o IdentitiesOnly=yes -o IdentityAgent=none"
+        " -o StrictHostKeyChecking=yes"
+        f" -o UserKnownHostsFile={SOURCE_KNOWN_HOSTS}"
+        " -o GlobalKnownHostsFile=/dev/null -o UpdateHostKeys=no"
+        " -o ForwardAgent=no -o ClearAllForwardings=yes"
+        " -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no"
+        " -o ConnectTimeout=10"
+    )
+
+
+def verify_source_against_main(sha: str, blob: bytes) -> None:
+    """Verify a private GitHub main checkout independently of the upload.
+
+    Clone as the unprivileged deploy user using a VPS-only, repository-scoped
+    read-only GitHub key. Root-owned known_hosts prevents key substitution by
+    the deploy account. Require exact current main SHA and byte-exact archive
+    parity before activating any release.
     """
     user = pwd.getpwnam("capture402-deploy")
+    ssh_command = source_ssh_command(user)
     temp = Path(tempfile.mkdtemp(prefix=".verify-", dir=RELEASES))
     try:
         os.chown(temp, user.pw_uid, user.pw_gid)
         repo = temp / "repository"
-        run("runuser", "-u", "capture402-deploy", "--", "/usr/bin/env",
-            "git", "-c", "credential.helper=", "clone", "--depth=1",
+        run("runuser", "-u", "capture402-deploy", "--", "/usr/bin/env", "-i",
+            f"HOME={user.pw_dir}", "PATH=/usr/bin:/bin", "GIT_TERMINAL_PROMPT=0",
+            "/usr/bin/git", "-c", "credential.helper=",
+            "-c", f"core.sshCommand={ssh_command}", "clone", "--depth=1",
             "--single-branch", "--branch=main", "--no-checkout",
-            "https://github.com/starPaw/svm-auth-capture.git", str(repo),
-            timeout=180)
+            SOURCE_REMOTE, str(repo), timeout=180)
         live = run("runuser", "-u", "capture402-deploy", "--",
                    "git", "rev-parse", "HEAD", cwd=repo)
         require(live == sha, "remote canonical main does not match approved SHA")
@@ -317,6 +362,7 @@ def verify_source_against_main(sha: str, blob: bytes) -> None:
                 "received artifact differs from exact GitHub main tree")
     finally:
         shutil.rmtree(temp)
+
 
 def chown_tree(root: Path, uid: int, gid: int) -> None:
     # Never follow npm-created .bin symlinks. Root is owner after final sealing.
