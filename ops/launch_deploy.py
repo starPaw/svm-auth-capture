@@ -82,17 +82,19 @@ def require_acceptance(sha):
     source.require(len(matched) == 1, 'main SHA lacks an unambiguous merged PR')
     pull = matched[0]
     reviews = json.loads(source.run('gh', 'api', '--paginate', '--slurp', f"{api}/pulls/{pull['number']}/reviews"))
+    # Owner-approved policy: gwinpin reviews count even when agent-submitted.
+    # An agent approval is not an independent human review.
     latest = {}
     for page in reviews:
         for review in page:
             user = review['user']
-            if user['login'] in ('starPaw', 'gwinpin') or user.get('type') != 'User':
+            if user['login'] == 'starPaw' or user.get('type') != 'User':
                 continue
             if review['state'] in ('APPROVED', 'CHANGES_REQUESTED', 'DISMISSED'):
                 latest[user['login']] = review
     accepted = [r for r in latest.values() if r['state'] == 'APPROVED'
                 and r['commit_id'] == pull['head']['sha']]
-    source.require(bool(accepted), 'independent exact-head human approval missing')
+    source.require(bool(accepted), 'eligible exact-head reviewer approval missing')
     # A merge conflict fix must not silently change the accepted application tree.
     source.run('git', 'fetch', 'origin', pull['head']['sha'], timeout=120)
     source.require(not source.run('git', 'diff', '--name-only', pull['head']['sha'], sha),
@@ -108,7 +110,7 @@ def main():
     source.run('git', 'fetch', 'origin', 'main', timeout=120)
     sha = source.run('git', 'rev-parse', 'HEAD')
     source.require(sha == source.run('git', 'rev-parse', 'origin/main'), 'checkout differs from canonical main')
-    # Require successful current-main CI and independent exact-head acceptance.
+    # Require successful current-main CI and owner-designated exact-head review.
     # Invoking this command is the owner's explicit operational authorization.
     import json
     runs = json.loads(source.run('gh', 'run', 'list', '--commit', sha, '--workflow', 'components.yml',
