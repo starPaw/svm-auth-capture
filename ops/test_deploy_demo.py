@@ -385,6 +385,7 @@ class LocalManualReleaseTests(unittest.TestCase):
         releases = root / "releases"
         releases.mkdir()
         (releases / OLD).mkdir()
+        (releases / NEW).mkdir()
         manifests = root / "manifests"
         manifests.mkdir()
         (root / "current").symlink_to(releases / OLD)
