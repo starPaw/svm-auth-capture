@@ -365,9 +365,21 @@ class LocalManualReleaseTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        patch = mock.patch.object(cd, "RELEASES", Path(self.tmp.name))
-        patch.start()
-        self.addCleanup(patch.stop)
+        root = Path(self.tmp.name)
+        releases = root / "releases"
+        releases.mkdir()
+        (releases / OLD).mkdir()
+        manifests = root / "manifests"
+        manifests.mkdir()
+        (root / "current").symlink_to(releases / OLD)
+        for name, value in (
+            ("BASE", root), ("RELEASES", releases),
+            ("MANIFESTS", manifests), ("CURRENT", root / "current"),
+            ("PENDING", root / "pending.json"),
+        ):
+            patch = mock.patch.object(cd, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
         self.user = types.SimpleNamespace(
             pw_uid=os.getuid(), pw_gid=os.getgid(), pw_dir=self.tmp.name)
 
