@@ -34,7 +34,7 @@ beforeEach(async () => {
 });
 afterEach(async () => { await h.close(); });
 async function offer(scenario = "normal"): Promise<Session> {
-  const r = await app.request(`${origin}/resource?payer=${h.payer.address}&scenario=${scenario}`);
+  const r = await app.request(`${origin}/api/orders`, { method: "POST", headers: { origin, "content-type": "application/json" }, body: JSON.stringify({ payer: h.payer.address, scenario }) });
   expect(r.status).toBe(402);
   const required = decodeHeader(r.headers.get("PAYMENT-REQUIRED")!) as PaymentRequired;
   expect(required.accepts[0]!.amount).toBe("100000000");
@@ -54,6 +54,96 @@ async function expectAction(s: Session, a: string) {
   expect(body, JSON.stringify(body)).toMatchObject({ receipt: { success: true } }); expect(r.status).toBe(200);
   expect(decodeHeader(r.headers.get("PAYMENT-RESPONSE")!)).toMatchObject({ success: true, transaction: body.receipt.transaction });
 }
+describe("read-only discovery and same-origin order preparation", () => {
+  test.each(["", "?payer=invalid&scenario=invalid", "?payer=public-wallet&scenario=normal"])("GET /resource%s only discovers x402 requirements", async query => {
+    const reads = vi.spyOn(c.orders, "read"), writes = vi.spyOn(c.orders, "create");
+    const latest = vi.spyOn(c, "getLatestBlockhash"), simulate = vi.spyOn(c.ledger, "simulate");
+    const response = await app.request(`${origin}/resource${query}`, { headers: { "sec-fetch-site": "cross-site" } });
+    expect(response.status).toBe(402);
+    const required = decodeHeader(response.headers.get("PAYMENT-REQUIRED")!);
+    expect(required).toMatchObject({ x402Version: 2, accepts: [{ amount: "100000000" }] });
+    expect(await response.json()).toEqual(required);
+    expect(response.headers.get("set-cookie")).toBeNull();
+    for (const call of [reads, writes, latest, simulate]) expect(call).not.toHaveBeenCalled();
+    expect(readdirSync(c.orders.dir)).toEqual([]);
+    expect(h.ledger.submissions).toHaveLength(0);
+  });
+  test.each([undefined, "null", "https://attacker.invalid", `${origin}/`, `${origin}.attacker.invalid`, `${origin}:80`, `${origin}, https://attacker.invalid`])("order preparation rejects Origin %s before side effects", async suppliedOrigin => {
+    const headers: Record<string,string> = { "content-type": "application/json" };
+    if (suppliedOrigin !== undefined) headers.origin = suppliedOrigin;
+    const now = vi.spyOn(c, "now"), latest = vi.spyOn(c, "getLatestBlockhash"), simulate = vi.spyOn(c.ledger, "simulate");
+    const response = await app.request(`${origin}/api/orders`, { method: "POST", headers, body: JSON.stringify({ payer: h.payer.address }) });
+    expect(response.status).toBe(403); expect(response.headers.get("set-cookie")).toBeNull();
+    for (const call of [now, latest, simulate]) expect(call).not.toHaveBeenCalled();
+    expect(readdirSync(c.orders.dir)).toEqual([]); expect(h.ledger.submissions).toHaveLength(0);
+  });
+  test.each([
+    [undefined, '{}', 415], ["text/plain", '{}', 415], ["application/x-www-form-urlencoded", 'payer=wallet', 415],
+    ["application/json", '{', 400], ["application/json", 'null', 400], ["application/json", '[]', 400],
+    ["application/json", '{}', 400], ["application/json", '{"payer":1}', 400],
+    ["application/json", '{"payer":"invalid"}', 400],
+    ["application/json", "invalid-scenario", 400], ["application/json", "extra-key", 400],
+    ["application/json", "oversize", 413],
+  ])("malformed preparation (%s, %s) does not issue a session", async (contentType, input, status) => {
+    const headers: Record<string,string> = { origin };
+    if (contentType) headers["content-type"] = contentType as string;
+    const body = input === "invalid-scenario" ? JSON.stringify({ payer: h.payer.address, scenario: null }) : input === "extra-key" ? JSON.stringify({ payer: h.payer.address, order: "overwrite" }) : input === "oversize" ? "x".repeat(32_769) : input as string;
+    const now = vi.spyOn(c, "now"), latest = vi.spyOn(c, "getLatestBlockhash"), simulate = vi.spyOn(c.ledger, "simulate");
+    const response = await app.request(`${origin}/api/orders`, { method: "POST", headers, body });
+    expect(response.status).toBe(status); expect(response.headers.get("set-cookie")).toBeNull();
+    for (const call of [now, latest, simulate]) expect(call).not.toHaveBeenCalled();
+    expect(readdirSync(c.orders.dir)).toEqual([]); expect(h.ledger.submissions).toHaveLength(0);
+  });
+  test("explicit cross-site metadata is rejected even with a claimed valid Origin", async () => {
+    const response = await app.request(`${origin}/api/orders`, { method: "POST", headers: { origin, "sec-fetch-site": "cross-site", "content-type": "application/json" }, body: JSON.stringify({ payer: h.payer.address }) });
+    expect(response.status).toBe(403); expect(response.headers.get("set-cookie")).toBeNull();
+    expect(readdirSync(c.orders.dir)).toEqual([]); expect(h.ledger.simulated).toHaveLength(0);
+  });
+  test("same-origin JSON preparation issues one wallet-specific draft without broadcasting", async () => {
+    const response = await app.request(`${origin}/api/orders`, { method: "POST", headers: { origin, "content-type": "application/json; charset=utf-8", "sec-fetch-site": "same-origin" }, body: JSON.stringify({ payer: h.payer.address }) });
+    expect(response.status).toBe(402); const body = await response.json() as any;
+    expect(body.required).toEqual(decodeHeader(response.headers.get("PAYMENT-REQUIRED")!));
+    const cookie = response.headers.get("set-cookie")!;
+    expect(cookie).toContain("HttpOnly"); expect(cookie).toContain("SameSite=Strict");
+    expect(c.orders.read(body.order)).toMatchObject({ payer: h.payer.address, scenario: "normal", status: "draft", unsigned: body.unsigned });
+    expect(readdirSync(c.orders.dir)).toHaveLength(1); expect(h.ledger.submissions).toHaveLength(0);
+  });
+  test("original P2-1 cross-site navigation cannot overwrite a funded session or obstruct viewing and payer-direct reclaim", async () => {
+    c.origin = "https://restaurant.test"; app = createRestaurantApp(c);
+    const prepare = await app.request(`${c.origin}/api/orders`, { method: "POST", headers: { origin: c.origin, "content-type": "application/json" }, body: JSON.stringify({ payer: h.payer.address, scenario: "unavailable" }) });
+    const body = await prepare.json() as any;
+    const existing: Session = { id: body.order, unsigned: body.unsigned, required: body.required, cookie: prepare.headers.get("set-cookie")!.split(";")[0]! };
+    expect(prepare.headers.get("set-cookie")).toContain("Secure");
+    expect((await app.request(`${c.origin}/resource?order=${existing.id}`, { method: "POST", headers: { origin: c.origin, cookie: existing.cookie, "PAYMENT-SIGNATURE": encodeHeader({ x402Version: 2, resource: existing.required.resource, accepted: existing.required.accepts[0], payload: { transaction: await sign(existing.unsigned) } }) } })).status).toBe(200);
+    const disk = readFileSync(c.orders.path(existing.id), "utf8"), files = readdirSync(c.orders.dir).sort(), simulated = h.ledger.simulated.length;
+    // SameSite=Strict omits the existing cookie on this original cross-site navigation.
+    const navigation = await app.request(`${c.origin}/resource?payer=${h.payer.address}`, { headers: { "sec-fetch-site": "cross-site", "sec-fetch-mode": "navigate", "sec-fetch-dest": "document", referer: "https://attacker.invalid/" } });
+    expect(navigation.status).toBe(402); expect(navigation.headers.get("set-cookie")).toBeNull();
+    expect(await navigation.json()).not.toHaveProperty("order");
+    expect(readdirSync(c.orders.dir).sort()).toEqual(files); expect(readFileSync(c.orders.path(existing.id), "utf8")).toBe(disk);
+    expect(h.ledger.simulated).toHaveLength(simulated); expect(h.ledger.submissions).toHaveLength(1);
+    expect(await view(existing)).toMatchObject({ remaining: 100, status: "active" });
+    h.setTime(NOW + 150n);
+    const reclaim = await app.request(`${c.origin}/api/orders/${existing.id}/reclaim`, { headers: { cookie: existing.cookie } });
+    expect(reclaim.status).toBe(200); const { unsigned } = await reclaim.json() as any;
+    c.facilitatorUrl = "http://127.0.0.1:1";
+    expect((await app.request(`${c.origin}/api/orders/${existing.id}/reclaim`, { method: "POST", headers: { origin: c.origin, cookie: existing.cookie, "content-type": "application/json" }, body: JSON.stringify({ transaction: await sign(unsigned) }) })).status).toBe(200);
+    expect(await view(existing)).toMatchObject({ remaining: 0, released: 100 });
+    expect(inspect(h.ledger.submissions[1]!.transaction).signers).toEqual([h.payer.address]);
+  });
+  test.each(["active", "pending", "busy"])("a new order cannot replace an existing %s reservation across restart", async state => {
+    const existing = await offer("unavailable");
+    if (state === "pending") h.ledger.failSubmit = "after-landing";
+    if (state === "busy") c.orders.reserve(existing.id, "authorize");
+    else await authorize(existing);
+    const files = readdirSync(c.orders.dir).sort(), disk = readFileSync(c.orders.path(existing.id), "utf8"), submitted = h.ledger.submissions.length;
+    app = createRestaurantApp({ ...c, orders: new RestaurantOrders(c.orders.dir) });
+    const response = await app.request(`${origin}/api/orders`, { method: "POST", headers: { origin, cookie: existing.cookie, "content-type": "application/json" }, body: JSON.stringify({ payer: h.payer.address }) });
+    expect(response.status).toBe(409); expect(response.headers.get("set-cookie")).toBeNull();
+    expect(readdirSync(c.orders.dir).sort()).toEqual(files); expect(readFileSync(c.orders.path(existing.id), "utf8")).toBe(disk);
+    expect(h.ledger.submissions).toHaveLength(submitted);
+  });
+});
 describe("merchant application authority", () => {
   test.each(["beer", "salmon", "finish", "void", "refund"])("payer session cannot request %s or reach merchant signing", async a => {
     const s = await offer("refund"); await authorize(s);
@@ -162,7 +252,7 @@ describe("restaurant budget lifecycle", () => {
   test("expired never-submitted draft can be replaced by an explicit fresh offer without touching old evidence or submitting", async () => {
     const first = await offer(); const original = readFileSync(c.orders.path(first.id),"utf8");
     h.setTime(NOW + 300n);
-    const r = await app.request(`${origin}/resource?payer=${h.payer.address}&scenario=normal`,{headers:{cookie:first.cookie}});
+    const r = await app.request(`${origin}/api/orders`, { method: "POST", headers: { origin, cookie: first.cookie, "content-type": "application/json" }, body: JSON.stringify({ payer: h.payer.address, scenario: "normal" }) });
     expect(r.status).toBe(402); const next = await r.json() as any;
     expect(next.order).not.toBe(first.id);expect(next.unsigned).not.toBe(first.unsigned);
     expect(next.required.accepts[0].extra.captureDeadline).toBe(Number(NOW+450n));

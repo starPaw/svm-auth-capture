@@ -139,13 +139,20 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
     if (kind !== "unresolved") c.orders.unlock(order.id); // Uncertainty/crash retains the reservation permanently.
   }
   app.get("/resource", async ctx => {
-    const payer = ctx.req.query("payer");
-    const scenario = ctx.req.query("scenario") ?? "normal";
-    if (!payer) {
-      const required: PaymentRequired = { x402Version: 2, resource: { url: `${c.origin}/resource`, description: "Pivovar Marina hackathon budget", mimeType: "application/json" }, accepts: [await freshRequirements(c)] };
-      ctx.header(PAYMENT_REQUIRED_HEADER, encodeHeader(required)); return ctx.json(required, 402);
-    }
-    if (!isAddress(payer) || !(SCENARIOS as readonly string[]).includes(scenario)) return ctx.json({ error: "connect a Solana wallet and select a demo scenario" }, 400);
+    // Discovery never prepares a wallet transaction, creates an order or issues a capability.
+    // In particular, SameSite=Strict cookies are absent on cross-site top-level navigation.
+    const required: PaymentRequired = { x402Version: 2, resource: { url: `${c.origin}/resource`, description: "Pivovar Marina hackathon budget", mimeType: "application/json" }, accepts: [await freshRequirements(c)] };
+    ctx.header(PAYMENT_REQUIRED_HEADER, encodeHeader(required)); return ctx.json(required, 402);
+  });
+  app.post("/api/orders", async ctx => {
+    // The exact Origin gate above runs before parsing, chain reads, simulation or durable writes.
+    if (ctx.req.header("sec-fetch-site") === "cross-site") return ctx.json({ error: "same-origin demo action required" }, 403);
+    if (!/^application\/json(?:\s*;\s*charset=utf-8)?$/i.test(ctx.req.header("content-type") ?? "")) return ctx.json({ error: "JSON order request required" }, 415);
+    let body: unknown;
+    try { body = await ctx.req.json(); } catch { return ctx.json({ error: "invalid JSON order request" }, 400); }
+    if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).some(key => key !== "payer" && key !== "scenario")) return ctx.json({ error: "invalid order request" }, 400);
+    const { payer, scenario = "normal" } = body as { payer?: unknown; scenario?: unknown };
+    if (typeof payer !== "string" || !isAddress(payer) || typeof scenario !== "string" || !(SCENARIOS as readonly string[]).includes(scenario)) return ctx.json({ error: "connect a Solana wallet and select a demo scenario" }, 400);
     const previous = getCookie(ctx, cookieName);
     if (previous?.includes(".")) {
       try {

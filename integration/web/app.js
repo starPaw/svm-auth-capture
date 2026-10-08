@@ -92,7 +92,7 @@ $('authorize').onclick = () => run(async () => {
   // Pending/submitted attempts are never refreshed, re-signed or retried.
   if (order?.status === 'draft' && !draftExpired) { ({ required, unsigned, id } = order); }
   else {
-    const { response, data } = await request(`/resource?payer=${encodeURIComponent(connection.account.address)}&scenario=${scenario}`, {}, [402]);
+    const { response, data } = await request('/api/orders', { method:'POST', headers:{ 'Content-Type':'application/json' }, body:JSON.stringify({ payer:connection.account.address, scenario }) }, [402]);
     const header = response.headers.get('PAYMENT-REQUIRED'); if (!header) throw new Error('No real PAYMENT-REQUIRED offer was returned.');
     required = decodeEnvelope(header); unsigned = data.unsigned; id = data.order;
     if (!id || !unsigned) throw new Error('The budget offer could not be prepared.');
