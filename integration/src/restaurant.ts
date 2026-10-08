@@ -1,0 +1,271 @@
+// Restaurant orchestration only. All economic movements use the unchanged SAC-006 builders,
+// receipt validation, facilitator and SBF. A durable order binds one signed budget to its menu
+// actions. HttpOnly per-order capabilities are application session control, not onchain authority.
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { existsSync, readFileSync, unlinkSync, openSync, fsyncSync, closeSync } from "node:fs";
+import { join } from "node:path";
+import { Hono } from "hono";
+import { requireBearerToken } from "./auth.ts";
+import { bodyLimit } from "hono/body-limit";
+import { getCookie, setCookie } from "hono/cookie";
+import { type Address, getBase64Encoder, getTransactionDecoder, getCompiledTransactionMessageDecoder, getSignatureFromTransaction, getPublicKeyFromAddress, verifySignature, isAddress, type SignatureBytes, type Transaction } from "@solana/kit";
+import { createDurableFile, ensureDurableDirectory, replaceDurableFile } from "./durable-file.ts";
+import { decodePayment, paymentAddress, type Payment } from "./program.ts";
+import { acceptedDeadlines, freshRequirements, peekAuthorize, settle, type ResourceServerConfig } from "./resource-server.ts";
+import { encodeHeader, decodeHeader, parsePaymentPayload, PAYMENT_REQUIRED_HEADER, PAYMENT_SIGNATURE_HEADER, PAYMENT_RESPONSE_HEADER, type PaymentRequired } from "./http-transport.ts";
+import { authorizeInstruction, encodeTransaction, captureInstruction, capturePayload, voidInstruction, voidPayload, refundInstruction, refundPayload, reclaimInstruction } from "./transactions.ts";
+import { buildDemoTransaction } from "./demo-compute.ts";
+import { messageHash, submissionOutcome, type SubmissionJournal } from "./submission-journal.ts";
+import type { ChainReader } from "./reconciliation.ts";
+import type { Ledger } from "./ledger.ts";
+import type { PaymentRequirements, SettleResponse } from "./types.ts";
+
+export const DEMO_UNIT = 1_000_000n;
+export const DEMO_BUDGET = 100n * DEMO_UNIT;
+export const SCENARIOS = ["normal", "refund", "cancelled", "unavailable"] as const;
+type Scenario = typeof SCENARIOS[number];
+type Action = "authorize" | "beer" | "salmon" | "finish" | "void" | "refund" | "reclaim";
+type Event = { action: Action; label: string; amount: string; at: string; status: "prepared" | "pending" | "finalized" | "rejected"; transaction: string; transactionBase64: string; receipt?: SettleResponse };
+type Order = { id: string; capabilityHash: string; payer: Address; payment: Address; scenario: Scenario; required: PaymentRequired; unsigned: string; createdAt: number; status: "draft" | "active" | "closed" | "pending" | "rejected"; events: Event[]; reclaimUnsigned?: string; reclaimLifetime?: { blockhash: string; lastValidBlockHeight: string; blockhashSlot?: string } };
+export type RestaurantConfig = ResourceServerConfig & { ledger: Ledger & Pick<ChainReader, "getSignatureStatus" | "getAccountAtLeast">; orders: RestaurantOrders; reclaimJournal: SubmissionJournal; origin: string; merchantToken?: string };
+
+export class RestaurantOrders {
+  readonly dir: string;
+  constructor(dir: string) { this.dir = dir; ensureDurableDirectory(dir); }
+  path(id: string): string { if (!/^[a-f0-9]{32}$/.test(id)) throw new Error("invalid order ID"); return join(this.dir, `${id}.json`); }
+  read(id: string): Order { return JSON.parse(readFileSync(this.path(id), "utf8")) as Order; }
+  create(order: Order): void { createDurableFile(this.path(order.id), JSON.stringify(order)); }
+  write(order: Order): void { replaceDurableFile(this.path(order.id), JSON.stringify(order)); }
+  reserve(id: string, action: Action): void {
+    const busy = `${this.path(id)}.busy`;
+    createDurableFile(busy, action); // Cross-process exclusive reservation before any network await.
+    try { if (this.attempted(id, action)) throw new Error("action already reserved; inspect its original outcome"); }
+    catch (e) { this.unlock(id); throw e; }
+  }
+  prepare(order: Order, event: Event): void {
+    createDurableFile(`${this.path(order.id)}.${event.action}.lock`, JSON.stringify(event));
+    order.events.push(event); order.status = "pending"; this.write(order);
+  }
+  unlock(id: string): void {
+    unlinkSync(`${this.path(id)}.busy`);
+    const fd = openSync(this.dir, "r"); try { fsyncSync(fd); } finally { closeSync(fd); }
+  }
+  attempted(id: string, action: Action): boolean { return existsSync(`${this.path(id)}.${action}.lock`); }
+  busy(id: string): boolean { return existsSync(`${this.path(id)}.busy`); }
+}
+const decoder = getTransactionDecoder();
+const decode = (wire: string): Transaction => decoder.decode(getBase64Encoder().encode(wire));
+const digest = (s: string) => createHash("sha256").update(s).digest("hex");
+const equalMessage = (a: Transaction, b: Transaction) => Buffer.from(a.messageBytes).equals(Buffer.from(b.messageBytes));
+const money = (n: bigint) => Number(n) / Number(DEMO_UNIT);
+const labels: Record<Action, string> = { authorize: "Budget authorized", beer: "Beer + Ribs", salmon: "Salmon", finish: "Order finished · remainder released", void: "Order cancelled · hold released", refund: "Consumed budget refunded", reclaim: "Payer reclaimed unused budget" };
+
+export async function restaurantSnapshot(c: RestaurantConfig, order: Order): Promise<Payment | null> {
+  let slot = 0n;
+  for (const e of order.events) if (e.transaction) {
+    const status = await c.ledger.getSignatureStatus(e.transaction);
+    if (e.status === "finalized" && (status.kind !== "found" || status.commitment !== "finalized" || status.err !== null)) throw new Error("original finalized signature evidence unavailable; inspect before new actions");
+    if (status.kind === "found" && status.commitment === "finalized" && status.slot > slot) slot = status.slot;
+  }
+  const snapshot = await c.ledger.getAccountAtLeast(order.payment, slot);
+  if (snapshot.kind !== "ok") throw new Error("finalized payment state unavailable; inspect original signatures");
+  if (!snapshot.account) return null;
+  const p = decodePayment(snapshot.account.data);
+  if (!p || snapshot.account.owner !== c.programId || p.payer !== order.payer || p.server !== c.server.address || p.mint !== c.asset || p.maximum !== DEMO_BUDGET || String(p.captureDeadline) !== String(order.required.accepts[0]!.extra!.captureDeadline) || String(p.refundDeadline) !== String(order.required.accepts[0]!.extra!.refundDeadline)) throw new Error("payment identity differs from this order");
+  return p;
+}
+
+export function createRestaurantApp(c: RestaurantConfig): Hono {
+  if (c.amount !== DEMO_BUDGET) throw new Error("restaurant budget must be exactly 100 six-decimal demo USDC");
+  // Separate application authority: an order capability never authorizes merchant signing.
+  const merchantToken = c.merchantToken;
+  if (merchantToken !== undefined && (merchantToken.length < 32 || merchantToken.trim() !== merchantToken || /[\r\n]/.test(merchantToken) || merchantToken === c.bearerToken)) {
+    throw new Error("merchant token must be independent and at least 32 characters");
+  }
+  const merchantAuth = merchantToken ? requireBearerToken(merchantToken) : undefined;
+  const app = new Hono();
+  const cookieName = "capture402-order";
+  const secured = c.origin.startsWith("https:");
+  function owned(id: string, cookie: string | undefined): Order {
+    const order = c.orders.read(id);
+    if (!cookie || cookie.length > 256) throw new Error("this order requires its wallet-created demo session");
+    const actual = Buffer.from(digest(cookie)); const expected = Buffer.from(order.capabilityHash);
+    if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) throw new Error("this order requires its wallet-created demo session");
+    return order;
+  }
+  app.use("*", bodyLimit({ maxSize: 32_768, onError: ctx => ctx.json({ error: "request too large" }, 413) }));
+  app.use("*", async (ctx, next) => {
+    ctx.header("Cache-Control", "no-store");
+    if (ctx.req.method === "POST" && ctx.req.header("origin") !== c.origin) return ctx.json({ error: "same-origin demo action required" }, 403);
+    if (Number(ctx.req.header("content-length") ?? 0) > 32_768) return ctx.json({ error: "request too large" }, 413);
+    await next();
+  });
+  // SDK/provider errors can embed private credential URLs. Never echo them to the browser.
+  app.onError((error, ctx) => ctx.json({ error: error.message.includes("ENOENT") ? "order unavailable" : error.message.includes("EEXIST") ? "action reserved; inspect original outcome before any new consent" : "action refused or chain evidence unavailable; refresh and inspect the original order" }, 409));
+
+  async function publicSignatureStatus(signature: string) {
+    const status = await c.ledger.getSignatureStatus(signature);
+    if (status.kind === "unavailable") return { kind: "unavailable", detail: "RPC signature evidence unavailable" };
+    return JSON.parse(JSON.stringify(status, (_k,v) => typeof v === "bigint" ? v.toString() : v));
+  }
+  async function view(order: Order) {
+    const p = await restaurantSnapshot(c, order);
+    const now = await c.now();
+    const blocked = order.status === "pending" || c.orders.busy(order.id);
+    const done = (action: Action) => c.orders.attempted(order.id, action);
+    const captured = order.events.filter(e => e.status === "finalized" && ["beer", "salmon"].includes(e.action)).reduce((s,e) => s + BigInt(e.amount), 0n);
+    const refunded = order.events.filter(e => e.status === "finalized" && e.action === "refund").reduce((s,e) => s + BigInt(e.amount), 0n);
+    const active = p !== null && !blocked;
+    return { id: order.id, payer: order.payer, payment: order.payment, scenario: order.scenario,
+      status: blocked ? "pending" : p ? p.held === 0n ? "closed" : "active" : order.status,
+      authorized: p ? money(p.maximum) : 0, captured: money(captured), remaining: p ? money(p.held) : 0, refunded: money(refunded), released: p ? money(p.maximum - p.held - captured) : 0,
+      heldBaseUnits: p?.held.toString(), refundableBaseUnits: p?.refundable.toString(),
+      captureDeadline: Number(order.required.accepts[0]!.extra!.captureDeadline), refundDeadline: Number(order.required.accepts[0]!.extra!.refundDeadline), now: Number(now),
+      actions: { beer: active && order.scenario !== "cancelled" && order.scenario !== "unavailable" && !done("beer") && p!.held >= 40n * DEMO_UNIT && now < p!.captureDeadline,
+        salmon: active && order.scenario === "normal" && done("beer") && captured >= 40n * DEMO_UNIT && !done("salmon") && p!.held >= 25n * DEMO_UNIT && now < p!.captureDeadline,
+        finish: active && p!.held > 0n && now < p!.captureDeadline && !done("finish") && (order.scenario === "normal" ? done("salmon") && captured === 65n * DEMO_UNIT : order.scenario === "refund" && refunded > 0n),
+        void: active && order.scenario !== "unavailable" && p!.held > 0n && now < p!.captureDeadline && !done("void"),
+        refund: active && order.scenario !== "unavailable" && p!.refundable > 0n && now < p!.refundDeadline && !done("refund"),
+        reclaim: active && p!.held > 0n && now >= p!.captureDeadline && !done("reclaim") },
+      events: await Promise.all(order.events.map(async e => ({ action: e.action, label: e.label, amount: money(BigInt(e.amount)), at: e.at, status: e.status, signature: e.transaction, ...(e.transaction ? { chainStatus: await publicSignatureStatus(e.transaction) } : {}) }))),
+      ...(order.status === "draft" ? { required: order.required, unsigned: order.unsigned } : {}),
+    };
+  }
+  async function recordResult(order: Order, event: Event, receipt: SettleResponse, kind: "succeeded" | "rejected" | "unresolved") {
+    event.receipt = receipt; event.transaction = receipt.transaction;
+    event.status = kind === "succeeded" ? "finalized" : kind === "rejected" ? "rejected" : "pending";
+    order.status = kind === "unresolved" ? "pending" : event.action === "authorize" && kind === "rejected" ? "rejected" : "active";
+    c.orders.write(order);
+    if (kind !== "unresolved") c.orders.unlock(order.id); // Uncertainty/crash retains the reservation permanently.
+  }
+  app.get("/resource", async ctx => {
+    // Discovery never prepares a wallet transaction, creates an order or issues a capability.
+    // In particular, SameSite=Strict cookies are absent on cross-site top-level navigation.
+    const required: PaymentRequired = { x402Version: 2, resource: { url: `${c.origin}/resource`, description: "Pivovar Marina hackathon budget", mimeType: "application/json" }, accepts: [await freshRequirements(c)] };
+    ctx.header(PAYMENT_REQUIRED_HEADER, encodeHeader(required)); return ctx.json(required, 402);
+  });
+  app.post("/api/orders", async ctx => {
+    // The exact Origin gate above runs before parsing, chain reads, simulation or durable writes.
+    if (ctx.req.header("sec-fetch-site") === "cross-site") return ctx.json({ error: "same-origin demo action required" }, 403);
+    if (!/^application\/json(?:\s*;\s*charset=utf-8)?$/i.test(ctx.req.header("content-type") ?? "")) return ctx.json({ error: "JSON order request required" }, 415);
+    let body: unknown;
+    try { body = await ctx.req.json(); } catch { return ctx.json({ error: "invalid JSON order request" }, 400); }
+    if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).some(key => key !== "payer" && key !== "scenario")) return ctx.json({ error: "invalid order request" }, 400);
+    const { payer, scenario = "normal" } = body as { payer?: unknown; scenario?: unknown };
+    if (typeof payer !== "string" || !isAddress(payer) || typeof scenario !== "string" || !(SCENARIOS as readonly string[]).includes(scenario)) return ctx.json({ error: "connect a Solana wallet and select a demo scenario" }, 400);
+    const previous = getCookie(ctx, cookieName);
+    if (previous?.includes(".")) {
+      try {
+        const old = owned(previous.split(".")[0]!, previous);
+        const p = await restaurantSnapshot(c, old);
+        if (c.orders.busy(old.id) || old.status === "pending" || (p && p.held > 0n)) return ctx.json({ error: "finish or reconcile the existing budget before opening another" }, 409);
+      } catch (e) { if (!(e instanceof Error) || !e.message.includes("ENOENT")) throw e; }
+    }
+    const id = randomBytes(16).toString("hex"); const capability = `${id}.${randomBytes(32).toString("hex")}`;
+    const salt = randomBytes(32); const requirements = await freshRequirements(c);
+    const required: PaymentRequired = { x402Version: 2, resource: { url: `${c.origin}/resource`, description: "Pivovar Marina · 7-day hackathon food budget (compressed demo timing)", mimeType: "application/json" }, accepts: [requirements] };
+    const tx = await buildDemoTransaction({ feePayer: c.feePayer, signers: [], lifetime: await c.getLatestBlockhash(), instructions: [await authorizeInstruction({ programId: c.programId, payer, server: c.server.address, mint: c.asset, funder: c.feePayer, salt, maximum: DEMO_BUDGET, captureDeadline: BigInt(requirements.extra!.captureDeadline as number), refundDeadline: BigInt(requirements.extra!.refundDeadline as number) })] }, c.ledger);
+    const order: Order = { id, capabilityHash: digest(capability), payer, payment: await paymentAddress(c.programId, payer, salt), scenario: scenario as Scenario, required, unsigned: encodeTransaction(tx), createdAt: Number(await c.now()), status: "draft", events: [] };
+    c.orders.create(order);
+    setCookie(ctx, cookieName, capability, { httpOnly: true, secure: secured, sameSite: "Strict", path: "/", maxAge: 86400 });
+    ctx.header(PAYMENT_REQUIRED_HEADER, encodeHeader(required));
+    return ctx.json({ order: id, required, unsigned: order.unsigned }, 402);
+  });
+  app.get("/api/orders/:id", async ctx => ctx.json(await view(owned(ctx.req.param("id"), getCookie(ctx, cookieName)))));
+  app.post("/resource", async ctx => {
+    const order = owned(ctx.req.query("order") ?? "", getCookie(ctx, cookieName));
+    if (order.status !== "draft") return ctx.json({ error: "budget already submitted; inspect the original payment" }, 409);
+    const header = ctx.req.header(PAYMENT_SIGNATURE_HEADER); if (!header) return ctx.json({ error: "PAYMENT-SIGNATURE required" }, 400);
+    const payload = parsePaymentPayload(decodeHeader(header));
+    const deadlines = await acceptedDeadlines(c, payload.accepted); if (typeof deadlines === "string") return ctx.json({ error: deadlines }, 402);
+    if (JSON.stringify(payload.resource) !== JSON.stringify(order.required.resource) || JSON.stringify(payload.accepted) !== JSON.stringify(order.required.accepts[0])) return ctx.json({ error: "payment envelope differs from the issued budget" }, 400);
+    if (typeof payload.payload.transaction !== "string" || Object.keys(payload.payload).length !== 1) return ctx.json({ error: "authorize transaction required" }, 400);
+    const tx = decode(payload.payload.transaction); const signed = await peekAuthorize(c, tx);
+    if (signed.payer !== order.payer || !equalMessage(tx, decode(order.unsigned))) return ctx.json({ error: "wallet must sign the exact offered budget" }, 400);
+    c.orders.reserve(order.id, "authorize");
+    const event: Event = { action: "authorize", label: labels.authorize, amount: DEMO_BUDGET.toString(), at: new Date().toISOString(), status: "prepared", transaction: "", transactionBase64: payload.payload.transaction };
+    c.orders.prepare(order, event);
+    const result = await settle(c, { x402Version: 2, paymentPayload: payload, paymentRequirements: order.required.accepts[0]! }, tx, order.payer);
+    await recordResult(order, event, result.receipt, result.kind);
+    ctx.header(PAYMENT_RESPONSE_HEADER, encodeHeader(result.receipt));
+    return ctx.json({ receipt: result.receipt, order: order.id }, result.kind === "succeeded" ? 200 : 402);
+  });
+  app.use("/api/orders/:id/actions/*", async (ctx, next) => {
+    if (!merchantAuth) return ctx.json({ error: "merchant operations disabled" }, 503);
+    return merchantAuth(ctx, next);
+  });
+  app.post("/api/orders/:id/actions/:action", async ctx => {
+    let order = c.orders.read(ctx.req.param("id")); const action = ctx.req.param("action") as Action;
+    if (!["beer", "salmon", "finish", "void", "refund"].includes(action)) return ctx.json({ error: "unsupported menu action" }, 400);
+    c.orders.reserve(order.id, action);
+    order = c.orders.read(order.id);
+    let prepared = false;
+    try {
+      const p = await restaurantSnapshot(c, order);
+      // No new consent while an earlier attempt is unresolved.
+      if (!p || order.status === "pending" || order.status === "draft" || order.scenario === "unavailable") throw new Error("merchant action unavailable for this budget");
+      const now = await c.now();
+      const amount = action === "beer" ? 40n * DEMO_UNIT : action === "salmon" ? 25n * DEMO_UNIT : action === "refund" ? p.refundable : p.held;
+      const consumed = order.events.filter(e => e.status === "finalized").map(e => e.action);
+      if (action === "beer" && (order.scenario === "cancelled" || consumed.includes("beer"))) throw new Error("first item unavailable");
+      if (action === "salmon" && (order.scenario !== "normal" || !consumed.includes("beer") || consumed.includes("salmon"))) throw new Error("serve Beer + Ribs before Salmon");
+      if (action === "finish" && (order.scenario === "normal" ? !consumed.includes("salmon") || p.held !== 35n * DEMO_UNIT : order.scenario !== "refund" || !consumed.includes("refund"))) throw new Error("complete the selected menu scenario before finishing");
+      if (amount <= 0n || (action === "refund" ? now >= p.refundDeadline : now >= p.captureDeadline) || (action === "beer" || action === "salmon") && amount > p.held) throw new Error("amount/deadline no longer eligible");
+      const stored = { programId: c.programId, payment: order.payment, payer: p.payer, server: p.server, mint: p.mint };
+      const ix = action === "beer" || action === "salmon" ? await captureInstruction(stored, amount, false, p.held, p.refundable) : action === "refund" ? await refundInstruction(stored, amount, p.held, p.refundable) : await voidInstruction(stored, p.held, p.refundable);
+      const tx = await buildDemoTransaction({ feePayer: c.feePayer, signers: [c.server], lifetime: await c.getLatestBlockhash(), instructions: [ix] }, c.ledger);
+      const scheme = action === "beer" || action === "salmon" ? capturePayload(order.payment, tx, amount, false, p.held, p.refundable) : action === "refund" ? refundPayload(order.payment, tx, amount, p.held, p.refundable) : voidPayload(order.payment, tx, p.held, p.refundable);
+      const event: Event = { action, label: labels[action], amount: amount.toString(), at: new Date().toISOString(), status: "prepared", transaction: "", transactionBase64: encodeTransaction(tx) };
+      c.orders.prepare(order, event); prepared = true;
+      const req = order.required.accepts[0]!;
+      const result = await settle(c, { x402Version: 2, paymentPayload: { x402Version: 2, accepted: req, payload: scheme }, paymentRequirements: req }, tx, order.payer);
+      await recordResult(order, event, result.receipt, result.kind);
+      ctx.header(PAYMENT_RESPONSE_HEADER, encodeHeader(result.receipt));
+      return ctx.json({ receipt: result.receipt }, result.kind === "succeeded" ? 200 : 409);
+    } catch (e) {
+      if (!prepared && order.status !== "pending") c.orders.unlock(order.id);
+      throw e;
+    }
+  });
+  app.get("/api/orders/:id/reclaim", async ctx => {
+    let order = owned(ctx.req.param("id"), getCookie(ctx, cookieName));
+    c.orders.reserve(order.id, "reclaim");
+    try {
+      order = c.orders.read(order.id);
+      const p = await restaurantSnapshot(c, order);
+      if (!p || p.held === 0n || (await c.now()) < p.captureDeadline || order.status === "pending") return ctx.json({ error: "reclaim is not eligible yet" }, 409);
+      const lifetime = await c.getLatestBlockhash();
+      const tx = await buildDemoTransaction({ feePayer: p.payer, signers: [], lifetime, instructions: [await reclaimInstruction({ programId: c.programId, payment: order.payment, payer: p.payer, server: p.server, mint: p.mint })] }, c.ledger);
+      order.reclaimLifetime = { blockhash: lifetime.blockhash, lastValidBlockHeight: lifetime.lastValidBlockHeight.toString(), ...(lifetime.blockhashSlot === undefined ? {} : { blockhashSlot: lifetime.blockhashSlot.toString() }) };
+      order.reclaimUnsigned = encodeTransaction(tx); c.orders.write(order); return ctx.json({ unsigned: order.reclaimUnsigned, payer: p.payer });
+    } finally { c.orders.unlock(order.id); }
+  });
+  app.post("/api/orders/:id/reclaim", async ctx => {
+    let order = owned(ctx.req.param("id"), getCookie(ctx, cookieName)); const body = await ctx.req.json() as { transaction?: string };
+    if (!order.reclaimUnsigned || typeof body.transaction !== "string") return ctx.json({ error: "prepare and wallet-sign reclaim first" }, 400);
+    const tx = decode(body.transaction); const m = getCompiledTransactionMessageDecoder().decode(tx.messageBytes); const signature = tx.signatures[order.payer];
+    if (!equalMessage(tx, decode(order.reclaimUnsigned)) || m.header.numSignerAccounts !== 1 || m.staticAccounts[0] !== order.payer || !signature || !await verifySignature(await getPublicKeyFromAddress(order.payer), signature as SignatureBytes, tx.messageBytes)) return ctx.json({ error: "payer must sign the exact reclaim" }, 400);
+    c.orders.reserve(order.id, "reclaim");
+    order = c.orders.read(order.id);
+    const p = await restaurantSnapshot(c, order);
+    if (!p || p.held === 0n || (await c.now()) < p.captureDeadline || order.status === "pending") { c.orders.unlock(order.id); return ctx.json({ error: "reclaim no longer eligible" }, 409); }
+    // A concurrent preparation may have replaced the unsigned draft before this reservation.
+    // Never associate its lifetime evidence with another signed wire.
+    if (!order.reclaimUnsigned || !equalMessage(tx, decode(order.reclaimUnsigned)) || order.reclaimLifetime && order.reclaimLifetime.blockhash !== m.lifetimeToken) {
+      c.orders.unlock(order.id); return ctx.json({ error: "reclaim draft changed; inspect the current offer" }, 409);
+    }
+    const sig = getSignatureFromTransaction(tx);
+    const event: Event = { action: "reclaim", label: labels.reclaim, amount: p.held.toString(), at: new Date().toISOString(), status: "prepared", transaction: sig, transactionBase64: body.transaction };
+    c.orders.prepare(order, event);
+    const simulation = await c.ledger.simulate({ ...tx, signatures: { ...tx.signatures, [order.payer]: null } });
+    if (!simulation.ok) throw new Error("reclaim simulation refused; inspect the reserved attempt");
+    c.reclaimJournal.prepare({ signature: sig, messageHash: messageHash(tx.messageBytes), transactionBase64: body.transaction, blockhash: m.lifetimeToken, operation: "reclaim", payment: order.payment, payer: order.payer, expectedHeld: p.held.toString(), expectedRefundable: p.refundable.toString(), ...(order.reclaimLifetime ?? {}) });
+    const result = await c.ledger.submit(tx); c.reclaimJournal.resolve(sig, { ...submissionOutcome(result), recordedAt: new Date().toISOString() });
+    const success = result.kind === "submitted" && result.outcome?.commitment === "finalized" && result.outcome.status === "succeeded";
+    const failed = result.kind === "not-submitted" || result.kind === "submitted" && result.outcome?.commitment === "finalized" && result.outcome.status === "failed";
+    const receipt: SettleResponse = { success, transaction: sig, network: c.network, payer: order.payer, ...(success ? {} : { errorReason: failed ? "invalid_transaction_state" : "settlement_pending" }) };
+    await recordResult(order, event, receipt, success ? "succeeded" : failed ? "rejected" : "unresolved");
+    return ctx.json({ receipt }, success ? 200 : 409);
+  });
+  return app;
+}

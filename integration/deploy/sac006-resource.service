@@ -1,0 +1,22 @@
+[Unit]
+Description=SAC-006 restaurant demo and private Devnet orchestration
+After=network-online.target sac006-facilitator.service
+
+[Service]
+Type=simple
+User=sac006
+Group=sac006
+WorkingDirectory=/opt/svm-auth-capture/integration
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=/etc/sac006/resource.env
+ExecStart=/usr/bin/env node --experimental-strip-types src/restaurant-server.ts
+Restart=no
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/sac006
+
+[Install]
+WantedBy=multi-user.target

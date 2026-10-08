@@ -160,7 +160,7 @@ function requirements(config: ResourceServerConfig, captureDeadline: bigint, ref
   };
 }
 
-async function freshRequirements(config: ResourceServerConfig): Promise<PaymentRequirements> {
+export async function freshRequirements(config: ResourceServerConfig): Promise<PaymentRequirements> {
   const now = BigInt(await config.now());
   const captureDeadline = now + BigInt(config.captureDeadlineSeconds);
   return requirements(config, captureDeadline, captureDeadline + BigInt(config.refundDeadlineSeconds));
@@ -181,7 +181,7 @@ function paymentRequired(config: ResourceServerConfig, resourceUrl: string, offe
  * deadlines are the only per-challenge values). Without the freshness bound a client could pick
  * a capture deadline too short for the terminal settle to land after the handler runs.
  */
-async function acceptedDeadlines(config: ResourceServerConfig, accepted: unknown): Promise<{ captureDeadline: bigint; refundDeadline: bigint } | string> {
+export async function acceptedDeadlines(config: ResourceServerConfig, accepted: unknown): Promise<{ captureDeadline: bigint; refundDeadline: bigint } | string> {
   if (!isObject(accepted) || !isObject(accepted.extra)) return "accepted must carry extra";
   const extra = accepted.extra;
   const dc = extra.captureDeadline;
@@ -219,7 +219,7 @@ function decodeTransaction(transactionBase64: string): Transaction {
  * Reads the authorize instruction the payer signed and verifies that signature over the exact
  * message bytes: only the payer's own signed request can claim its fingerprint.
  */
-async function peekAuthorize(
+export async function peekAuthorize(
   config: ResourceServerConfig,
   transaction: Transaction,
 ): Promise<{ payer: Address; salt: Uint8Array; maximum: bigint; captureDeadline: bigint; refundDeadline: bigint; blockhash: string }> {
@@ -257,7 +257,7 @@ function isSettleResponse(v: unknown): v is SettleResponse {
  * refusal (or a gateway refusal that never reached the facilitator) counts as "did not execute";
  * a lost, malformed, pending, or unrecognized answer stays unresolved.
  */
-async function settle(config: ResourceServerConfig, body: ReturnType<typeof facilitatorBody>, transaction: Transaction, payer: Address): Promise<SettleOutcome> {
+export async function settle(config: ResourceServerConfig, body: ReturnType<typeof facilitatorBody>, transaction: Transaction, payer: Address): Promise<SettleOutcome> {
   const pending = (detail: string): SettleOutcome => ({
     kind: "unresolved",
     receipt: { success: false, errorReason: Reason.settlementPending, transaction: "", network: config.network },

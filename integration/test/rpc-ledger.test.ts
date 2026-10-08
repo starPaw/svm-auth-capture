@@ -168,6 +168,16 @@ describe("RpcLedger.simulate", () => {
     await expect(ledger.simulate(await sampleTransaction())).resolves.toEqual({ ok: true });
   });
 
+  test("preserves measured compute consumption without changing the signed blockhash or verifying absent signatures", async () => {
+    let options: any;
+    const ledger = new RpcLedger({network:NETWORK,genesisHash:GENESIS,rpcUrl:"http://unused.invalid",rpc:fakeRpc({simulateTransaction:(_wire:unknown,config:unknown)=>{options=config;return sendable({value:{err:null,logs:[],unitsConsumed:25001n}});}})});
+    await expect(ledger.simulate(await sampleTransaction())).resolves.toEqual({ok:true,unitsConsumed:25001n});
+    expect(options).toMatchObject({sigVerify:false,replaceRecentBlockhash:false});
+  });
+  test.each([null,0n,-1n,NaN,1.5,"25001"])("malformed simulation units %s never become a fee estimate",async unitsConsumed=>{
+    const ledger=new RpcLedger({network:NETWORK,genesisHash:GENESIS,rpcUrl:"http://unused.invalid",rpc:fakeRpc({simulateTransaction:()=>sendable({value:{err:null,logs:[],unitsConsumed}})})});
+    await expect(ledger.simulate(await sampleTransaction())).resolves.toEqual({ok:true});
+  });
   test("maps a failed simulation to its error and logs", async () => {
     const ledger = new RpcLedger({
       network: NETWORK,

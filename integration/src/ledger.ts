@@ -7,7 +7,7 @@ export type LedgerAccount = {
   executable: boolean;
 };
 
-export type SimulationOutcome = { ok: true } | { ok: false; error: string; logs: string[] };
+export type SimulationOutcome = { ok: true; unitsConsumed?: bigint } | { ok: false; error: string; logs: string[] };
 
 /**
  * A submission whose exact signature reached finalized commitment, with its execution result.

@@ -284,7 +284,11 @@ export class RpcLedger implements Ledger, ChainReader {
     const { value } = await this.request((abortSignal) =>
       this.rpc.simulateTransaction(wire, { encoding: "base64", sigVerify: false, replaceRecentBlockhash: false }).send({ abortSignal }),
     );
-    if (value.err === null) return { ok: true };
+    if (value.err === null) {
+      const units = value.unitsConsumed;
+      const valid = typeof units === "bigint" && units > 0n || typeof units === "number" && Number.isSafeInteger(units) && units > 0;
+      return { ok: true, ...(valid ? { unitsConsumed: BigInt(units!) } : {}) };
+    }
     return { ok: false, error: JSON.stringify(value.err), logs: [...(value.logs ?? [])] };
   }
 
