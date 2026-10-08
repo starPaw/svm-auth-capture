@@ -118,6 +118,27 @@ ENABLED = os.environ.get('CAPTURE402_SYSTEMD_TEST') == '1'
 
 @unittest.skipUnless(ENABLED, 'explicit disposable Linux systemd test required')
 class BootBoundaryTests(unittest.TestCase):
+    def test_sealed_release_starts_as_nonroot_under_private_umask(self):
+        release = source.RELEASES / ('b' * 40)
+        previous_umask = os.umask(0o077)
+        try:
+            dependency = release / 'integration/node_modules/package'
+            dependency.mkdir(parents=True)
+            (dependency / 'runtime.txt').write_bytes(b'nonroot runtime readable\n')
+        finally:
+            os.umask(previous_umask)
+        (release / 'integration').chmod(0o700)
+        source.seal_runtime_permissions(release)
+        result = subprocess.run([
+            'systemd-run', '--unit=' + self.cfg['prefix'] + '-readable',
+            '--wait', '--pipe', '--collect', '--property=User=nobody',
+            '--property=WorkingDirectory=' + str(release / 'integration'),
+            '/bin/cat', str(dependency / 'runtime.txt'),
+        ], capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, 'nonroot runtime readable\n')
+        self.assertEqual(host.inventory([host.STATE, host.PRIVATE]), self.original_state)
+
     def setUp(self):
         self.assertEqual(os.geteuid(), 0)
         self.assertEqual(os.environ.get('GITHUB_ACTIONS'), 'true', 'never run root fixtures on the VPS')

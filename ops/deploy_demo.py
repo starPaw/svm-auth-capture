@@ -408,6 +408,24 @@ def chown_tree(root: Path, uid: int, gid: int) -> None:
         os.chown(parent, uid, gid, follow_symlinks=False)
 
 
+def seal_runtime_permissions(root: Path) -> None:
+    """Make sealed application bytes readable by sac006 under private UMask.
+
+    Source and dependencies contain no private configuration. Keep only owner
+    write access, preserve executable files, and never follow npm symlinks.
+    """
+    require(root.is_dir() and not root.is_symlink(), "unsafe runtime root")
+    for parent, dirs, files in os.walk(root, followlinks=False):
+        for path in [Path(parent), *(Path(parent) / n for n in dirs + files)]:
+            info = path.lstat()
+            require(info.st_uid == os.geteuid(), "runtime is not owned by deployment user")
+            if stat.S_ISLNK(info.st_mode):
+                continue
+            require(stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode),
+                    "unsupported runtime file type")
+            path.chmod(0o755 if stat.S_ISDIR(info.st_mode) or info.st_mode & 0o100 else 0o644)
+
+
 def prepare_release(sha: str, digest: str, blob: bytes) -> None:
     target = RELEASES / sha
     manifest = MANIFESTS / f"{sha}.json"
@@ -416,6 +434,7 @@ def prepare_release(sha: str, digest: str, blob: bytes) -> None:
         data = json.loads(manifest.read_text())
         require(data["archiveSha256"] == digest and data["sha"] == sha,
                 "same SHA has a different archive digest")
+        seal_runtime_permissions(target)
         return
 
     stage = Path(tempfile.mkdtemp(prefix=".candidate-", dir=RELEASES))
@@ -428,7 +447,7 @@ def prepare_release(sha: str, digest: str, blob: bytes) -> None:
             "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund",
             cwd=stage / "integration", timeout=240)
         chown_tree(stage, 0, 0)
-        stage.chmod(0o755)
+        seal_runtime_permissions(stage)
         write_json(manifest, {"sha": sha, "archiveSha256": digest, "status": "prepared"})
         os.rename(stage, target)
     finally:

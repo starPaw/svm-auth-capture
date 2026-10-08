@@ -7,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import tarfile
 import tempfile
 import types
@@ -273,6 +274,79 @@ class HealthTests(unittest.TestCase):
         )):
             with self.assertRaisesRegex(RuntimeError, "Origin guard"):
                 cd.check_order_routes()
+
+
+class RuntimePermissionTests(unittest.TestCase):
+    def test_shell_launcher_imports_do_not_create_checkout_bytecode(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "ops").mkdir()
+            (root / "deploy.sh").write_bytes((Path(__file__).resolve().parents[1] / "deploy.sh").read_bytes())
+            (root / "ops/launch_deploy.py").write_text("import fixture\n")
+            (root / "ops/fixture.py").write_text("pass\n")
+            environment = {key: value for key, value in os.environ.items()
+                           if key not in ("PYTHONDONTWRITEBYTECODE", "PYTHONPYCACHEPREFIX")}
+            subprocess.run(["bash", str(root / "deploy.sh")], env=environment, check=True)
+            self.assertFalse((root / "ops/__pycache__").exists())
+
+    def test_private_umask_release_is_readable_without_changing_bytes_or_external_links(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "runtime"
+            secret = Path(temporary) / "private"
+            secret.write_bytes(b"private fixture")
+            secret.chmod(0o600)
+            original_umask = os.umask(0o077)
+            try:
+                root.mkdir()
+                cd.unpack_archive(tar(FILES), root)
+                dependency = root / "integration/node_modules/package"
+                dependency.mkdir(parents=True)
+                executable = dependency / "cli"
+                executable.write_bytes(b"#!/bin/sh\n")
+                executable.chmod(0o700)
+                (dependency / "external").symlink_to(secret)
+            finally:
+                os.umask(original_umask)
+            self.assertEqual((root / "integration").stat().st_mode & 0o777, 0o700)
+            cd.seal_runtime_permissions(root)
+            for parent, dirs, files in os.walk(root):
+                self.assertEqual(Path(parent).stat().st_mode & 0o777, 0o755)
+                for name in files:
+                    path = Path(parent) / name
+                    if not path.is_symlink():
+                        self.assertEqual(path.stat().st_mode & 0o777,
+                                         0o755 if path == executable else 0o644)
+            for relative, contents in FILES.items():
+                self.assertEqual((root / relative).read_bytes(), contents)
+            self.assertEqual(secret.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(secret.read_bytes(), b"private fixture")
+
+    def test_prepared_release_permissions_are_repaired_before_reuse(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            releases, manifests = base / "releases", base / "manifests"
+            target = releases / NEW
+            (target / "integration").mkdir(parents=True)
+            (target / "integration").chmod(0o700)
+            manifests.mkdir()
+            cd.write_json(manifests / (NEW + ".json"), {"sha": NEW, "archiveSha256": "digest"})
+            with mock.patch.object(cd, "RELEASES", releases), mock.patch.object(cd, "MANIFESTS", manifests):
+                cd.prepare_release(NEW, "digest", b"already-verified archive")
+            self.assertEqual((target / "integration").stat().st_mode & 0o777, 0o755)
+
+    def test_reject_symlink_runtime_root(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "runtime"
+            root.symlink_to(temporary, target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, "unsafe runtime root"):
+                cd.seal_runtime_permissions(root)
+
+    def test_reject_special_runtime_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            os.mkfifo(root / "pipe")
+            with self.assertRaisesRegex(RuntimeError, "unsupported runtime file type"):
+                cd.seal_runtime_permissions(root)
 
 
 class SwitchingTests(unittest.TestCase):
