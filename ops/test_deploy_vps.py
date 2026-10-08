@@ -293,6 +293,19 @@ class ServiceMigrationTests(unittest.TestCase):
         self.assertFalse(host.PENDING.exists())
         self.assert_preserved()
 
+    def test_alias_layout_is_refused_before_service_stop(self):
+        self.migration_fixture()
+        path = host.UNITS / (host.LEGACY_SERVICES[0] + '.service')
+        path.write_text(path.read_text() + 'Alias=external.service\n')
+        with self.assertRaisesRegex(RuntimeError, 'aliases require'): host.deploy(NEW)
+        self.backup_mock.assert_not_called()
+        self.assertFalse(host.PENDING.exists())
+        self.assert_preserved()
+
+    def test_unavailable_systemd_is_not_mistaken_for_absent_service(self):
+        with mock.patch.object(source, 'run', side_effect=subprocess.CalledProcessError(1, ['systemctl'], output='')):
+            with self.assertRaisesRegex(RuntimeError, 'cannot determine backend'): host.stop()
+
 
 class BackupTests(unittest.TestCase):
     def test_backup_round_trip_preserves_busy_symlinks_metadata_and_original_wires(self):

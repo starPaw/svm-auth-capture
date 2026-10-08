@@ -374,6 +374,8 @@ def migration_snapshot(previous):
         if directory.exists():
             source.require(all(p.is_file() and not p.is_symlink() and p.suffix == '.conf' for p in directory.iterdir()),
                            'unexpected legacy drop-in entry')
+            source.require(all(p.stat().st_uid == os.getuid() and not p.stat().st_mode & 0o022 for p in directory.iterdir()),
+                           'unsafe legacy drop-in ownership/mode')
         effective = source.run('systemctl', 'show', '-p', 'DropInPaths', '--value', name).split()
         expected = [] if not directory.exists() else [str(p) for p in directory.iterdir()]
         source.require(set(effective) == set(expected), 'unmanaged service drop-ins; inspect before migration')
@@ -512,8 +514,9 @@ def stop(names=None):
     for name in names:
         try:
             state = source.run('systemctl', 'show', '-p', 'LoadState', '--value', name)
-        except subprocess.CalledProcessError:
-            continue
+        except subprocess.CalledProcessError as error:
+            source.require((error.stdout or '').strip() == 'not-found', 'cannot determine backend load state')
+            state = 'not-found'
         if state != 'not-found':
             available.append(name)
     if available:

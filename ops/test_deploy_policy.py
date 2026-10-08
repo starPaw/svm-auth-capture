@@ -1,5 +1,8 @@
 """Release eligibility and on-host command trust boundaries, offline."""
 import json
+import io
+import tarfile
+import contextlib
 import os
 from pathlib import Path
 import tempfile
@@ -9,6 +12,7 @@ from unittest import mock
 
 import deploy_demo as source
 import host_cli as cli
+import launch_deploy as launcher
 import release_policy as policy
 
 OLD, NEW = 'a' * 40, 'b' * 40
@@ -77,6 +81,50 @@ class ReleasePolicyTests(PolicyFixture):
 
 
 class HostCommandTests(unittest.TestCase):
+    def test_bootstrap_installs_reviewed_files_without_starting_systemd_job(self):
+        data = io.BytesIO()
+        with tarfile.open(fileobj=data, mode='w') as archive:
+            for name in cli.FILES:
+                member = tarfile.TarInfo('ops/' + name)
+                member.size = 5
+                archive.addfile(member, io.BytesIO(b'pass\n'))
+        with tempfile.TemporaryDirectory() as temporary:
+            program = launcher.INSTALLER.replace('/opt/capture402/controllers', temporary + '/controllers')
+            with (mock.patch.object(cli.sys, 'argv', ['installer', NEW, '--install-cli']),
+                  mock.patch.object(cli.sys, 'stdin', types.SimpleNamespace(buffer=io.BytesIO(data.getvalue()))),
+                  mock.patch.object(cli.sys, 'path', list(cli.sys.path)),
+                  mock.patch.object(cli, 'install_controllers') as install,
+                  mock.patch.object(cli.subprocess, 'run') as job, contextlib.redirect_stdout(io.StringIO())):
+                with self.assertRaises(SystemExit) as result: exec(program, {})
+            self.assertEqual(result.exception.code, 0)
+            self.assertEqual(set(install.call_args.args[1]), set(cli.FILES))
+            job.assert_not_called()
+
+    def test_legacy_command_delegates_to_same_gated_cli(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            with (mock.patch.object(source, 'BASE', base), mock.patch.object(cli, 'COMMAND', base / 'capture402'),
+                  mock.patch.object(cli, 'OLD_COMMAND', base / 'capture402-deploy')):
+                cli.install_controllers(NEW, {name: b'pass\n' for name in cli.FILES})
+                old = cli.OLD_COMMAND.read_text()
+                self.assertIn('exec /usr/local/sbin/capture402 deploy "$2"', old)
+                self.assertNotIn('deploy_demo.py', old)
+                self.assertEqual(cli.COMMAND.stat().st_mode & 0o777, 0o755)
+
+    def test_status_uses_live_process_metadata_without_github(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            out = io.StringIO()
+            with (mock.patch.object(source, 'BASE', Path(temporary)), mock.patch.object(source, 'CURRENT', Path(temporary) / 'current'),
+                  mock.patch.object(source.os, 'geteuid', return_value=0),
+                  mock.patch.object(source, 'run', side_effect=lambda *args: 'inactive' if 'ActiveState' in args else '0'),
+                  mock.patch.object(cli, 'GitHub') as api, contextlib.redirect_stdout(out)):
+                cli.main(['status'])
+            result = json.loads(out.getvalue())
+            self.assertFalse(result['pending'])
+            self.assertIsNone(result['lastResult'])
+            self.assertEqual(len(result['services']), 4)
+            api.assert_not_called()
+
     def test_rejected_release_does_not_install_or_start_anything(self):
         with (mock.patch.object(source.os, 'geteuid', return_value=0),
               mock.patch.object(cli, 'recover_first', return_value=False),

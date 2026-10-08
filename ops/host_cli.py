@@ -17,6 +17,7 @@ import release_policy as policy
 
 TOKEN = Path('/etc/capture402/github-release-readonly')
 COMMAND = Path('/usr/local/sbin/capture402')
+OLD_COMMAND = Path('/usr/local/sbin/capture402-deploy')
 FILES = ('deploy_demo.py', 'deploy_vps.py', 'host_cli.py', 'release_policy.py')
 
 
@@ -72,11 +73,16 @@ def install_controllers(sha, files):
         target = root / name
         source.require(not target.is_symlink(), 'controller is symlink')
         if target.exists():
+            info = target.stat()
+            source.require(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and not info.st_mode & 0o022,
+                           'unsafe immutable controller ownership/mode')
             source.require(target.read_bytes() == data, 'immutable controller changed')
         else:
             host.atomic_bytes(target, data)
     source.require(not COMMAND.is_symlink(), 'operator command is symlink')
+    source.require(not OLD_COMMAND.is_symlink(), 'legacy operator command is symlink')
     host.atomic_bytes(COMMAND, ('#!/bin/sh\nexec /usr/bin/python3 -B ' + str(root / 'host_cli.py') + ' "$@"\n').encode(), 0o755)
+    host.atomic_bytes(OLD_COMMAND, b'#!/bin/sh\nif [ "$#" -eq 2 ] && [ "$1" = "--manual" ]; then\n  exec /usr/local/sbin/capture402 deploy "$2"\nfi\nexec /usr/local/sbin/capture402 "$@"\n', 0o755)
     return root
 
 
@@ -105,7 +111,20 @@ def main(argv):
     source.require(os.geteuid() == 0, 'use sudo capture402 on the VPS')
     if argv == ['status']:
         receipt = source.BASE / 'last-result.json'
-        print(receipt.read_text() if receipt.exists() else '{"verdict":"UNKNOWN"}')
+        import deploy_vps as host
+        services = {}
+        for name in (*host.LEGACY_SERVICES, *host.PRODUCT_SERVICES):
+            try:
+                active = source.run('systemctl', 'show', '-p', 'ActiveState', '--value', name)
+                pid = source.run('systemctl', 'show', '-p', 'MainPID', '--value', name)
+                cwd = os.readlink('/proc/' + pid + '/cwd') if pid.isdecimal() and int(pid) > 0 else None
+                services[name] = {'state': active, 'pid': pid, 'cwd': cwd}
+            except (OSError, subprocess.CalledProcessError):
+                services[name] = {'state': 'unknown'}
+        print(json.dumps({'lastResult': json.loads(receipt.read_text()) if receipt.exists() else None,
+                          'current': str(source.CURRENT.resolve()) if source.CURRENT.is_symlink() else None,
+                          'pending': any((source.BASE / n).exists() for n in ('transaction.json', 'pending.json')),
+                          'maintenance': (source.BASE / 'maintenance').exists(), 'services': services}))
         return
     if argv == ['recover']:
         print('RECOVERED' if recover_first() else 'NO_PENDING')

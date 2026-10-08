@@ -13,11 +13,15 @@ import release_policy as policy
 # This constant program only installs the explicitly selected controller files.
 # SSH disconnect does not stop the systemd-owned deployment transaction.
 INSTALLER = r'''
-import io, os, pathlib, subprocess, sys, tarfile, tempfile
+import io, os, pathlib, stat, subprocess, sys, tarfile, tempfile
 sha = sys.argv[1]
 assert len(sha) == 40 and all(c in '0123456789abcdef' for c in sha)
 root = pathlib.Path('/opt/capture402/controllers') / sha
-root.mkdir(parents=True, exist_ok=True, mode=0o755)
+for directory in (root.parent.parent, root.parent, root):
+    assert not directory.is_symlink(), 'controller directory is symlink'
+    directory.mkdir(exist_ok=True, mode=0o755)
+    assert directory.stat().st_uid == os.geteuid(), 'controller directory owner changed'
+    directory.chmod(0o755)
 allowed = {'ops/deploy_demo.py', 'ops/deploy_vps.py', 'ops/host_cli.py', 'ops/release_policy.py'}
 data = sys.stdin.buffer.read(1024 * 1024)
 with tarfile.open(fileobj=io.BytesIO(data), mode='r:') as archive:
@@ -28,7 +32,10 @@ with tarfile.open(fileobj=io.BytesIO(data), mode='r:') as archive:
         target = root / pathlib.Path(member.name).name
         payload = archive.extractfile(member).read()
         compile(payload, str(target), 'exec')
+        assert not target.is_symlink(), 'controller file is symlink'
         if target.exists():
+            info = target.stat()
+            assert stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and not info.st_mode & 0o022, 'unsafe controller ownership/mode'
             assert target.read_bytes() == payload, 'existing controller changed'
         else:
             fd, temporary = tempfile.mkstemp(prefix='.controller-', dir=root)
