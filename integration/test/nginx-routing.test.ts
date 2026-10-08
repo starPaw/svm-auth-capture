@@ -22,6 +22,15 @@ import { createHarness, type Harness } from "./fixture.js";
 
 const fragmentPath = fileURLToPath(new URL("../deploy/nginx-resource.conf", import.meta.url));
 const fragment = readFileSync(fragmentPath, "utf8");
+const devFragmentPath = fileURLToPath(new URL("../deploy/dev/nginx-routes.conf", import.meta.url));
+const devFragment = readFileSync(devFragmentPath, "utf8");
+
+test("the development proxy routes only to its restaurant and never retries payment requests", () => {
+  expect([...devFragment.matchAll(/proxy_pass\s+(\S+);/g)].map(match => match[1]))
+    .toEqual(Array(5).fill("http://127.0.0.1:18888"));
+  expect(devFragment).toContain("proxy_next_upstream off;");
+  expect(devFragment).toContain("location / { return 404; }");
+});
 
 test("the browser's POST order-creation endpoint has an exact public nginx route", () => {
   const browser = readFileSync(new URL("../web/app.js", import.meta.url), "utf8");
@@ -34,7 +43,10 @@ test("the browser's POST order-creation endpoint has an exact public nginx route
 });
 
 const nginxBin = process.env.SAC006_TEST_NGINX;
-describe.skipIf(!nginxBin)("deployment fragment through nginx HTTPS (SAC006_TEST_NGINX)", () => {
+for (const [environment, testedFragmentPath, upstreamPort] of [
+  ["stable", fragmentPath, 8788], ["development", devFragmentPath, 18888],
+] as const) {
+describe.skipIf(!nginxBin)(`${environment} deployment fragment through nginx HTTPS (SAC006_TEST_NGINX)`, () => {
   let h: Harness, config: RestaurantConfig, backend: ServerType | undefined;
   let nginx: ChildProcess | undefined, dir: string | undefined, origin: string, ca: Buffer;
   const upstream: { path: string; method: string; headers: Headers }[] = [];
@@ -87,7 +99,7 @@ http {
     server_name localhost;
     ssl_certificate "${dir}/certificate.pem";
     ssl_certificate_key "${dir}/key.pem";
-    include "${fragmentPath}";
+    include "${testedFragmentPath}";
   }
 }
 `);
@@ -117,7 +129,7 @@ http {
     const app = createPresentationApp({ programId: config.programId, network: config.network, configured: true }, createRestaurantApp(config));
     // Use the fragment's actual fixed upstream; fail if the port is occupied.
     await new Promise<void>((resolve, reject) => {
-      backend = serve({ port: 8788, hostname: "127.0.0.1", fetch: req => {
+      backend = serve({ port: upstreamPort, hostname: "127.0.0.1", fetch: req => {
         upstream.push({ path: new URL(req.url).pathname, method: req.method, headers: req.headers });
         return app.fetch(req);
       } }, () => resolve());
@@ -152,6 +164,11 @@ http {
     for (const attribute of ["HttpOnly", "Secure", "SameSite=Strict", "Path=/"]) expect(cookie).toContain(attribute);
     expect(result.headers["x-content-type-options"]).toBe("nosniff");
     expect(result.headers["content-security-policy"]).toContain("default-src 'self'");
+    if (environment === "development") {
+      expect(result.headers["x-capture402-environment"]).toBe("development");
+      expect(result.headers["cache-control"]).toBe("no-store");
+      expect(result.headers["x-robots-tag"]).toBe("noindex, nofollow");
+    }
     const received = upstream.at(-1)!;
     expect(received).toMatchObject({ path: "/api/orders", method: "POST" });
     expect(received.headers.get("origin")).toBe(origin);
@@ -170,7 +187,7 @@ http {
     expect(upstream).toHaveLength(before);
   });
 
-  test.each(["/api/orders/", "/api/orders-other", "/api/private", "/api/orders/invalid", `/api/orders/${"a".repeat(32)}/actions/unrelated`, `/api/orders/${"a".repeat(32)}/reclaim/`, "/assets/private.js", "/settle", "/verify", "/supported"])("%s remains private or outside the allowlist", async path => {
+  test.each(["/api/orders/", "/api/orders-other", "/api/private", "/api/orders/invalid", `/api/orders/${"a".repeat(32)}/actions/unrelated`, `/api/orders/${"a".repeat(32)}/reclaim/`, "/assets/private.js", "/settle", "/verify", "/supported", "/json/list", "/.git/config"])("%s remains private or outside the allowlist", async path => {
     const before = upstream.length;
     for (const method of ["GET", "POST"]) expect((await https(path, method, { origin })).status).toBe(404);
     expect(upstream).toHaveLength(before);
@@ -201,3 +218,4 @@ http {
     expect(h.ledger.submissions).toHaveLength(0);
   });
 });
+}

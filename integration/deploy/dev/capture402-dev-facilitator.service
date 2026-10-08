@@ -1,0 +1,40 @@
+[Unit]
+Description=Capture402 isolated Devnet development facilitator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=capture402-dev-facilitator
+Group=capture402-dev-runtime
+Slice=capture402-dev.slice
+WorkingDirectory=/opt/capture402-dev/current/integration
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=/etc/capture402-dev/facilitator.env
+ExecStart=/usr/bin/env node --experimental-strip-types src/devnet-server.ts
+Restart=no
+TimeoutStopSec=30
+UMask=0077
+Nice=10
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectProc=invisible
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+InaccessiblePaths=/etc/sac006 /var/lib/sac006 /opt/capture402 /opt/svm-auth-capture
+InaccessiblePaths=/etc/capture402-dev/keys/merchant.json /etc/capture402-dev/keys/payer.json /etc/capture402-dev/keys/mint.json
+ReadWritePaths=/var/lib/capture402-dev/facilitator
+MemoryMax=384M
+TasksMax=64
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target

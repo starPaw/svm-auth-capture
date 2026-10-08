@@ -1,0 +1,12 @@
+[Unit]
+Description=Capture402 development resource budget
+
+[Slice]
+CPUAccounting=true
+CPUQuota=50%
+CPUWeight=10
+MemoryAccounting=true
+MemoryHigh=768M
+MemoryMax=1G
+TasksMax=128
+IOWeight=10
