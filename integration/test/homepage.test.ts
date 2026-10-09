@@ -1,4 +1,6 @@
 import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import { gzipSync } from "node:zlib";
 import { Hono } from "hono";
@@ -70,7 +72,16 @@ test("static evidence includes every full historical identity, URL, slot and cor
   for (const key of ["runSourceRevision", "recordedAuditAt", "programId", "paymentId", "mint", "sbfSha256"]) expect(html).toContain(proof[key]);
   expect(html).toContain("07 Oct 2026 · Test-token base units · Recorded evidence");
   for (const source of proof.sourceFiles) {
-    const content = readFileSync(new URL(`../../${source.path}`, import.meta.url));
+    // Evidence URLs pin historical bytes; current architecture docs may evolve.
+    const prefix = "https://github.com/starPaw/svm-auth-capture/blob/";
+    expect(source.url.startsWith(prefix)).toBe(true);
+    const revision = source.url.slice(prefix.length).split("/")[0];
+    expect(revision).toMatch(/^[0-9a-f]{40}$/);
+    expect(source.url).toBe(`${prefix}${revision}/${source.path}`);
+    const content = execFileSync("git", ["show", `${revision}:${source.path}`], {
+      cwd: fileURLToPath(new URL("../../", import.meta.url)),
+      maxBuffer: 8 * 1024 * 1024,
+    });
     expect(createHash("sha256").update(content).digest("hex")).toBe(source.sha256);
     expect(html).toContain(source.sha256); expect(html).toContain(source.url);
   }

@@ -22,7 +22,7 @@ for directory in (root.parent.parent, root.parent, root):
     directory.mkdir(exist_ok=True, mode=0o755)
     assert directory.stat().st_uid == os.geteuid(), 'controller directory owner changed'
     directory.chmod(0o755)
-allowed = {'ops/deploy_demo.py', 'ops/deploy_vps.py', 'ops/host_cli.py', 'ops/release_policy.py'}
+allowed = {'ops/deploy_demo.py', 'ops/deploy_vps.py', 'ops/host_cli.py', 'ops/release_policy.py', 'ops/deploy_dev.py'}
 data = sys.stdin.buffer.read(1024 * 1024)
 with tarfile.open(fileobj=io.BytesIO(data), mode='r:') as archive:
     members = archive.getmembers()
@@ -103,7 +103,7 @@ def main():
     source.require(sha == source.run('git', 'rev-parse', 'origin/main'), 'checkout differs from canonical main')
     # Shared eligibility policy is identical for local SSH and on-host operation.
     require_acceptance(sha)
-    blob = subprocess.run(['git', 'archive', '--format=tar', sha, 'ops/deploy_demo.py', 'ops/deploy_vps.py', 'ops/host_cli.py', 'ops/release_policy.py'],
+    blob = subprocess.run(['git', 'archive', '--format=tar', sha, 'ops/deploy_demo.py', 'ops/deploy_vps.py', 'ops/host_cli.py', 'ops/release_policy.py', 'ops/deploy_dev.py'],
                           check=True, capture_output=True).stdout
     # Git adds an ops/ directory; rebuild the small transfer as regular files only.
     output = io.BytesIO()

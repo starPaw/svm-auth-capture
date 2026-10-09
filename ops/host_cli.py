@@ -18,7 +18,7 @@ import release_policy as policy
 TOKEN = Path('/etc/capture402/github-release-readonly')
 COMMAND = Path('/usr/local/sbin/capture402')
 OLD_COMMAND = Path('/usr/local/sbin/capture402-deploy')
-FILES = ('deploy_demo.py', 'deploy_vps.py', 'host_cli.py', 'release_policy.py')
+FILES = ('deploy_demo.py', 'deploy_vps.py', 'host_cli.py', 'release_policy.py', 'deploy_dev.py')
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -109,6 +109,13 @@ def recover_first():
 
 def main(argv):
     source.require(os.geteuid() == 0, 'use sudo capture402 on the VPS')
+    if argv and argv[0] == 'dev':
+        import deploy_dev
+        try:
+            deploy_dev.dispatch(argv[1:])
+        except Exception:
+            raise RuntimeError('dev deployment blocked; inspect dev receipts and retained transaction') from None
+        return
     if argv == ['status']:
         receipt = source.BASE / 'last-result.json'
         import deploy_vps as host

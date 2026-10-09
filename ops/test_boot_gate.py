@@ -19,6 +19,7 @@ from unittest import mock
 
 import deploy_demo as source
 import deploy_vps as host
+import deploy_dev as dev
 
 
 NATIVE_RUN = source.run
@@ -391,6 +392,86 @@ http {{ access_log off; server {{ listen 127.0.0.1:{cfg['publicPort']}; include 
     def test_failed_gate_blocks_nginx_and_both_backends(self):
         (self.root/'gate-fail').touch()
         self.boot(failed=True)
+
+
+@unittest.skipUnless(ENABLED, 'explicit disposable Linux systemd test required')
+class DevFreezerTests(unittest.TestCase):
+    """Actual frozen cgroups and startup condition, using synthetic idle workers."""
+    def setUp(self):
+        self.assertEqual(os.geteuid(), 0)
+        self.assertEqual(os.environ.get('GITHUB_ACTIONS'), 'true', 'never run root fixtures on the VPS')
+        self.tmp = tempfile.TemporaryDirectory(prefix='capture402-test-dev-', dir='/run')
+        self.root = Path(self.tmp.name)
+        self.root.chmod(0o755)
+        self.prefix = 'capture402-test-dev-' + self.root.name.rsplit('-', 1)[-1]
+        self.names = (self.prefix + '-facilitator', self.prefix + '-restaurant')
+        self.slice = self.prefix + '.slice'
+        self.patches = []
+        self.addCleanup(self.cleanup)
+        for name, value in {'BASE': self.root, 'RELEASES': self.root / 'releases',
+                            'CURRENT': self.root / 'current', 'PENDING': self.root / 'transaction.json',
+                            'PERMIT': self.root / 'permit', 'SERVICES': self.names, 'SLICE': self.slice}.items():
+            patch = mock.patch.object(dev, name, value); patch.start(); self.patches.append(patch)
+        dev.RELEASES.mkdir()
+        (dev.RELEASES / ('a' * 40)).mkdir()
+        dev.CURRENT.symlink_to(dev.RELEASES / ('a' * 40))
+        host.atomic_bytes(Path('/run/systemd/system') / self.slice, b'[Slice]\nCPUQuota=10%\nMemoryMax=64M\n')
+        gate_script = self.root / 'gate.py'
+        gate_script.write_text('import sys\nfrom pathlib import Path\nsys.path.insert(0, ' + repr(str(Path(dev.__file__).parent)) + ')\nimport deploy_dev as d\nd.BASE=Path(' + repr(str(self.root)) + ')\nd.RELEASES=d.BASE/"releases"\nd.CURRENT=d.BASE/"current"\nd.PENDING=d.BASE/"transaction.json"\nd.PERMIT=d.BASE/"permit"\nd.main(["gate"])\n')
+        worker = self.root / 'worker.py'
+        worker.write_text('import time\nwhile True: time.sleep(.02)\n')
+        for name in self.names:
+            data = ('[Service]\nType=simple\nUser=nobody\nInaccessiblePaths=' + str(gate_script) + '\nSlice=' + self.slice + '\nRestart=no\n'
+                    'ExecCondition=+' + sys.executable + ' -B ' + str(gate_script) + '\n'
+                    'ExecStart=' + sys.executable + ' -B ' + str(worker) + '\n')
+            host.atomic_bytes(Path('/run/systemd/system') / (name + '.service'), data.encode())
+        NATIVE_RUN('systemctl', 'daemon-reload')
+        NATIVE_RUN('systemctl', 'start', *self.names)
+        for name in self.names:
+            self.assertEqual(NATIVE_RUN('systemctl', 'is-active', name), 'active')
+
+    def cleanup(self):
+        try:
+            subprocess.run(['systemctl', 'thaw', *self.names], capture_output=True, timeout=10)
+            subprocess.run(['systemctl', 'stop', *self.names, self.slice], capture_output=True, timeout=10)
+            for name in (*[n + '.service' for n in self.names], self.slice):
+                (Path('/run/systemd/system') / name).unlink(missing_ok=True)
+            subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=10)
+            subprocess.run(['systemctl', 'reset-failed', *self.names], capture_output=True, timeout=10)
+        finally:
+            for patch in reversed(self.patches): patch.stop()
+            self.tmp.cleanup()
+
+    def test_frozen_idle_workers_are_killed_without_resuming(self):
+        dev.freeze()
+        dev.stop()
+        for name in self.names:
+            self.assertEqual(NATIVE_RUN('systemctl', 'show', '-p', 'MainPID', '--value', name), '0')
+
+    def test_aborted_freeze_retains_same_worker_pids(self):
+        pids = [NATIVE_RUN('systemctl', 'show', '-p', 'MainPID', '--value', n) for n in self.names]
+        dev.freeze(); dev.thaw()
+        self.assertEqual(pids, [NATIVE_RUN('systemctl', 'show', '-p', 'MainPID', '--value', n) for n in self.names])
+        for name in self.names: self.assertEqual(NATIVE_RUN('systemctl', 'is-active', name), 'active')
+
+    def test_pre_stop_reboot_recovers_old_workers_offline(self):
+        NATIVE_RUN('systemctl', 'stop', *self.names)
+        source.write_json(dev.PENDING, {'previous': 'a' * 40, 'target': 'b' * 40, 'stage': 'freezing'})
+        with mock.patch.object(dev, 'ready'):
+            with dev.locked(): self.assertTrue(dev.recover())
+        self.assertFalse(dev.PENDING.exists())
+        for name in self.names: self.assertEqual(NATIVE_RUN('systemctl', 'is-active', name), 'active')
+
+    def test_retained_transaction_blocks_boot_until_operator_permit(self):
+        NATIVE_RUN('systemctl', 'stop', *self.names)
+        source.write_json(dev.PENDING, {'stage': 'stopping'})
+        for name in self.names:
+            NATIVE_RUN('systemctl', 'start', name)
+            self.assertEqual(NATIVE_RUN('systemctl', 'show', '-p', 'MainPID', '--value', name), '0')
+        host.atomic_bytes(dev.PERMIT, ('a' * 40).encode(), 0o600)
+        NATIVE_RUN('systemctl', 'start', *self.names)
+        for name in self.names: self.assertEqual(NATIVE_RUN('systemctl', 'is-active', name), 'active')
+        host.durable_remove(dev.PERMIT)
 
 
 if __name__=='__main__':
