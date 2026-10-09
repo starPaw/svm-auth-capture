@@ -153,6 +153,28 @@ http {
     if (dir) rmSync(dir, { recursive: true, force: true });
   });
 
+  test("homepage is isolated and exact dev assets are GET-only through the real proxy", async () => {
+    const root = await https("/");
+    expect(root.status).toBe(200); expect(root.body).toContain("Authorize once.");
+    expect(root.body).not.toContain('src="/assets/app.js"');
+    for (const path of ["/customer", "/merchant"]) {
+      const demo = await https(path); expect(demo.status).toBe(200); expect(demo.body).toContain("Pivovar Marina");
+    }
+    if (environment === "development") {
+      expect(root.headers["x-robots-tag"]).toBe("noindex, nofollow");
+      expect(root.headers["cache-control"]).toBe("no-store");
+      for (const [name, mime] of [["homepage.css", "text/css"], ["homepage.js", "text/javascript"]]) {
+        const asset = await https(`/assets/${name}`); expect(asset.status).toBe(200);
+        expect(asset.headers["content-type"]).toBe(`${mime}; charset=utf-8`);
+        const before = upstream.length;
+        for (const method of ["HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]) expect((await https(`/assets/${name}`, method)).status).toBe(405);
+        for (const path of [`/assets/${name}/`, `/assets/${name}.extra`]) expect((await https(path)).status).toBe(404);
+        expect(upstream).toHaveLength(before);
+      }
+    }
+    expect(h.ledger.submissions).toHaveLength(0);
+  });
+
   test("same-origin POST returns the real 402 offer, PAYMENT-REQUIRED and secure session cookie", async () => {
     const result = await https("/api/orders", "POST", { origin, "content-type": "application/json", "sec-fetch-site": "same-origin" }, JSON.stringify({ payer: h.payer.address, scenario: "normal" }));
     expect(result.status).toBe(402);
