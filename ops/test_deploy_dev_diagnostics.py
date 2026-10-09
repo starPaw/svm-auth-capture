@@ -132,6 +132,27 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(r['consistency'], 'inconsistent')
         self.assertIsNone(r['after'])
 
+    def test_diagnostic_report_retained_durably_outside_selected_store(self):
+        before = self.path.read_bytes()
+        with mock.patch.object(dev, 'BASE', self.root), mock.patch.object(dev, 'trusted'), mock.patch.object(dev, '_dev_rpc_call', side_effect=RuntimeError(SECRET_URL)), redirect_stdout(io.StringIO()):
+            r = dev.inspect_tx(SIGNATURE)
+        self.assertEqual(r['retention'], 'stored')
+        record = self.root / 'diagnostics' / r['id'] / 'record.json'
+        self.assertEqual(json.loads(record.read_text()), r)
+        self.assertEqual(record.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(record.parent.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertNotIn('DO_NOT_PRINT', record.read_text())
+
+    def test_diagnostic_reporting_failure_keeps_observation_and_original_unchanged(self):
+        before = self.path.read_bytes()
+        with mock.patch.object(dev, 'BASE', self.root), mock.patch.object(dev, 'trusted'), mock.patch.object(dev.host, 'atomic_bytes', side_effect=OSError(28, SECRET_URL)), mock.patch.object(dev, '_dev_rpc_call', side_effect=RuntimeError(SECRET_URL)), redirect_stdout(io.StringIO()):
+            r = dev.inspect_tx(SIGNATURE)
+        self.assertEqual(r['retention'], 'unavailable')
+        self.assertEqual(r['consistency'], 'unchanged')
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertNotIn('DO_NOT_PRINT', json.dumps(r))
+
     def test_replacement_during_bounded_read_refused(self):
         original = dev.os.read
         def change(fd, length):

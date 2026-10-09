@@ -1163,6 +1163,38 @@ def _dev_rpc_call(url, method, params):
     return result['result']
 
 
+def retain_diagnostic(report):
+    """Retain only the public observation, never original bytes, outside stores."""
+    report['id'] = f'{time.time_ns():020d}-' + uuid.uuid4().hex
+    report['retention'] = 'unavailable'
+    try:
+        trusted(BASE, True)
+        root = BASE / 'diagnostics'
+        root.mkdir(mode=0o700, exist_ok=True)
+        trusted(root, True)
+        source.require(root.stat().st_mode & 0o077 == 0, 'unsafe diagnostic directory')
+        fd = os.open(root / 'allocation.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        try:
+            info = os.fstat(fd)
+            source.require(info.st_uid == os.geteuid() and info.st_mode & 0o077 == 0, 'unsafe diagnostic lock')
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            source.require(sum(1 for p in root.iterdir() if ATTEMPT_RE.fullmatch(p.name)) < 4096,
+                           'diagnostic retention capacity reached')
+            directory = root / report['id']
+            directory.mkdir(mode=0o700)
+            sync(root)
+            report['retention'] = 'stored'
+            data = (json.dumps(report, sort_keys=True) + '\n').encode()
+            source.require(len(data) <= 32768, 'diagnostic report too large')
+            host.atomic_bytes(directory / 'record.json', data, 0o600)
+            sync(BASE)
+        finally:
+            os.close(fd)
+    except Exception:
+        report['retention'] = 'unavailable'
+        # Read-only observations remain usable with an explicit retention gap.
+
+
 def inspect_tx(signature):
     source.require(bool(re.fullmatch(r'[1-9A-HJ-NP-Za-km-z]{80,90}', signature)), 'invalid signature format')
     journal = state_paths()[0]
@@ -1196,6 +1228,7 @@ def inspect_tx(signature):
                 report['consistency'] = 'inconsistent'
         except Exception:
             report['consistency'] = 'inconsistent'
+        retain_diagnostic(report)
         print('Original byte evidence:', json.dumps(report, sort_keys=True))
         if report['consistency'] != 'unchanged':
             print('INCONSISTENT original observation; no frozen global snapshot or recovery is established')
