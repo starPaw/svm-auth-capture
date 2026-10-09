@@ -298,6 +298,35 @@ time.sleep(60)
         self.assertEqual(dev.safe_last_result(), {'verdict': 'UNAVAILABLE'})
 
 
+class ProductionObservationTests(fixtures.DevFixture):
+    def test_process_cwd_entrypoint_and_routing_are_sanitized_and_scoped(self):
+        def run(*args, **kwargs):
+            field = args[args.index('-p') + 1]
+            return {'MainPID': '123', 'ActiveState': 'active', 'FragmentPath': '',
+                    'InvocationID': 'e' * 32, 'ExecStart': SECRET,
+                    'WorkingDirectory': str(dev.source.RELEASES / fixtures.OLD / 'integration')}[field]
+        with mock.patch.object(dev.source, 'run', side_effect=run), mock.patch.object(dev.host, 'inventory', return_value={SECRET: ['file', 'f' * 64]}), mock.patch.object(dev.os, 'readlink', return_value=str(dev.source.RELEASES / fixtures.OLD / 'integration')), mock.patch.object(dev.Path, 'read_bytes', return_value=SECRET.encode()):
+            r = dev.observation()
+        self.assertEqual(r['state'], 'available')
+        self.assertNotIn('SECRET', json.dumps(r))
+        self.assertEqual(set(r['processes']), set((*dev.host.LEGACY_SERVICES, *dev.host.PRODUCT_SERVICES)))
+        for item in r['processes'].values():
+            self.assertEqual(item['applicationSha'], fixtures.OLD)
+            self.assertEqual(item['cwd'], 'release-integration')
+            self.assertRegex(item['entrypointSha256'], '[a-f0-9]{64}')
+        a = dev.Attempt.create(fixtures.NEW)
+        a.record['production']['before'] = r
+        with mock.patch.object(dev, 'observation', return_value=r): a.finish('FAILED')
+        self.assertEqual(dev.latest_attempt()['production']['classification'], 'unchanged')
+
+    def test_unavailable_process_inventory_has_no_raw_exception(self):
+        with mock.patch.object(dev.source, 'run', side_effect=RuntimeError(SECRET)):
+            r = dev.observation()
+        self.assertEqual(r['state'], 'unavailable')
+        self.assertNotIn('SECRET', json.dumps(r))
+
+
 def load_tests(loader, tests, pattern):
     # Reuse fixtures, without rerunning inherited tests from the existing suite.
-    return unittest.TestSuite(AttemptTests(name) for name in AttemptTests.__dict__ if name.startswith('test_'))
+    return unittest.TestSuite(cls(name) for cls in (AttemptTests, ProductionObservationTests)
+                              for name in cls.__dict__ if name.startswith('test_'))
