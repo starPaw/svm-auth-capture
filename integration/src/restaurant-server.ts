@@ -24,8 +24,11 @@ export function createPresentationApp(info: { programId: string; network: string
     c.header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: https://c.praguemarina.cz; connect-src 'self'; frame-src https://connect.solflare.com; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
     await next();
   });
-  for (const route of ["/", "/customer", "/merchant"]) app.get(route, c => c.html(readFileSync(`${root}index.html`, "utf8")));
-  for (const [name, mime] of [["app.js", "text/javascript"], ["wallet.js", "text/javascript"], ["style.css", "text/css"], ["solflare.js", "text/javascript"], ["solflare.js.LEGAL.txt", "text/plain"]]) app.get(`/assets/${name}`, c => { c.header("Content-Type", `${mime}; charset=utf-8`); return c.body(readFileSync(`${root}${name}`)); });
+  app.all("/assets/homepage.css", async (c, next) => { if (c.req.method !== "GET") return c.body(null, 405); await next(); });
+  app.all("/assets/homepage.js", async (c, next) => { if (c.req.method !== "GET") return c.body(null, 405); await next(); });
+  app.get("/", c => c.html(readFileSync(`${root}homepage.html`, "utf8")));
+  for (const route of ["/customer", "/merchant"]) app.get(route, c => c.html(readFileSync(`${root}index.html`, "utf8")));
+  for (const [name, mime] of [["homepage.css", "text/css"], ["homepage.js", "text/javascript"], ["app.js", "text/javascript"], ["wallet.js", "text/javascript"], ["style.css", "text/css"], ["solflare.js", "text/javascript"], ["solflare.js.LEGAL.txt", "text/plain"]]) app.get(`/assets/${name}`, c => { c.header("Content-Type", `${mime}; charset=utf-8`); return c.body(readFileSync(`${root}${name}`)); });
   app.get("/api/config", c => c.json({ ...info, venue: "Pivovar Marina", budget: 100, decimals: 6, assetLabel: "demo USDC", cluster: "devnet", walletChain: "solana:devnet", computeBudget: DEMO_COMPUTE, timing: DEMO_TIMING }));
   if (backend) app.route("/", backend);
   else { for (const pattern of ["/api/*", "/resource"]) app.all(pattern, c => c.json({ error: "Devnet demo awaits keypairs, six-decimal test mint and token funding." }, 503)); }
