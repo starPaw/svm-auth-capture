@@ -31,16 +31,16 @@
 .c402-home-mobile-break{display:none}
 #c402-home-root h2{font-size:44px;line-height:1.08;letter-spacing:-.035em;margin:0 0 20px;font-weight:700}
 #c402-home-root h3{font-size:24px;line-height:1.2;margin:0 0 14px}
-#c402-home-root p{margin-top:0}
+.c402-home-page p{margin-top:0}
 .c402-home-lead{font-size:20px;line-height:1.5;margin-bottom:40px}
 .c402-home-clarifier{color:var(--muted);margin-bottom:44px;max-width:590px}
 .c402-home-actions{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
 .c402-home-note{color:var(--muted);font-size:14px;line-height:1.55}
 .c402-home-actions+.c402-home-note{margin-top:20px}
 .c402-home-instrument{margin:8px 0 0;padding:28px;border:1px solid var(--line);border-radius:8px;background:var(--surface)}
-.c402-home-instrument>.c402-home-eyebrow{margin-bottom:12px;letter-spacing:0}
+.c402-home-instrument>.c402-home-eyebrow{margin-bottom:8px;letter-spacing:0}
 .c402-home-maximum{display:flex;align-items:center;justify-content:space-between;gap:24px;margin-bottom:12px}
-.c402-home-maximum>strong{font-size:96px;line-height:1.15;letter-spacing:-.045em}
+.c402-home-maximum>strong{font-size:96px;line-height:1.05;letter-spacing:-.045em}
 .c402-home-maximum p{font-size:14px;color:var(--muted);margin-bottom:0}
 .c402-home-maximum .c402-home-eyebrow{line-height:2.8;letter-spacing:0}
 .c402-home-bracket{height:12px;margin-bottom:8px;border-bottom:1px solid var(--ink);position:relative}
@@ -54,13 +54,13 @@
 .c402-home-held{background:#e5eafe}
 .c402-home-final .c402-home-first{width:30%}.c402-home-final .c402-home-second{width:20%}.c402-home-final .c402-home-released{width:50%}
 .c402-home-receipt{margin:0 0 20px}
-.c402-home-receipt>div{display:flex;flex-direction:row-reverse;justify-content:flex-end;align-items:flex-start;gap:28px;padding:12px 0;border-bottom:1px solid var(--line)}
+.c402-home-receipt>div{display:flex;flex-direction:row-reverse;justify-content:flex-end;align-items:flex-start;gap:28px;padding:8px 0;border-bottom:1px solid var(--line)}
 .c402-home-receipt dd{margin:0;font:28px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;min-width:60px}
 .c402-home-receipt dt{font-size:20px;line-height:1.3}
 #c402-home-root small{display:block;font-size:14px;font-weight:400;line-height:1.55;color:var(--muted)}
 .c402-home-receipt small{margin-top:4px}
 .c402-home-blue{color:var(--blue)}.c402-home-teal{color:var(--teal)}
-#c402-home-root .c402-home-instrument-footer{margin:28px 0 0;font-size:11px;letter-spacing:0}
+#c402-home-root .c402-home-instrument-footer{margin:24px 0 0;font-size:12px;letter-spacing:0}
 .c402-home-teaser{margin-top:64px;border-top:1px solid var(--line);padding:24px 0 0;display:flex;align-items:center;justify-content:space-between;gap:24px;font-size:16px}
 .c402-home-teaser p{margin:0}.c402-home-teaser a{font-weight:700;min-height:48px;display:flex;align-items:center}
 .c402-home-section{padding-top:112px;padding-bottom:112px}
@@ -138,3 +138,7 @@
 @media(max-width:767px){.c402-home-page{font-size:16px}.c402-home-wrap{width:calc(100% - 40px)}.c402-home-header{min-height:68px}#c402-home-root .c402-home-brand{font-size:22px}.c402-home-menu[open] summary{top:-58px}.c402-home-hero{padding-top:40px}#c402-home-root h1{font-size:44px;line-height:.99;margin:24px 0}.c402-home-mobile-break{display:initial}#c402-home-root h1>span{white-space:normal}.c402-home-lead{font-size:18px;margin-bottom:28px}.c402-home-clarifier{margin-bottom:24px}.c402-home-actions{display:flex;flex-direction:column;align-items:stretch}.c402-home-actions :is(a,button){width:100%}.c402-home-note{font-size:14px}.c402-home-instrument{padding:20px}.c402-home-maximum>strong{font-size:64px}.c402-home-maximum{gap:12px}.c402-home-maximum p{font-size:14px}.c402-home-bar{height:64px}.c402-home-final>span{font-size:0}.c402-home-receipt>div{gap:16px}.c402-home-receipt dt{font-size:18px}.c402-home-receipt dd{font-size:24px;min-width:32px}.c402-home-instrument-footer{line-height:1.6!important}.c402-home-teaser{margin-top:32px;padding-top:24px;align-items:flex-start;flex-direction:column;gap:8px}.c402-home-teaser>p:nth-child(2){display:none}.c402-home-section{padding-block:56px}#c402-home-root h2,.c402-home-section h2{font-size:32px!important}#c402-home-root h3{font-size:22px}.c402-home-controls{grid-template-columns:repeat(2,1fr);gap:12px;margin:32px 0}.c402-home-controls button{padding:12px!important;font-size:14px!important}.c402-home-lifecycle-grid{grid-template-columns:1fr;gap:24px;margin-top:32px}.c402-home-totals{gap:12px}.c402-home-totals dd{font-size:28px}.c402-home-totals dt{font-size:12px}.c402-home-disclosures,.c402-home-two-columns{grid-template-columns:1fr;gap:0}.c402-home-two-columns{gap:32px}.c402-home-trust{margin:32px 0}.c402-home-evidence{display:block;margin-top:32px}.c402-home-evidence caption{display:block;font-size:12px;line-height:1.6}.c402-home-evidence tr{display:block;padding:24px 0}.c402-home-evidence th{font-size:22px;padding-bottom:12px}.c402-home-evidence td{padding:0}.c402-home-evidence td:last-child{margin-top:12px}.c402-home-evidence small{margin-top:8px}.c402-home-evidence td:last-child small{font-size:12px}.c402-home-identifiers,.c402-home-record dl{grid-template-columns:1fr;gap:8px}.c402-home-identifiers dd,.c402-home-record dd{margin-bottom:12px}.c402-home-proof .c402-home-sources{padding-left:16px}.c402-home-proof-total{font-size:17px}.c402-home-architecture{margin:32px 0}.c402-home-consent{padding:0 0 24px}.c402-home-applications{grid-template-columns:1fr;gap:32px;margin-top:40px}.c402-home-applications li+li{padding-left:0;border:0}.c402-home-applications .c402-home-eyebrow{margin-bottom:12px}.c402-home-demo{padding:24px;margin-bottom:32px}.c402-home-footer{grid-template-columns:1fr;gap:24px;padding-bottom:32px}}
 @media(max-width:359px){.c402-home-wrap{width:calc(100% - 32px)}#c402-home-root h1{font-size:40px}.c402-home-maximum{flex-wrap:wrap}.c402-home-maximum>strong{font-size:56px}.c402-home-totals{grid-template-columns:1fr;gap:12px}.c402-home-totals>div{flex-direction:row;align-items:center;justify-content:space-between}.c402-home-totals dt{font-size:14px}.c402-home-receipt dt{font-size:16px}.c402-home-demo{padding:20px}}
 @media(prefers-reduced-motion:reduce){#c402-home-root *,#c402-home-root *::before,#c402-home-root *::after{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
+
+#c402-home-root .c402-home-two-columns a,#c402-home-root .c402-home-sources a{display:inline-flex;align-items:center;min-height:44px}
+
+#c402-home-root .c402-home-controls button{transition:none}
