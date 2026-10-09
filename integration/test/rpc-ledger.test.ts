@@ -6,12 +6,20 @@
 // read-only `ChainReader` evidence used by reconciliation.
 import {
   type Address,
+  appendTransactionMessageInstructions,
+  compileTransaction,
+  createTransactionMessage,
   generateKeyPairSigner,
   getBase64EncodedWireTransaction,
   getCompiledTransactionMessageDecoder,
   getSignatureFromTransaction,
+  getTransactionDecoder,
   getSolanaErrorFromJsonRpcError,
   lamports,
+  partiallySignTransaction,
+  pipe,
+  setTransactionMessageFeePayer,
+  setTransactionMessageLifetimeUsingBlockhash,
   type Rpc,
   SolanaError,
   SOLANA_ERROR__JSON_RPC__SERVER_ERROR_SEND_TRANSACTION_PREFLIGHT_FAILURE,
@@ -49,6 +57,18 @@ async function sampleTransaction(): Promise<Transaction> {
     signers: [feePayer],
     lifetime: { blockhash: "11111111111111111111111111111111111111111111" as never, lastValidBlockHeight: 1n },
   });
+}
+
+/** Real SDK-encoded, locally signed read-side fixtures; never submitted to any cluster. */
+async function sampleVersionedTransaction(version: 0 | 1): Promise<Transaction> {
+  const [payer, destination] = await Promise.all([generateKeyPairSigner(), generateKeyPairSigner()]);
+  const message = pipe(
+    createTransactionMessage({ version }),
+    m => setTransactionMessageFeePayer(payer.address, m),
+    m => setTransactionMessageLifetimeUsingBlockhash({ blockhash: GENESIS as never, lastValidBlockHeight: 1n }, m),
+    m => appendTransactionMessageInstructions([getTransferSolInstruction({ source: payer, destination: destination.address, amount: lamports(1n) })], m),
+  );
+  return partiallySignTransaction([payer.keyPair], compileTransaction(message));
 }
 
 /** Builds a Clock sysvar account's base64 `data` for a given `unix_timestamp`. */
@@ -637,6 +657,181 @@ describe("RpcLedger network awaits are bounded", () => {
     expect((await ledger.getAccountAtLeast(PROGRAM_ID, 1n)).kind).toBe("unavailable");
   });
 });
+
+describe("RpcLedger versioned message history", () => {
+  const ledgerWithHistory = (entries: unknown, getTransaction: unknown, options: Partial<{ confirmTimeoutMs: number; requestTimeoutMs: number }> = {}) =>
+    new RpcLedger({
+      network: NETWORK, genesisHash: GENESIS, rpcUrl: "http://unused.invalid", ...options,
+      rpc: fakeRpc({ getSignaturesForAddress: () => sendable(entries), getTransaction }),
+    });
+
+  test.each([0, 1] as const)("encoded v%s before legacy does not hide the original payment", async version => {
+    const original = await sampleTransaction();
+    const other = await sampleVersionedTransaction(version);
+    const signature = getSignatureFromTransaction(original);
+    const otherSignature = getSignatureFromTransaction(other);
+    const wire = getBase64EncodedWireTransaction(other);
+    const bytes = Buffer.from(wire, "base64");
+    if (version === 1) {
+      // v1 is a message-first envelope, with signatures at the end, not a relabelled v0.
+      expect(bytes[0]).toBe(0x81);
+      expect(bytes.subarray(0, other.messageBytes.length)).toEqual(Buffer.from(other.messageBytes));
+      expect(bytes.subarray(other.messageBytes.length)).toEqual(Buffer.from(Object.values(other.signatures)[0]!));
+    }
+    const roundtrip = getTransactionDecoder().decode(bytes);
+    expect(getCompiledTransactionMessageDecoder().decode(roundtrip.messageBytes).version).toBe(version);
+    expect(getSignatureFromTransaction(roundtrip)).toBe(otherSignature);
+    const reads: string[] = [];
+    const ledger = ledgerWithHistory([{ signature: otherSignature }, { signature }], (sig: string, config: unknown) => {
+      expect(config).toEqual({ encoding: "base64", commitment: "confirmed", maxSupportedTransactionVersion: 1 });
+      reads.push(sig);
+      return sendable({ transaction: [sig === otherSignature ? wire : getBase64EncodedWireTransaction(original), "base64"] });
+    });
+    expect(getCompiledTransactionMessageDecoder().decode(original.messageBytes).version).toBe("legacy");
+    expect(await ledger.findSignaturesByMessage(PROGRAM_ID, new Uint8Array(original.messageBytes)))
+      .toEqual({ kind: "ok", signatures: [signature], truncated: false });
+    expect(reads).toEqual([otherSignature, signature]);
+  });
+
+  test("authenticates an exact v1 message as read-only history evidence", async () => {
+    const tx = await sampleVersionedTransaction(1);
+    const signature = getSignatureFromTransaction(tx);
+    const ledger = ledgerWithHistory([{ signature }], () => sendable({ transaction: [getBase64EncodedWireTransaction(tx), "base64"] }));
+    expect(await ledger.findSignaturesByMessage(PROGRAM_ID, new Uint8Array(tx.messageBytes)))
+      .toEqual({ kind: "ok", signatures: [signature], truncated: false });
+  });
+
+  test.each(["listed signature", "grafted signature", "tampered message", "missing signature"] as const)(
+    "%s cannot authenticate v1 history, even when filtering a nonmatch", async corruption => {
+      const tx = await sampleVersionedTransaction(1);
+      const other = await sampleTransaction();
+      const payer = getCompiledTransactionMessageDecoder().decode(tx.messageBytes).staticAccounts[0]!;
+      let signature = getSignatureFromTransaction(tx);
+      let wire: string = getBase64EncodedWireTransaction(tx);
+      if (corruption === "listed signature") signature = getSignatureFromTransaction(other);
+      if (corruption === "grafted signature" || corruption === "missing signature") {
+        const forged = { ...tx, signatures: { ...tx.signatures, [payer]: corruption === "missing signature" ? null : Object.values(other.signatures)[0]! } };
+        wire = getBase64EncodedWireTransaction(forged);
+        if (corruption === "grafted signature") signature = getSignatureFromTransaction(forged);
+      }
+      if (corruption === "tampered message") {
+        const bytes = Buffer.from(wire, "base64");
+        bytes[8] = bytes[8]! ^ 1; // Change the lifetime token, keeping a valid v1 message layout.
+        wire = bytes.toString("base64");
+      }
+      const ledger = ledgerWithHistory([{ signature }], () => sendable({ transaction: [wire, "base64"] }));
+      for (const message of [new Uint8Array(tx.messageBytes), new Uint8Array(other.messageBytes)]) {
+        expect((await ledger.findSignaturesByMessage(PROGRAM_ID, message)).kind).toBe("unavailable");
+      }
+    },
+  );
+
+  test.each(["short envelope", "missing instruction payload", "trailing message bytes", "future version"] as const)(
+    "%s before legacy remains unknown rather than being skipped", async corruption => {
+      const tx = await sampleVersionedTransaction(1);
+      const original = await sampleTransaction();
+      const signature = getSignatureFromTransaction(tx);
+      const bytes = Buffer.from(getBase64EncodedWireTransaction(tx), "base64");
+      const messageEnd = tx.messageBytes.length;
+      let wire: Buffer;
+      if (corruption === "short envelope") wire = bytes.subarray(0, 10);
+      else if (corruption === "missing instruction payload") {
+        // Preserve the signer prefix and signature suffix: the envelope decoder alone accepts this.
+        wire = Buffer.concat([bytes.subarray(0, messageEnd - 1), bytes.subarray(messageEnd)]);
+        expect(getSignatureFromTransaction(getTransactionDecoder().decode(wire))).toBe(signature);
+      } else if (corruption === "trailing message bytes") {
+        wire = Buffer.concat([bytes.subarray(0, messageEnd), Buffer.from([0]), bytes.subarray(messageEnd)]);
+      } else {
+        wire = Buffer.from(bytes);
+        wire[0] = 0x82;
+      }
+      const getTransaction = vi.fn(() => sendable({ transaction: [wire.toString("base64"), "base64"] }));
+      const ledger = ledgerWithHistory([{ signature }, { signature: getSignatureFromTransaction(original) }], getTransaction);
+      expect((await ledger.findSignaturesByMessage(PROGRAM_ID, new Uint8Array(original.messageBytes))).kind).toBe("unavailable");
+      expect(getTransaction).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  test.each([null, new Error("429"), new Error("Transaction version (1) is not supported"), { transaction: ["garbage", "json"] }])(
+    "unretrievable v1 entry never establishes absence: %s", async response => {
+      const tx = await sampleVersionedTransaction(1);
+      const getTransaction = vi.fn(() => response instanceof Error
+        ? { send: () => Promise.reject(response) } : sendable(response));
+      const ledger = ledgerWithHistory([{ signature: getSignatureFromTransaction(tx) }], getTransaction);
+      expect((await ledger.findSignaturesByMessage(PROGRAM_ID, new Uint8Array([9]))).kind).toBe("unavailable");
+    },
+  );
+
+  test.each([49, 50])("an authenticated v1 scan of %s entries reports its search bound", async count => {
+    const tx = await sampleVersionedTransaction(1);
+    const signature = getSignatureFromTransaction(tx);
+    const getTransaction = vi.fn(() => sendable({ transaction: [getBase64EncodedWireTransaction(tx), "base64"] }));
+    const list = vi.fn((_address: Address, config: unknown) => {
+      expect(config).toEqual({ limit: 50, commitment: "confirmed" });
+      return sendable(Array.from({ length: count }, () => ({ signature })));
+    });
+    const ledger = new RpcLedger({ network: NETWORK, genesisHash: GENESIS, rpcUrl: "http://unused.invalid",
+      rpc: fakeRpc({ getSignaturesForAddress: list, getTransaction }) });
+    expect(await ledger.findSignaturesByMessage(PROGRAM_ID, new Uint8Array([9])))
+      .toEqual({ kind: "ok", signatures: [], truncated: count === 50 });
+    expect(getTransaction).toHaveBeenCalledTimes(count);
+  });
+
+  test("finds legacy at the last entry of a full v1-prefixed page", async () => {
+    const tx = await sampleVersionedTransaction(1);
+    const original = await sampleTransaction();
+    const signature = getSignatureFromTransaction(original);
+    const otherSignature = getSignatureFromTransaction(tx);
+    const entries = [...Array.from({ length: 49 }, () => ({ signature: otherSignature })), { signature }];
+    const ledger = ledgerWithHistory(entries, (sig: string) =>
+      sendable({ transaction: [getBase64EncodedWireTransaction(sig === signature ? original : tx), "base64"] }));
+    expect(await ledger.findSignaturesByMessage(PROGRAM_ID, new Uint8Array(original.messageBytes)))
+      .toEqual({ kind: "ok", signatures: [signature], truncated: false });
+  });
+
+  test.each([undefined, {}, [null], Array.from({ length: 51 }, () => ({ signature: "unexpected" }))])(
+    "malformed or oversized history cannot become absence: %j", async entries => {
+      const getTransaction = vi.fn();
+      const ledger = ledgerWithHistory(entries, getTransaction);
+      expect((await ledger.findSignaturesByMessage(PROGRAM_ID, new Uint8Array([9]))).kind).toBe("unavailable");
+      expect(getTransaction).not.toHaveBeenCalled();
+    },
+  );
+
+  test("v1 decoding and a later stalled read share the deadline including the history list", async () => {
+    const tx = await sampleVersionedTransaction(1);
+    const original = await sampleTransaction();
+    const reads: string[] = [];
+    const signals: AbortSignal[] = [];
+    const otherSignature = getSignatureFromTransaction(tx);
+    const signature = getSignatureFromTransaction(original);
+    const ledger = new RpcLedger({ network: NETWORK, genesisHash: GENESIS, rpcUrl: "http://unused.invalid",
+      confirmTimeoutMs: 150, requestTimeoutMs: 1000,
+      rpc: fakeRpc({
+        getSignaturesForAddress: () => ({ send: () => new Promise(resolve =>
+          setTimeout(() => resolve([{ signature: otherSignature }, { signature }]), 25)) }),
+        getTransaction: (sig: string) => {
+          reads.push(sig);
+          return { send: ({ abortSignal }: { abortSignal: AbortSignal }) => {
+            signals.push(abortSignal);
+            return sig === otherSignature
+              ? new Promise(resolve => setTimeout(() => resolve({ transaction: [getBase64EncodedWireTransaction(tx), "base64"] }), 25))
+              : new Promise(() => {});
+          } };
+        },
+      }),
+    });
+    const started = Date.now();
+    const result = await ledger.findSignaturesByMessage(PROGRAM_ID, new Uint8Array(original.messageBytes));
+    const ms = Date.now() - started;
+    expect(result).toMatchObject({ kind: "unavailable", detail: "RPC request did not complete before its deadline" });
+    expect(reads).toEqual([otherSignature, signature]);
+    expect(signals[1]!.aborted).toBe(true);
+    expect(ms).toBeGreaterThanOrEqual(120);
+    expect(ms).toBeLessThan(350);
+  });
+});
+
 
 describe("RpcLedger ChainReader", () => {
   const ledgerWith = (rpc: Partial<Record<keyof SolanaRpcApi, unknown>>) =>
