@@ -67,7 +67,7 @@ class DiagnosticsTests(unittest.TestCase):
     def test_finalized_receipt_does_not_mutate_original_journal(self):
         result = self.run_inspection({"confirmationStatus": "finalized", "err": None, "slot": 509274400},
                                      account={"owner": "Unverified"})
-        self.assertIn("finalized; verify binding/account evidence", result)
+        self.assertIn("RPC signature finalized; verify original binding/account evidence", result)
         self.assertIn("PRESENT (identity not validated)", result)
 
     def test_rpc_unavailable_fails_closed_without_private_response(self):

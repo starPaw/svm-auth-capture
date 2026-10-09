@@ -1251,7 +1251,7 @@ def _inspect_tx(signature, entry, report):
         print('Last valid block height:', entry.get('lastValidBlockHeight') if
               isinstance(entry.get('lastValidBlockHeight'), str) and re.fullmatch('[0-9]{1,20}', entry['lastValidBlockHeight']) else 'NOT RECORDED')
         if status is not None and status.get('confirmationStatus') == 'finalized':
-            print('Verdict: original finalized; verify binding/account evidence before any recovery')
+            print('Verdict: RPC signature finalized; verify original binding/account evidence before any recovery')
         else:
             print('Verdict: INCONCLUSIVE; missing history and invalid blockhash alone are not proof of no effect')
     except Exception:
