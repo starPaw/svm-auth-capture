@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Dev-only code deployment. Never restores state, signs, or broadcasts payments."""
 from contextlib import contextmanager
+import base64
 import fcntl
 import gzip
 import hashlib
 import http.client
 import json
 import os
+import re
 from pathlib import Path
 import pwd
 import shutil
@@ -30,6 +32,7 @@ PENDING = BASE / 'transaction.json'
 PRIVATE = Path('/etc/capture402-dev')
 STATE = Path('/var/lib/capture402-dev')
 PERMIT = Path('/run/capture402-dev-deploy-permit')
+RECONCILED = BASE / 'reconciled'
 SERVICES = ('capture402-dev-facilitator', 'capture402-dev-restaurant')
 CGROUP = Path('/sys/fs/cgroup')
 SLICE = 'capture402-dev.slice'
@@ -158,16 +161,23 @@ def clean_operations():
             source.require(path.stat().st_size < 4 * 1024 * 1024, 'dev journal member too large')
             source.require('.tmp-' not in path.name and not path.name.endswith('.busy'), 'unfinished dev operation')
             if path.suffix == '.json':
-                record = json.loads(path.read_text())
+                original = path.read_bytes()
+                record = json.loads(original)
                 if directory in (journal, reclaim):
                     fields = ('signature', 'messageHash', 'transactionBase64', 'blockhash', 'operation', 'payment', 'payer', 'expectedHeld', 'expectedRefundable')
                     source.require(all(isinstance(record.get(key), str) and record[key] for key in fields)
                                    and record['signature'] == path.stem
                                    and record['operation'] in ('authorize', 'capture', 'void', 'refund', 'reclaim', 'setup'), 'unresolved or malformed dev submission')
                     attempts = record.get('attempts')
-                    source.require(isinstance(attempts, list) and attempts and all(
-                        a.get('outcome', {}).get('result') in ('not-submitted', 'finalized-succeeded', 'finalized-failed')
-                        for a in attempts), 'unresolved dev submission')
+                    source.require(isinstance(attempts, list) and attempts and
+                                   all(isinstance(a, dict) and
+                                       (a.get('outcome') is None or isinstance(a.get('outcome'), dict))
+                                       for a in attempts),
+                                   'malformed dev submission attempts')
+                    source.require(all((a.get('outcome') or {}).get('result') in
+                                       ('not-submitted', 'finalized-succeeded', 'finalized-failed')
+                                       for a in attempts) or _has_finality_proof(path, record, original),
+                                   'unresolved dev submission')
                 elif directory == operations:
                     source.require(record.get('status') in ('authorize-rejected', 'completed'), 'unresolved dev resource operation')
                 else:
@@ -541,6 +551,351 @@ def deploy(sha, api):
             raise RuntimeError('DEV_DEPLOY_FAILED: previous code restored; inspect sanitized receipt') from None
 
 
+
+# Read-only operator diagnostics. Never authorize, sign, replay, unlock or mutate journals.
+
+# A terminal finality receipt is a new root-owned *append-only* proof, not an edit
+# to the submission journal. Missing, mismatched or altered receipts fail closed.
+def _proof_identity():
+    path = RELEASES / current() / source.RECORD
+    trusted(path)
+    record = json.loads(path.read_text())
+    return record['network']['genesis_hash'], record['program']['program_id']
+
+
+def _has_finality_proof(journal_path, entry, original=None):
+    if not RECONCILED.exists():
+        return False
+    trusted(RECONCILED, True)
+    signature = entry.get('signature')
+    if not isinstance(signature, str) or not re.fullmatch(r'[1-9A-HJ-NP-Za-km-z]{80,90}', signature):
+        return False
+    path = RECONCILED / (signature + '.json')
+    if not path.exists() and not path.is_symlink():
+        return False
+    trusted(path)
+    proof = json.loads(path.read_text())
+    genesis, program = _proof_identity()
+    original = journal_path.read_bytes() if original is None else original
+    return isinstance(proof, dict) and proof.get('version') == 2 and proof.get('signature') == signature and (
+        proof.get('verdict') in ('finalized-succeeded', 'finalized-failed')
+    ) and proof.get('journalSha256') == hashlib.sha256(original).hexdigest() and (
+        proof.get('genesis') == genesis and proof.get('programId') == program
+    ) and proof.get('operation') == entry.get('operation') and proof.get('payment') == entry.get('payment') and (
+        proof.get('payer') == entry.get('payer') and proof.get('wireSha256') ==
+        hashlib.sha256(base64.b64decode(entry['transactionBase64'], validate=True)).hexdigest()
+    ) and (
+        type(proof.get('slot')) is int and proof['slot'] >= 0
+    )
+
+
+# Reuse the installed client's pinned codec and accepted ABI, rather than maintaining
+# a second partial Solana/Ed25519/PDA implementation in Python. The sealed release
+# is read by an unprivileged child with a clean environment; no keys or RPC URLs
+# are passed to it. This code has no chain reader, signer, or journal writer.
+_WIRE_VALIDATOR = r'''
+import { createHash } from 'node:crypto';
+import { createRequire } from 'node:module';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+const root = process.argv[1];
+const kit = createRequire(join(root, 'package.json'))('@solana/kit');
+const abi = await import(pathToFileURL(join(root, 'src/program.ts')));
+const check = (ok) => { if (!ok) throw new Error('original wire authentication failed'); };
+let input = '';
+for await (const chunk of process.stdin) { input += chunk; check(input.length <= 8192); }
+const { entry: e, program } = JSON.parse(input);
+check(['authorize', 'capture', 'void', 'refund'].includes(e.operation));
+check(typeof e.transactionBase64 === 'string' && e.transactionBase64.length <= 1644);
+const raw = Buffer.from(e.transactionBase64, 'base64');
+check(raw.length > 0 && raw.length <= 1232 && raw.toString('base64') === e.transactionBase64);
+const tx = kit.getTransactionDecoder().decode(raw);
+const bytes = Buffer.from(tx.messageBytes);
+const [m, end] = kit.getCompiledTransactionMessageDecoder().read(bytes, 0);
+check(m.version === 'legacy' && end === bytes.length);
+check(Buffer.from(kit.getCompiledTransactionMessageEncoder().encode(m)).equals(bytes));
+check(kit.getBase64EncodedWireTransaction(tx) === e.transactionBase64);
+check(createHash('sha256').update(bytes).digest('hex') === e.messageHash);
+check(kit.getSignatureFromTransaction(tx) === e.signature && m.lifetimeToken === e.blockhash);
+const keys = m.staticAccounts, h = m.header;
+check(keys.length <= 256 && new Set(keys).size === keys.length);
+check(h.numSignerAccounts === 2 && h.numReadonlySignerAccounts < 2 &&
+      h.numReadonlyNonSignerAccounts <= keys.length - 2);
+for (const signer of keys.slice(0, h.numSignerAccounts)) {
+    const sig = tx.signatures[signer];
+    check(sig && await kit.verifySignature(await kit.getPublicKeyFromAddress(signer), sig, bytes));
+}
+let ix;
+const computeTags = new Set();
+for (const i of m.instructions) {
+    check(i.programAddressIndex >= h.numSignerAccounts && i.programAddressIndex < keys.length);
+    check((i.accountIndices ?? []).every(n => n < keys.length));
+    if (keys[i.programAddressIndex] === program) { check(!ix); ix = i; continue; }
+    const data = Buffer.from(i.data ?? []), tag = data[0];
+    check(keys[i.programAddressIndex] === 'ComputeBudget111111111111111111111111111111' &&
+          !(i.accountIndices ?? []).length && (tag === 2 || tag === 3) &&
+          data.length === (tag === 2 ? 5 : 9) && !computeTags.has(tag));
+    computeTags.add(tag);
+}
+check(ix);
+const op = abi.decodeInstructionData(new Uint8Array(ix.data ?? []));
+check(op && op.op === e.operation);
+const indices = ix.accountIndices ?? [], accounts = indices.map(n => keys[n]);
+const authorize = op.op === 'authorize';
+const server = accounts[authorize ? 1 : 0], mint = accounts[authorize ? 3 : 2];
+check(accounts[0] === keys[1] && accounts[authorize ? 2 : 1] === e.payment && e.payer !== server);
+const payerAta = await abi.ata(e.payer, mint);
+const common = { payer: e.payer, server, payment: e.payment, mint, source: payerAta, payerAta,
+    vault: await abi.ata(e.payment, mint), serverAta: await abi.ata(server, mint), funder: keys[0] };
+const slots = authorize ? abi.authorizeAccounts(common) : op.op === 'capture' ? abi.captureAccounts(common) :
+    op.op === 'void' ? abi.voidAccounts(common) : abi.refundAccounts(common);
+check(indices.length === slots.length && indices.every((n, i) => {
+    const s = slots[i], signer = n < h.numSignerAccounts;
+    const writable = signer ? n < h.numSignerAccounts - h.numReadonlySignerAccounts :
+        n < keys.length - h.numReadonlyNonSignerAccounts;
+    return keys[n] === s.address && signer === s.signer && writable === s.writable;
+}));
+if (authorize) {
+    check(e.payer === keys[1] && await abi.paymentAddress(program, e.payer, op.salt) === e.payment);
+    check(e.expectedHeld === '0' && e.expectedRefundable === '0');
+} else {
+    check(e.expectedHeld === op.expectedHeld.toString() && e.expectedRefundable === op.expectedRefundable.toString());
+}
+process.stdout.write(createHash('sha256').update(raw).digest('hex'));
+'''
+
+
+def _wire_runtime():
+    return RELEASES / current() / 'integration'
+
+
+def _validate_original_wire(entry, signature):
+    genesis, program = _proof_identity()
+    source.require(entry['signature'] == signature and entry['operation'] in ('authorize', 'capture', 'void', 'refund'),
+                   'unsupported original operation: setup/reclaim require separate evidence')
+    fields = ('signature', 'messageHash', 'transactionBase64', 'blockhash', 'operation',
+              'payment', 'payer', 'expectedHeld', 'expectedRefundable')
+    payload = json.dumps({'entry': {k: entry[k] for k in fields}, 'program': program})
+    source.require(len(payload) <= 8192, 'original wire input too large')
+    result = subprocess.run([
+        'runuser', '-u', 'capture402-deploy', '--', '/usr/bin/env', '-i',
+        'PATH=/usr/local/bin:/usr/bin:/bin', 'node', '--experimental-strip-types',
+        '--input-type=module', '--eval', _WIRE_VALIDATOR, str(_wire_runtime())],
+        input=payload, capture_output=True, text=True, timeout=15)
+    # Never surface the child error body or original wire in operator output.
+    source.require(result.returncode == 0 and bool(re.fullmatch(r'[a-f0-9]{64}', result.stdout)),
+                   'original wire authentication failed')
+    return result.stdout, genesis, program
+
+
+def reconcile_original(signature, record=False):
+    # Reconciliation can only make a sidecar if the original *signed bytes*
+    # are bound to an actually finalized transaction on the pinned network.
+    # Missing history, an invalid blockhash and an absent PDA do NOT qualify.
+    source.require(bool(re.fullmatch(r'[1-9A-HJ-NP-Za-km-z]{80,90}', signature)), 'invalid signature')
+    journal = state_paths()[0]
+    source.require(journal.is_dir() and not journal.is_symlink(), 'invalid journal directory')
+    path = journal / (signature + '.json')
+    info = path.lstat()
+    source.require(stat.S_ISREG(info.st_mode) and 0 < info.st_size < 4 * 1024 * 1024, 'unsafe journal file')
+    initial = path.read_bytes()
+    entry = json.loads(initial)
+    source.require(isinstance(entry, dict) and entry.get('signature') == signature and path.stem == signature,
+                   'journal signature mismatch')
+    fields = ('messageHash', 'transactionBase64', 'blockhash', 'operation', 'payment',
+              'payer', 'expectedHeld', 'expectedRefundable')
+    source.require(all(isinstance(entry.get(key), str) and entry[key] for key in fields),
+                   'malformed original journal')
+    attempts = entry.get('attempts')
+    source.require(isinstance(attempts, list) and attempts and all(
+        isinstance(a, dict) and (a.get('outcome') is None or isinstance(a.get('outcome'), dict))
+        for a in attempts), 'malformed original attempts')
+    wire_sha, genesis, program = _validate_original_wire(entry, signature)
+    rpc()  # Enforce genesis of the currently installed Devnet release.
+    url = host.env_value(PRIVATE / 'facilitator.env', 'SOLANA_RPC_URL')
+    response = _dev_rpc_call(url, 'getSignatureStatuses', [[signature], {'searchTransactionHistory': True}])
+    source.require(isinstance(response, dict) and isinstance(response.get('value'), list) and
+                   len(response['value']) == 1, 'invalid status response')
+    status = response['value'][0]
+    if not isinstance(status, dict) or status.get('confirmationStatus') != 'finalized' or (
+        type(status.get('slot')) is not int or status['slot'] < 0
+    ) or 'err' not in status:
+        print('INCONCLUSIVE: original finalized status unavailable; no recovery is authorized')
+        if record:
+            raise RuntimeError('original finalized status unavailable; no receipt created')
+        return False
+    verdict = 'finalized-failed' if status['err'] is not None else 'finalized-succeeded'
+    print('Original finalized:', verdict, 'slot:', status['slot'])
+    if not record:
+        print('READ ONLY: use --record to save an immutable finality receipt for deployment preflight')
+        return True
+    source.require(not PENDING.exists(), 'pending deployment prevents reconciliation')
+    source.require(path.read_bytes() == initial, 'original journal changed during reconciliation')
+    if not RECONCILED.exists():
+        RECONCILED.mkdir(mode=0o700)
+        sync(BASE)
+    trusted(RECONCILED, True)
+    receipt = {
+        'version': 2, 'signature': signature, 'verdict': verdict, 'slot': status['slot'],
+        'genesis': genesis, 'programId': program,
+        'operation': entry['operation'], 'payment': entry['payment'], 'payer': entry['payer'],
+        'wireSha256': wire_sha, 'journalSha256': hashlib.sha256(initial).hexdigest()
+    }
+    target = RECONCILED / (signature + '.json')
+    # Exclusive creation: no overwrite and no following symlinks.
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    # Incomplete receipts stay in place to fail closed; do not hide an error.
+    with os.fdopen(fd, 'w') as writer:
+        json.dump(receipt, writer, sort_keys=True)
+        writer.write(chr(10))
+        writer.flush()
+        os.fsync(writer.fileno())
+    sync(RECONCILED)
+    source.require(_has_finality_proof(path, entry), 'immutable finality receipt rejected')
+    print('FINALIZED RECEIPT RECORDED: original journal unchanged; rerun dev doctor before deployment')
+    return True
+
+
+def doctor():
+    print('DEV DEPLOY DIAGNOSTICS (read-only)')
+    try:
+        print('Current:', current())
+    except Exception:
+        print('Current: BLOCKED')
+    print('Pending deployment:', 'yes' if PENDING.exists() else 'no')
+    checks = (
+        ('Systemd units', units),
+        ('Dev health', lambda: health(current())),
+        ('Production isolation', production),
+        ('Payment journals', clean_operations),
+        ('Devnet RPC identity', rpc),
+    )
+    for name, check in checks:
+        try:
+            check()
+            print('PASS:', name)
+        except Exception:
+            # Error bodies, RPC URLs and private fields must never reach stdout.
+            print('BLOCKED:', name)
+    try:
+        journal = state_paths()[0]
+        source.require(journal.is_dir() and not journal.is_symlink(), 'unsafe journal directory')
+        count = 0
+        for path in sorted(journal.iterdir()):
+            if path.suffix != '.json':
+                continue  # clean_operations above reports unknown/temporary files
+            try:
+                info = path.lstat()
+                source.require(stat.S_ISREG(info.st_mode) and info.st_size < 4 * 1024 * 1024,
+                               'unsafe journal member')
+                entry = json.loads(path.read_text())
+                attempts = entry.get('attempts')
+                outcomes = [a.get('outcome', {}).get('result') if isinstance(a.get('outcome'), dict) else None
+                            for a in attempts] if isinstance(attempts, list) and all(isinstance(a, dict) for a in attempts) else []
+                allowed = {'not-submitted', 'finalized-succeeded', 'finalized-failed'}
+                if outcomes and all(result in allowed for result in outcomes):
+                    continue
+                if isinstance(entry, dict) and _has_finality_proof(path, entry):
+                    continue  # Root-owned finality receipt was verified against exact journal bytes.
+                count += 1
+                if count > 10:
+                    continue
+                sig = entry.get('signature')
+                operation = entry.get('operation')
+                # Public signatures/operations only, no transaction wire or private metadata.
+                safe_sig = sig if isinstance(sig, str) and bool(re.fullmatch(r'[1-9A-HJ-NP-Za-km-z]{80,90}', sig)) and path.stem == sig else 'invalid-signature'
+                safe_op = operation if operation in ('authorize', 'capture', 'void', 'refund', 'reclaim', 'setup') else 'invalid-operation'
+                safe_outcomes = ','.join(result if isinstance(result, str) and result in
+                                         {'unresolved', 'submit-threw', 'not-submitted', 'finalized-succeeded', 'finalized-failed'}
+                                         else 'missing-or-invalid' for result in outcomes) or 'missing-or-invalid'
+                print(f'  UNRESOLVED {safe_op} {safe_sig} outcome={safe_outcomes}')
+            except Exception:
+                count += 1
+                if count <= 10:
+                    print('  MALFORMED facilitator journal entry')
+        if count > 10:
+            print(f'  ... {count - 10} additional entries need inspection')
+    except Exception:
+        print('Journal detail unavailable; payment evidence must be preserved')
+    print('No recovery or journal modification was performed')
+
+
+def _dev_rpc_call(url, method, params):
+    from host_cli import NoRedirect
+    source.require(url.startswith('https://'), 'dev RPC must use TLS')
+    payload = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': method, 'params': params}).encode()
+    request = urllib.request.Request(url, data=payload, headers={'Content-Type': 'application/json'})
+    with urllib.request.build_opener(NoRedirect()).open(request, timeout=10) as response:
+        raw = response.read(65537)
+    source.require(len(raw) <= 65536, 'oversized RPC response')
+    result = json.loads(raw)
+    source.require(isinstance(result, dict) and 'error' not in result and 'result' in result, 'invalid RPC response')
+    return result['result']
+
+
+def inspect_tx(signature):
+    # Path input may NEVER escape the private journal directory.
+    source.require(bool(re.fullmatch(r'[1-9A-HJ-NP-Za-km-z]{80,90}', signature)), 'invalid signature format')
+    journal = state_paths()[0]
+    source.require(journal.is_dir() and not journal.is_symlink(), 'invalid journal directory')
+    path = journal / (signature + '.json')
+    info = path.lstat()
+    source.require(stat.S_ISREG(info.st_mode) and 0 < info.st_size < 4 * 1024 * 1024, 'unsafe journal entry')
+    entry = json.loads(path.read_text())
+    source.require(entry.get('signature') == signature and
+                   entry.get('operation') in ('authorize', 'capture', 'void', 'refund', 'reclaim', 'setup'),
+                   'journal signature/operation mismatch')
+    blockhash = entry.get('blockhash')
+    payment = entry.get('payment')
+    source.require(isinstance(blockhash, str) and bool(re.fullmatch(r'[1-9A-HJ-NP-Za-km-z]{32,44}', blockhash))
+                   and isinstance(payment, str) and bool(re.fullmatch(r'[1-9A-HJ-NP-Za-km-z]{32,44}', payment)),
+                   'journal has invalid public identifiers')
+    attempts = entry.get('attempts')
+    outcomes = [(a.get('outcome') or {}).get('result', 'missing')
+                for a in attempts] if isinstance(attempts, list) and all(isinstance(a, dict) and isinstance(a.get('outcome'), (dict, type(None))) for a in attempts) else []
+    safe_outcomes = [x if x in ('unresolved', 'submit-threw', 'not-submitted', 'finalized-succeeded', 'finalized-failed') else 'invalid'
+                     for x in outcomes]
+    print('Operation:', entry['operation'])
+    print('Signature:', signature)
+    print('Journal:', ', '.join(safe_outcomes) if safe_outcomes else 'missing-or-invalid')
+    try:
+        rpc()  # Verify RPC genesis against the pinned Devnet deployment record.
+        url = host.env_value(PRIVATE / 'facilitator.env', 'SOLANA_RPC_URL')
+        status_result = _dev_rpc_call(url, 'getSignatureStatuses', [[signature], {'searchTransactionHistory': True}])
+        source.require(isinstance(status_result, dict) and
+                       isinstance(status_result.get('value'), list) and len(status_result['value']) == 1,
+                       'malformed signature status')
+        status = status_result['value'][0]
+        if status is None:
+            print('Chain signature: NOT FOUND (not proof of no execution)')
+        else:
+            source.require(isinstance(status, dict), 'malformed signature status')
+            commitment = status.get('confirmationStatus')
+            print('Chain signature:', commitment if commitment in ('processed', 'confirmed', 'finalized') else 'unknown',
+                  'execution=' + ('failed' if status.get('err') is not None else 'succeeded'))
+            print('Signature slot:', status.get('slot') if isinstance(status.get('slot'), int) else 'unknown')
+        validity = _dev_rpc_call(url, 'isBlockhashValid', [blockhash, {'commitment': 'finalized'}])
+        source.require(isinstance(validity, dict) and isinstance(validity.get('value'), bool)
+                       and isinstance(validity.get('context'), dict), 'malformed blockhash status')
+        print('Blockhash valid at finalized bank:', validity['value'], 'slot:', validity['context'].get('slot'))
+        account = _dev_rpc_call(url, 'getAccountInfo', [payment, {'commitment': 'finalized', 'encoding': 'base64'}])
+        source.require(isinstance(account, dict) and isinstance(account.get('context'), dict) and 'value' in account,
+                       'malformed account response')
+        print('Payment account:', 'ABSENT' if account['value'] is None else 'PRESENT (identity not validated)',
+              'slot:', account['context'].get('slot'))
+        print('Blockhash origin slot:', entry.get('blockhashSlot') if
+              isinstance(entry.get('blockhashSlot'), str) and entry['blockhashSlot'].isdigit() else 'NOT RECORDED')
+        print('Last valid block height:', entry.get('lastValidBlockHeight') if
+              isinstance(entry.get('lastValidBlockHeight'), str) and entry['lastValidBlockHeight'].isdigit() else 'NOT RECORDED')
+        if status is not None and status.get('confirmationStatus') == 'finalized':
+            print('Verdict: original finalized; verify binding/account evidence before any recovery')
+        else:
+            print('Verdict: INCONCLUSIVE; missing history and invalid blockhash alone are not proof of no effect')
+    except Exception:
+        print('RPC evidence: UNAVAILABLE or invalid; preserve the original journal')
+    print('No broadcast, journal write or recovery was performed')
+
+
 def dispatch(argv):
     source.require(os.geteuid() == 0, 'dev deployment requires authorized local sudo')
     if len(argv) == 2 and argv[0] == 'deploy' and source.SHA_RE.fullmatch(argv[1]):
@@ -568,11 +923,22 @@ def main(argv):
         with locked():
             print('RECOVERED' if recover() else 'NO_PENDING')
         return
+    if argv == ['doctor']:
+        doctor()
+        return
+    if len(argv) == 2 and argv[0] == 'tx':
+        inspect_tx(argv[1])
+        return
+    if len(argv) in (2, 3) and argv[0] == 'reconcile':
+        source.require(len(argv) == 2 or argv[2] == '--record', 'usage: dev reconcile <signature> [--record]')
+        with locked():
+            reconcile_original(argv[1], record=len(argv) == 3)
+        return
     if argv == ['status']:
         print(json.dumps({'current': current(), 'pending': PENDING.exists(),
                           'lastResult': json.loads((BASE / 'last-result.json').read_text()) if (BASE / 'last-result.json').exists() else None}))
         return
-    source.require(len(argv) == 2 and argv[0] == 'deploy' and source.SHA_RE.fullmatch(argv[1]), 'usage: capture402 dev deploy <40-hex-sha>|status|recover')
+    source.require(len(argv) == 2 and argv[0] == 'deploy' and source.SHA_RE.fullmatch(argv[1]), 'usage: capture402 dev deploy <40-hex-sha>|status|doctor|tx <signature>|reconcile <signature> [--record]|recover')
     from host_cli import GitHub
     # No metadata access before retained offline recovery.
     with locked():
