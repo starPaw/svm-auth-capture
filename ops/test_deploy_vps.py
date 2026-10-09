@@ -148,6 +148,19 @@ class TransactionTests(unittest.TestCase):
         self.assertFalse(source.CURRENT.exists())
         self.assert_preserved()
 
+    def test_old_format_recovery_survives_retired_forward_activator(self):
+        source.switch_to(NEW)
+        source.write_json(source.PENDING, {'previous': OLD, 'target': NEW})
+        with mock.patch.object(source, 'ready') as ready:
+            with self.assertRaisesRegex(RuntimeError, 'retry to deploy'):
+                host.deploy(NEW)
+        self.assertEqual(source.current_sha(), OLD)
+        self.assertFalse(source.PENDING.exists())
+        self.manually_fetch_archive_mock.assert_not_called()
+        self.restart_mock.assert_called_once()
+        ready.assert_called_once_with(OLD)
+        self.assert_preserved()
+
     def test_kill_after_switch_recovery_restores_current_and_overrides(self):
         self.ready_mock.side_effect = [None, KeyboardInterrupt()]
         with self.assertRaises(KeyboardInterrupt): host.deploy(NEW)

@@ -1,12 +1,11 @@
 """Offline failure, trust-boundary, and rollback tests for the Devnet CD helper."""
 from __future__ import annotations
 
-import fcntl
-import hashlib
 import io
 import json
 import os
 from pathlib import Path
+import runpy
 import subprocess
 import tarfile
 import tempfile
@@ -122,7 +121,6 @@ class ArchiveTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as root:
                 with self.assertRaisesRegex(RuntimeError, "decompressed tar stream exceeds limit"):
                     cd.unpack_archive(payload, Path(root))
-
 
 
 class PrivateSourceTests(unittest.TestCase):
@@ -385,37 +383,23 @@ class SwitchingTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "escapes releases"):
             cd.current_sha()
 
-    def test_failed_activation_restores_old_version(self):
-        payload = b"test compressed archive"
-        digest = hashlib.sha256(payload).hexdigest()
-        with (mock.patch.object(cd.os, "geteuid", return_value=0),
-              mock.patch.object(cd, "check_unit_layout"),
-              mock.patch.object(cd, "verify_source_against_main"),
-              mock.patch.object(cd, "prepare_release"),
-              mock.patch.object(cd, "restart"),
-              mock.patch.object(cd, "run", return_value=""),
-              mock.patch.object(cd, "ready",
-                                side_effect=[RuntimeError("resource unhealthy"), None])):
-            with self.assertRaisesRegex(RuntimeError, "resource unhealthy"):
-                cd.deploy(NEW, digest, payload)
+    def test_retired_cli_refuses_before_network_or_live_mutation(self):
+        # A stale runbook must not bypass the canonical CI/review gate. Even
+        # pending recovery belongs to the gated host controller, not this CLI.
+        cd.write_json(cd.PENDING, {"previous": OLD, "target": NEW})
+        before = cd.PENDING.read_bytes()
+        with (mock.patch("sys.argv", ["deploy_demo.py", "--manual", NEW]),
+              mock.patch("subprocess.run") as run,
+              mock.patch("urllib.request.urlopen") as network,
+              mock.patch("os.replace") as replace):
+            with self.assertRaisesRegex(SystemExit, "Retired deployment entrypoint"):
+                runpy.run_path(str(Path(cd.__file__)), run_name="__main__")
+        run.assert_not_called()
+        network.assert_not_called()
+        replace.assert_not_called()
         self.assertEqual(cd.current_sha(), OLD)
-        self.assertFalse(cd.PENDING.exists())
+        self.assertEqual(cd.PENDING.read_bytes(), before)
 
-
-    def test_failed_nginx_preflight_does_not_touch_current_services(self):
-        payload = b"test archive"
-        digest = hashlib.sha256(payload).hexdigest()
-        with (mock.patch.object(cd.os, "geteuid", return_value=0),
-              mock.patch.object(cd, "check_unit_layout"),
-              mock.patch.object(cd, "verify_source_against_main"),
-              mock.patch.object(cd, "prepare_release"),
-              mock.patch.object(cd, "restart") as restart,
-              mock.patch.object(cd, "run", side_effect=RuntimeError("nginx -t failed"))):
-            with self.assertRaisesRegex(RuntimeError, "nginx -t failed"):
-                cd.deploy(NEW, digest, payload)
-        restart.assert_not_called()
-        self.assertEqual(cd.current_sha(), OLD)
-        self.assertFalse(cd.PENDING.exists())
 
     def test_interrupted_activation_is_reverted_before_new_release(self):
         cd.switch_to(NEW)
@@ -426,18 +410,6 @@ class SwitchingTests(unittest.TestCase):
         self.assertEqual(cd.current_sha(), OLD)
         self.assertFalse(cd.PENDING.exists())
 
-    def test_duplicate_exact_sha_no_restart(self):
-        payload = b"test archive"
-        digest = hashlib.sha256(payload).hexdigest()
-        with (mock.patch.object(cd.os, "geteuid", return_value=0),
-              mock.patch.object(cd, "check_unit_layout"),
-              mock.patch.object(cd, "verify_source_against_main"),
-              mock.patch.object(cd, "prepare_release"),
-              mock.patch.object(cd, "restart") as restart,
-              mock.patch.object(cd, "ready")):
-            cd.deploy(OLD, digest, payload)
-        restart.assert_not_called()
-        self.assertEqual(cd.current_sha(), OLD)
 
     def test_failed_recovery_leaves_pending_evidence(self):
         cd.switch_to(NEW)
@@ -448,9 +420,8 @@ class SwitchingTests(unittest.TestCase):
         self.assertTrue(cd.PENDING.exists())
 
 
-
-class LocalManualReleaseTests(unittest.TestCase):
-    """No CI runner can deploy. The VPS operator must select current main."""
+class SourceFetchTests(unittest.TestCase):
+    """Source preparation remains shared with the canonical host controller."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -522,133 +493,6 @@ class LocalManualReleaseTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         self.assertFalse((root / ".github/workflows/deploy-demo.yml").exists())
         self.assertFalse((root / "ops/ssh-deploy.sh").exists())
-
-    def test_manual_deploy_root_validates_exact_digest_before_restart(self):
-        with (mock.patch.object(cd.os, "geteuid", return_value=0),
-              mock.patch.object(cd, "check_unit_layout"),
-              mock.patch.object(cd, "restart") as restart):
-            with self.assertRaisesRegex(RuntimeError, "archive SHA-256 mismatch"):
-                cd.deploy(NEW, "0" * 64, b"artifact")
-            restart.assert_not_called()
-
-
-    def test_cli_recovers_pending_offline_before_attempting_github(self):
-        """P1 reproduction: next CLI invocation rolls back without network."""
-        cd.switch_to(NEW)
-        cd.write_json(cd.PENDING, {
-            "previous": OLD, "target": NEW, "archiveSha256": "c" * 64,
-        })
-        with (mock.patch.object(cd.os, "geteuid", return_value=0),
-              mock.patch.object(cd, "check_unit_layout"),
-              mock.patch.object(cd, "restart") as restart,
-              mock.patch.object(cd, "ready") as ready,
-              mock.patch.object(cd, "manually_fetch_archive",
-                                side_effect=RuntimeError("GitHub unavailable")) as fetch):
-            with self.assertRaisesRegex(RuntimeError, "retry to deploy"):
-                cd.main(["capture402-deploy", "--manual", NEW])
-            self.assertEqual(restart.call_count, 1)
-            ready.assert_called_once_with(OLD)
-            fetch.assert_not_called()
-        self.assertEqual(cd.current_sha(), OLD)
-        self.assertFalse(cd.PENDING.exists())
-
-    def test_cli_recovers_pending_before_rejecting_invalid_new_sha(self):
-        cd.switch_to(NEW)
-        cd.write_json(cd.PENDING, {"previous": OLD, "target": NEW})
-        with (mock.patch.object(cd.os, "geteuid", return_value=0),
-              mock.patch.object(cd, "check_unit_layout"),
-              mock.patch.object(cd, "restart") as restart,
-              mock.patch.object(cd, "ready"),
-              mock.patch.object(cd, "manually_fetch_archive") as fetch):
-            with self.assertRaisesRegex(RuntimeError, "retry to deploy"):
-                cd.main(["capture402-deploy", "--manual", "not-a-sha"])
-            restart.assert_called_once()
-            fetch.assert_not_called()
-        self.assertEqual(cd.current_sha(), OLD)
-        self.assertFalse(cd.PENDING.exists())
-
-    def test_cli_failed_recovery_keeps_pending_without_github_fetch(self):
-        cd.switch_to(NEW)
-        cd.write_json(cd.PENDING, {"previous": OLD, "target": NEW})
-        with (mock.patch.object(cd.os, "geteuid", return_value=0),
-              mock.patch.object(cd, "check_unit_layout"),
-              mock.patch.object(cd, "restart") as restart,
-              mock.patch.object(cd, "ready", side_effect=RuntimeError("rollback unhealthy")),
-              mock.patch.object(cd, "manually_fetch_archive") as fetch):
-            with self.assertRaisesRegex(RuntimeError, "rollback unhealthy"):
-                cd.main(["capture402-deploy", "--manual", NEW])
-            restart.assert_called_once()
-            fetch.assert_not_called()
-        self.assertEqual(cd.current_sha(), OLD)
-        self.assertTrue(cd.PENDING.exists())
-
-    def test_cli_no_pending_and_github_outage_leaves_old_version(self):
-        with (mock.patch.object(cd.os, "geteuid", return_value=0),
-              mock.patch.object(cd, "check_unit_layout"),
-              mock.patch.object(cd, "restart") as restart,
-              mock.patch.object(cd, "ready") as ready,
-              mock.patch.object(cd, "manually_fetch_archive",
-                                side_effect=RuntimeError("GitHub unavailable")) as fetch):
-            with self.assertRaisesRegex(RuntimeError, "GitHub unavailable"):
-                cd.main(["capture402-deploy", "--manual", NEW])
-            fetch.assert_called_once_with(NEW)
-            restart.assert_not_called()
-            ready.assert_not_called()
-        self.assertEqual(cd.current_sha(), OLD)
-        self.assertFalse(cd.PENDING.exists())
-
-    def test_cli_fetch_and_activation_hold_the_same_exclusive_lock(self):
-        """Never release the lock between a verified recovery and network fetch."""
-        checked = []
-
-        def assert_lock(*_args):
-            probe = os.open(self.tmp.name + "/deploy.lock", os.O_RDWR)
-            try:
-                with self.assertRaises(BlockingIOError):
-                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            finally:
-                os.close(probe)
-            checked.append(True)
-
-        def fetch(_sha):
-            assert_lock()
-            return b"source-archive"
-
-        def activate(_sha, _digest, _blob):
-            assert_lock()
-
-        with (mock.patch.object(cd.os, "geteuid", return_value=0),
-              mock.patch.object(cd, "check_unit_layout"),
-              mock.patch.object(cd, "manually_fetch_archive", side_effect=fetch),
-              mock.patch.object(cd, "activate_locked", side_effect=activate)):
-            cd.main(["capture402-deploy", "--manual", NEW])
-        self.assertEqual(checked, [True, True])
-        self.assertEqual(cd.current_sha(), OLD)
-
-    def test_cli_concurrent_manual_deploy_fails_before_fetch(self):
-        fd = os.open(self.tmp.name + "/deploy.lock", os.O_CREAT | os.O_RDWR, 0o600)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            with (mock.patch.object(cd.os, "geteuid", return_value=0),
-                  mock.patch.object(cd, "manually_fetch_archive") as fetch):
-                with self.assertRaises(BlockingIOError):
-                    cd.main(["capture402-deploy", "--manual", NEW])
-                fetch.assert_not_called()
-        finally:
-            os.close(fd)
-        self.assertEqual(cd.current_sha(), OLD)
-
-    def test_cli_bad_unit_layout_fails_before_fetch(self):
-        with (mock.patch.object(cd.os, "geteuid", return_value=0),
-              mock.patch.object(cd, "check_unit_layout",
-                                side_effect=RuntimeError("wrong WorkingDirectory")),
-              mock.patch.object(cd, "manually_fetch_archive") as fetch,
-              mock.patch.object(cd, "restart") as restart):
-            with self.assertRaisesRegex(RuntimeError, "wrong WorkingDirectory"):
-                cd.main(["capture402-deploy", "--manual", NEW])
-            fetch.assert_not_called()
-            restart.assert_not_called()
-
 
 
 if __name__ == "__main__":

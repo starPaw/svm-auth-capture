@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
-"""Root-owned, manually provisioned Capture402 Devnet release activator.
+"""Shared release-source utilities and retained old-format rollback reader.
 
-Called ONLY by the authorized VPS operator after inspecting successful exact-SHA
-GitHub CI. Builds the release archive directly from privately authenticated,
-read-only GitHub main; independently re-fetches and verifies each archived file.
-No Actions deploy secrets, network SSH deploy entrypoint, Solana program upgrade,
-secret mutation, journal modification or payment submission.
+Forward deployment is owned by host_cli.py and deploy_vps.py. This module has
+no activation CLI: direct invocation refuses without network or live mutation.
+The pending.json recovery reader remains necessary for interrupted old releases.
 """
 from __future__ import annotations
 
 from contextlib import contextmanager
-import fcntl
 import gzip
 import hashlib
 import io
@@ -22,7 +19,6 @@ import re
 import shutil
 import stat
 import subprocess
-import sys
 import tarfile
 import tempfile
 import time
@@ -467,93 +463,5 @@ def prepare_release(sha: str, digest: str, blob: bytes) -> None:
             shutil.rmtree(stage)
 
 
-@contextmanager
-def locked_release():
-    """Own the one deployment lock through recovery, network fetch and switch.
-
-    A previous interrupted activation must be recovered *offline*, before any
-    GitHub access. Do not drop the lock between recovery and archive fetching:
-    another manual release must not race us to switch the current symlink.
-    """
-    require(os.geteuid() == 0, "root-owned helper requires local sudo")
-    require(BASE.is_dir() and RELEASES.is_dir() and MANIFESTS.is_dir(),
-            "versioned release directories not provisioned")
-    lock = os.open(BASE / "deploy.lock", os.O_CREAT | os.O_RDWR, 0o600)
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        check_unit_layout()
-        recover_pending()  # Requires no source network or deploy credential.
-        yield
-    finally:
-        os.close(lock)
-
-
-def activate_locked(sha: str, digest: str, blob: bytes) -> None:
-    """Use only under locked_release(), after its recovery-first preflight."""
-    require(bool(SHA_RE.fullmatch(sha)) and bool(HASH_RE.fullmatch(digest)),
-            "expected exact 40-hex Git SHA and 64-hex SHA-256")
-    previous = current_sha()
-    require(0 < len(blob) <= MAX_ARCHIVE, "archive empty or over limit")
-    require(hashlib.sha256(blob).hexdigest() == digest, "release archive SHA-256 mismatch")
-
-    verify_source_against_main(sha, blob)
-    prepare_release(sha, digest, blob)
-    if previous == sha:
-        ready(sha)
-        print(f"ALREADY_ACTIVE {sha}", flush=True)
-        return
-
-    # Failed preflight cannot create pending state or restart live services.
-    run("nginx", "-t")
-    write_json(PENDING, {"previous": previous, "target": sha,
-                         "archiveSha256": digest})
-    try:
-        switch_to(sha)
-        restart()
-        ready(sha)
-        write_json(MANIFESTS / f"{sha}.json",
-                   {"sha": sha, "archiveSha256": digest, "status": "deployed"})
-        PENDING.unlink()
-        print(f"DEPLOYED {sha}; previous={previous}", flush=True)
-    except Exception as original:
-        print(f"Release failed; restoring {previous}: {original}", file=sys.stderr,
-              flush=True)
-        try:
-            switch_to(previous)
-            restart()
-            ready(previous)
-            PENDING.unlink()
-            print(f"ROLLED_BACK {previous}", file=sys.stderr, flush=True)
-        except Exception as recovery:
-            raise RuntimeError(
-                f"ROLLBACK_UNVERIFIED previous={previous}: {recovery}") from original
-        raise
-
-
-def deploy(sha: str, digest: str, blob: bytes) -> None:
-    """Offline test seam: activation with an explicitly supplied archive."""
-    with locked_release():
-        activate_locked(sha, digest, blob)
-
-
-def manual_release(sha: str) -> None:
-    """Real on-host entrypoint: rollback first, fetch only with lock held."""
-    with locked_release():
-        require(bool(SHA_RE.fullmatch(sha)), "exact lowercase main SHA required")
-        blob = manually_fetch_archive(sha)
-        activate_locked(sha, hashlib.sha256(blob).hexdigest(), blob)
-
-
-def main(argv: list[str]) -> None:
-    """The exact CLI path is regression-tested, not just recover_pending()."""
-    if len(argv) != 3 or argv[1] != "--manual":
-        raise SystemExit("usage: capture402-deploy --manual <40-hex-current-main-sha>")
-    manual_release(argv[2])
-
-
 if __name__ == "__main__":
-    try:
-        main(sys.argv)
-    except Exception as error:
-        print(f"DEPLOY_BLOCKED: {error}", file=sys.stderr, flush=True)
-        raise SystemExit(1) from error
+    raise SystemExit("Retired deployment entrypoint; use sudo capture402 deploy <40-hex-main-sha>")
