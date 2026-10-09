@@ -21,6 +21,8 @@ export type PaymentPayload = {
 };
 
 export type FacilitatorRequest = {
+  /** Additive evidence, outside economic payload; always validated as untrusted input. */
+  lifetimeObservation?: unknown;
   x402Version: number;
   paymentPayload: PaymentPayload;
   paymentRequirements: PaymentRequirements;

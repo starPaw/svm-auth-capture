@@ -32,7 +32,10 @@ import {
   voidData,
 } from "./program.ts";
 
-export type Lifetime = { blockhash: Blockhash; lastValidBlockHeight: bigint; blockhashSlot?: bigint };
+import { retainObservation } from "./lifetime-provenance.ts";
+
+export type Lifetime = { blockhash: Blockhash; lastValidBlockHeight: bigint; blockhashSlot?: bigint;
+  contextSlot?: bigint; commitment?: "processed" | "confirmed" | "finalized"; network?: string; genesisHash?: string };
 
 /** Compiles a legacy message with the sponsor as fee payer and applies the given partial signers. */
 export async function buildTransaction(a: {
@@ -47,10 +50,12 @@ export async function buildTransaction(a: {
     (m) => setTransactionMessageLifetimeUsingBlockhash(a.lifetime, m),
     (m) => appendTransactionMessageInstructions(a.instructions, m),
   );
-  return partiallySignTransaction(
+  const transaction = await partiallySignTransaction(
     a.signers.map((s) => s.keyPair),
     compileTransaction(message),
   );
+  retainObservation(transaction, a.lifetime);
+  return transaction;
 }
 
 export const encodeTransaction = (tx: Transaction): string => getBase64EncodedWireTransaction(tx);

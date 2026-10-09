@@ -64,6 +64,22 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertIn("Verdict: INCONCLUSIVE", result)
         self.assertIn("No broadcast, journal write or recovery was performed", result)
 
+    def test_additive_relay_observation_remains_read_only_and_not_finality(self):
+        self.entry['lifetimeProvenance'] = {
+            'version': 1, 'messageHash': 'a' * 64, 'blockhash': BLOCKHASH,
+            'observation': {'state': 'recorded', 'source': 'request', 'value': {
+                'version': 1, 'messageHash': 'a' * 64, 'blockhash': BLOCKHASH,
+                'lastValidBlockHeight': '18446744073709551615', 'contextSlot': '9007199254740993',
+                'commitment': 'finalized', 'network': 'solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1',
+                'genesisHash': 'EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG'}},
+            'origin': {'state': 'unverified', 'reason': 'lookup-unavailable'}}
+        self.path.write_text(json.dumps(self.entry))
+        result = self.run_inspection()
+        self.assertIn('Verdict: INCONCLUSIVE', result)
+        self.assertIn('Blockhash origin slot: NOT RECORDED', result)
+        self.assertIn('Last valid block height: NOT RECORDED', result)
+        self.assertNotIn('18446744073709551615', result)
+
     def test_finalized_receipt_does_not_mutate_original_journal(self):
         result = self.run_inspection({"confirmationStatus": "finalized", "err": None, "slot": 509274400},
                                      account={"owner": "Unverified"})

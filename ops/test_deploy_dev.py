@@ -120,6 +120,36 @@ class JournalTests(DevFixture):
         before = self.snapshot(); dev.clean_operations()
         self.assertEqual(before, self.snapshot())
 
+    def test_additive_relay_provenance_does_not_change_preflight_eligibility(self):
+        # #52 compatibility with merged #53: evidence never supplies finality authority.
+        entry = {**dict.fromkeys(('messageHash', 'transactionBase64', 'blockhash', 'payment', 'payer',
+                                  'expectedHeld', 'expectedRefundable'), 'original'),
+                 'signature': 'sig', 'operation': 'authorize',
+                 'attempts': [{'outcome': {'result': 'finalized-succeeded'}}]}
+        entry['lifetimeProvenance'] = {
+            'version': 1, 'messageHash': 'a' * 64, 'blockhash': '11111111111111111111111111111111',
+            'observation': {'state': 'recorded', 'source': 'first-party', 'value': {
+                'version': 1, 'messageHash': 'a' * 64, 'blockhash': '11111111111111111111111111111111',
+                'lastValidBlockHeight': '18446744073709551615', 'contextSlot': '9007199254740993',
+                'commitment': 'finalized', 'network': 'solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1',
+                'genesisHash': 'EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG'}},
+            'origin': {'state': 'unverified', 'reason': 'lookup-unavailable'}}
+        path = self.journal / 'sig.json'
+        self.write(path, entry)
+        before = self.snapshot()
+        dev.clean_operations()
+        self.assertEqual(before, self.snapshot())
+        entry['lifetimeProvenance']['origin'] = {'state': 'verified', 'slot': '9007199254740993',
+            'blockhash': '11111111111111111111111111111111', 'commitment': 'finalized',
+            'network': 'solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1',
+            'genesisHash': 'EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG'}
+        entry['attempts'] = [{}]
+        self.write(path, entry)
+        before = self.snapshot()
+        with self.assertRaisesRegex(RuntimeError, 'unresolved'):
+            dev.clean_operations()
+        self.assertEqual(before, self.snapshot())
+
     def test_terminal_outcome_without_original_wire_is_malformed(self):
         self.write(self.journal / 'sig.json', {'attempts': [{'outcome': {'result': 'finalized-succeeded'}}]})
         with self.assertRaisesRegex(RuntimeError, 'malformed'): dev.clean_operations()

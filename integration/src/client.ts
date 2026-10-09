@@ -6,6 +6,7 @@
 // and the merchant, mint, and spend ceiling this payer consents to. Only then does it sign the
 // authorize transaction and retry with a `PAYMENT-SIGNATURE` `PaymentPayload`, and decode the
 // `PAYMENT-RESPONSE` header.
+import { LIFETIME_EXTENSION, transactionObservation } from "./lifetime-provenance.ts";
 import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { type Address, createKeyPairSignerFromBytes, isAddress, type KeyPairSigner, type Transaction } from "@solana/kit";
@@ -85,7 +86,9 @@ export function selectOffer(paymentRequired: PaymentRequired, policy: ClientPoli
 
 /** The x402 v2 `PaymentPayload` a client sends in `PAYMENT-SIGNATURE` for an authorize. */
 export function authorizePaymentPayload(paymentRequired: PaymentRequired, accepted: PaymentRequirements, tx: Transaction): PaymentPayload {
-  return { x402Version: 2, resource: paymentRequired.resource, accepted, payload: authorizePayload(tx) };
+  const observation = transactionObservation(tx);
+  return { x402Version: 2, resource: paymentRequired.resource, accepted, payload: authorizePayload(tx),
+    ...(observation ? { extensions: { [LIFETIME_EXTENSION]: { observation } } } : {}) };
 }
 
 /** Signs the authorize for a selected offer: the payer is the only economic signer. */

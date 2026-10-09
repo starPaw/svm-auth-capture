@@ -40,7 +40,7 @@ async function main(): Promise<void> {
 
   // The exact co-signed bytes, signature, and blockhash of every broadcast are written here first.
   const journal = new FileSubmissionJournal(requireEnv("SAC006_FACILITATOR_JOURNAL_DIR"));
-  const facilitator = new Facilitator({ network: record.network.caip2, programId: record.programId, feePayer, ledger, journal, ...demoSponsorComputeBounds() });
+  const facilitator = new Facilitator({ network: record.network.caip2, programId: record.programId, feePayer, ledger, journal, observationKey: requireEnv("SAC006_BEARER_TOKEN"), ...demoSponsorComputeBounds() });
   const sponsorship = new SponsorshipGuard({
     ledger,
     feePayer: feePayer.address,

@@ -3,6 +3,7 @@
 // operations on one payment and wait on the cluster Clock). Every rejection is bracketed by
 // finalized snapshots proving the guarded state did not change; any deviation exits non-zero.
 //   node --experimental-strip-types evidence/chains.ts      (env: see run-all.sh)
+import { transactionObservation } from "../src/lifetime-provenance.ts";
 import { getSignatureFromTransaction, type Address, type KeyPairSigner } from "@solana/kit";
 import { join } from "node:path";
 import { FileSubmissionJournal, messageHash } from "../src/submission-journal.ts";
@@ -74,7 +75,7 @@ async function main(): Promise<void> {
     maxTimeoutSeconds: 120,
     extra: { paymentFlow: "escrow", captureDeadline: t.dc.toString(), refundDeadline: t.dr.toString(), programId: record.programId, feePayer: sponsor.address },
   });
-  const body = (req: PaymentRequirements, payload: Record<string, unknown>) => ({ x402Version: 2, paymentPayload: { x402Version: 2, accepted: req, payload }, paymentRequirements: req });
+  const body = (req: PaymentRequirements, payload: Record<string, unknown>, tx?: Parameters<typeof transactionObservation>[0]) => ({ lifetimeObservation: tx ? { observation: transactionObservation(tx) } : undefined, x402Version: 2, paymentPayload: { x402Version: 2, accepted: req, payload }, paymentRequirements: req });
   const stored = (payment: Address) => ({ programId: record.programId, payment, payer: payer.address, server: server.address, mint });
   const signedByServer = async (ix: Parameters<typeof buildTransaction>[0]["instructions"][number]) =>
     buildTransaction({ feePayer: sponsor.address, instructions: [ix], signers: [server], lifetime: await lifetime() });
@@ -100,20 +101,20 @@ async function main(): Promise<void> {
     const salt = crypto.getRandomValues(new Uint8Array(32));
     const ix = await authorizeInstruction({ programId: record.programId, payer: payer.address, server: server.address, mint, funder: sponsor.address, salt, maximum, captureDeadline: dc, refundDeadline: dr });
     const tx = await buildTransaction({ feePayer: sponsor.address, instructions: [ix], signers: [payer], lifetime: await lifetime() });
-    const res = await succeeded("authorize", await facilitator.settle(body(requirements({ maximum, dc, dr }), authorizePayload(tx))));
+    const res = await succeeded("authorize", await facilitator.settle(body(requirements({ maximum, dc, dr }), authorizePayload(tx), tx)));
     return (res.extensions?.["auth-capture"] as { payment: Address }).payment;
   }
   const capture = async (p: Address, t: Terms, amount: bigint, release: boolean, h: bigint, f: bigint) => {
     const tx = await signedByServer(await captureInstruction(stored(p), amount, release, h, f));
-    return facilitator.settle(body(requirements(t), capturePayload(p, tx, amount, release, h, f)));
+    return facilitator.settle(body(requirements(t), capturePayload(p, tx, amount, release, h, f), tx));
   };
   const voidHold = async (p: Address, t: Terms, h: bigint, f: bigint) => {
     const tx = await signedByServer(await voidInstruction(stored(p), h, f));
-    return facilitator.settle(body(requirements(t), voidPayload(p, tx, h, f)));
+    return facilitator.settle(body(requirements(t), voidPayload(p, tx, h, f), tx));
   };
   const refund = async (p: Address, t: Terms, amount: bigint, h: bigint, f: bigint, req = requirements(t)) => {
     const tx = await signedByServer(await refundInstruction(stored(p), amount, h, f));
-    return facilitator.settle(body(req, refundPayload(p, tx, amount, h, f)));
+    return facilitator.settle(body(req, refundPayload(p, tx, amount, h, f), tx));
   };
   const tokenTransfer = async (from: KeyPairSigner, to: Address, amount: bigint) => {
     advanceSlot(await transferSetupTokens(c, journal, from, to, amount));
@@ -157,7 +158,7 @@ async function main(): Promise<void> {
       { address: TOKEN_PROGRAM_ADDRESS, signer: false, writable: false },
     ];
     const tx = await signedByServer(toInstruction(record.programId, accounts, refundData(5n, 0n, 35n)));
-    return facilitator.settle(body(requirements(tA), refundPayload(pA, tx, 5n, 0n, 35n)));
+    return facilitator.settle(body(requirements(tA), refundPayload(pA, tx, 5n, 0n, 35n), tx));
   });
 
   // Insufficient server liquidity: leave the server ATA below a refund that F allows, then restore.
