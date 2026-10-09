@@ -4,11 +4,14 @@ from contextlib import contextmanager
 import fcntl
 import gzip
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
 import pwd
 import shutil
+import socket
+import ssl
 import stat
 import subprocess
 import sys
@@ -217,6 +220,22 @@ def rpc():
         source.require(len(data) <= 65536 and json.loads(data).get('result') == record['network']['genesis_hash'], 'dev RPC identity unavailable')
 
 
+def ingress_response(path):
+    # The private tester allowlist admits loopback. Keep the real Host, SNI and
+    # certificate verification while checking this VPS's dev nginx listener.
+    socket.getaddrinfo('dev.capture402.xyz', 443, type=socket.SOCK_STREAM)
+    connection = http.client.HTTPSConnection('dev.capture402.xyz', timeout=5,
+                                              context=ssl.create_default_context())
+    connection._create_connection = lambda address, timeout, source_address=None: socket.create_connection(
+        ('127.0.0.1', address[1]), timeout, source_address)
+    try:
+        connection.request('GET', path)
+        answer = connection.getresponse()
+        return answer.status, answer.read(32 * 1024), dict(answer.getheaders())
+    finally:
+        connection.close()
+
+
 def health(sha, public=True):
     for name, entry in zip(SERVICES, ('devnet-server.ts', 'restaurant-server.ts')):
         source.require(source.run('systemctl', 'is-active', name) == 'active', 'dev service inactive')
@@ -226,14 +245,20 @@ def health(sha, public=True):
         argv = Path('/proc/' + pid + '/cmdline').read_bytes().rstrip(b'\0').split(b'\0')
         source.require(len(argv) == 3 and Path(os.fsdecode(argv[0])).name == 'node'
                        and argv[1:] == [b'--experimental-strip-types', ('src/' + entry).encode()], 'dev process entrypoint mismatch')
+    paths = [('/', 200), ('/resource', 402), ('/assets/app.js', 200),
+             ('/assets/style.css', 200), ('/assets/solflare.js', 200)]
+    # Bootstrap releases predate the homepage. Check their actual assets so
+    # preparation and code rollback can validate the previous running version.
+    paths += [('/assets/' + name, 200) for name in ('homepage.css', 'homepage.js')
+              if (RELEASES / sha / 'integration/web' / name).is_file()]
     for prefix in (['http://127.0.0.1:18888', ORIGIN] if public else ['http://127.0.0.1:18888']):
-        for path, expected in (('/', 200), ('/resource', 402), ('/assets/homepage.css', 200), ('/assets/homepage.js', 200),
-                               ('/assets/app.js', 200), ('/assets/style.css', 200), ('/assets/solflare.js', 200)):
-            status, body, headers = source.response(prefix + path)
+        response = ingress_response if prefix == ORIGIN else lambda path: source.response(prefix + path)
+        for path, expected in paths:
+            status, body, headers = response(path)
             source.require(status == expected and body, 'dev HTTP readiness failed')
             if path == '/resource':
                 source.require(any(k.lower() == 'payment-required' for k in headers), 'dev challenge missing')
-        status, body, _ = source.response(prefix + '/api/config')
+        status, body, _ = response('/api/config')
         config = json.loads(body)
         record = json.loads((RELEASES / sha / source.RECORD).read_text())
         source.require(status == 200 and config.get('configured') is True and config.get('cluster') == 'devnet'
@@ -472,6 +497,8 @@ def deploy(sha, api):
                 directory.mkdir(mode=0o755)
             trusted(directory, True)
         stage(sha, acceptance, api)
+        source.require(all((RELEASES / sha / 'integration/web' / name).is_file()
+                           for name in ('homepage.css', 'homepage.js')), 'candidate homepage assets missing')
         # Fresh metadata client/deadline after a potentially long dependency install.
         from host_cli import GitHub
         fresh = policy.verify_dev(sha, GitHub())

@@ -153,6 +153,64 @@ class JournalTests(DevFixture):
         with self.assertRaises(RuntimeError): dev.clean_operations()
 
 
+class HealthTests(DevFixture):
+    def test_bootstrap_without_homepage_can_be_validated_but_published_assets_must_work(self):
+        real_read = Path.read_bytes
+        def read(path):
+            if str(path) == '/proc/1/cmdline': return b'node\0--experimental-strip-types\0src/devnet-server.ts\0'
+            if str(path) == '/proc/2/cmdline': return b'node\0--experimental-strip-types\0src/restaurant-server.ts\0'
+            return real_read(path)
+        def run(*args):
+            if args[1] == 'is-active': return 'active'
+            return '1' if args[-1] == dev.SERVICES[0] else '2'
+        def response(path):
+            if path.endswith('/api/config'):
+                return 200, json.dumps({'configured': True, 'cluster': 'devnet', 'programId': 'program',
+                                        'sponsor': 'identity', 'mint': 'identity', 'merchant': 'identity'}).encode(), {}
+            if path.endswith('/resource'): return 402, b'challenge', {'Payment-Required': 'offer'}
+            if '/homepage.' in path: return 404, b'missing', {}
+            return 200, b'asset', {}
+        with (mock.patch.object(source, 'run', side_effect=run), mock.patch.object(Path, 'read_bytes', read),
+              mock.patch.object(dev.os, 'readlink', return_value=str(dev.RELEASES / OLD / 'integration')),
+              mock.patch.object(source, 'response', side_effect=response),
+              mock.patch.object(dev, 'ingress_response', side_effect=response),
+              mock.patch.object(dev.host, 'env_value', return_value='identity')):
+            dev.health(OLD)
+            web = dev.RELEASES / OLD / 'integration/web'; web.mkdir(parents=True)
+            (web / 'homepage.css').write_text('published')
+            with self.assertRaisesRegex(RuntimeError, 'HTTP readiness'): dev.health(OLD)
+
+    def test_ingress_uses_loopback_with_verified_hostname_and_closes_connection(self):
+        connection = mock.Mock()
+        connection.getresponse.return_value.status = 402
+        connection.getresponse.return_value.read.return_value = b'offer'
+        connection.getresponse.return_value.getheaders.return_value = [('Payment-Required', 'challenge')]
+        with (mock.patch.object(dev.socket, 'getaddrinfo') as dns,
+              mock.patch.object(dev.socket, 'create_connection') as connect,
+              mock.patch.object(dev.http.client, 'HTTPSConnection', return_value=connection) as tls):
+            self.assertEqual(dev.ingress_response('/resource'), (402, b'offer', {'Payment-Required': 'challenge'}))
+            dns.assert_called_once_with('dev.capture402.xyz', 443, type=dev.socket.SOCK_STREAM)
+            self.assertEqual(tls.call_args.args, ('dev.capture402.xyz',))
+            context = tls.call_args.kwargs['context']
+            self.assertTrue(context.check_hostname); self.assertEqual(context.verify_mode, dev.ssl.CERT_REQUIRED)
+            connection._create_connection(('dev.capture402.xyz', 443), 5)
+            connect.assert_called_once_with(('127.0.0.1', 443), 5, None)
+            connection.request.assert_called_once_with('GET', '/resource')
+            connection.close.assert_called_once()
+
+    def test_dns_and_certificate_failure_never_pass_readiness(self):
+        with (mock.patch.object(dev.socket, 'getaddrinfo', side_effect=OSError('DNS unavailable')),
+              mock.patch.object(dev.http.client, 'HTTPSConnection') as tls):
+            with self.assertRaises(OSError): dev.ingress_response('/')
+            tls.assert_not_called()
+        connection = mock.Mock()
+        connection.request.side_effect = dev.ssl.SSLCertVerificationError('certificate rejected')
+        with (mock.patch.object(dev.socket, 'getaddrinfo'),
+              mock.patch.object(dev.http.client, 'HTTPSConnection', return_value=connection)):
+            with self.assertRaises(dev.ssl.SSLCertVerificationError): dev.ingress_response('/')
+            connection.close.assert_called_once()
+
+
 class TransactionTests(DevFixture):
     def setUp(self):
         super().setUp()
@@ -161,6 +219,9 @@ class TransactionTests(DevFixture):
         self.acceptance = {'sha': NEW, 'tree': 'tree', 'branch': 'codex/app', 'reviewedHead': NEW, 'ciRun': 3}
         for name in ('units', 'health', 'rpc', 'install_gate', 'freeze', 'thaw'):
             self.stack.enter_context(mock.patch.object(dev, name, side_effect=lambda *args, n=name, **kw: self.calls.append(n)))
+        web = dev.RELEASES / NEW / 'integration/web'
+        web.mkdir(parents=True)
+        for name in ('homepage.css', 'homepage.js'): (web / name).write_text('asset')
         self.stage = self.stack.enter_context(mock.patch.object(dev, 'stage'))
         self.policy = self.stack.enter_context(mock.patch.object(policy, 'verify_dev', return_value=self.acceptance))
         self.stack.enter_context(mock.patch.object(cli, 'GitHub'))
@@ -200,6 +261,11 @@ class TransactionTests(DevFixture):
         with mock.patch.object(policy, 'verify_dev', side_effect=RuntimeError('CI unavailable')):
             with self.assertRaises(RuntimeError): dev.deploy(NEW, object())
         self.assertNotIn('stop', self.calls)
+
+    def test_missing_candidate_homepage_blocks_before_cutover(self):
+        (dev.RELEASES / NEW / 'integration/web/homepage.js').unlink()
+        with self.assertRaisesRegex(RuntimeError, 'homepage assets missing'): dev.deploy(NEW, object())
+        self.assertEqual(dev.current(), OLD); self.assertNotIn('stop', self.calls)
 
     def test_operation_arriving_before_freeze_is_detected_then_thawed(self):
         def freeze():
