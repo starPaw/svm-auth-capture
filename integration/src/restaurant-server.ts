@@ -21,7 +21,7 @@ export function createPresentationApp(info: { programId: string; network: string
   app.use("*", async (c, next) => {
     c.header("X-Content-Type-Options", "nosniff");
     c.header("Referrer-Policy", "no-referrer");
-    c.header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: https://c.praguemarina.cz; connect-src 'self'; frame-src https://connect.solflare.com; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
+    c.header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-src https://connect.solflare.com; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
     await next();
   });
   app.all("/assets/homepage.css", async (c, next) => { if (c.req.method !== "GET") return c.body(null, 405); await next(); });

@@ -5,12 +5,13 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync, readFileSync, unlinkSync, openSync, fsyncSync, closeSync } from "node:fs";
 import { join } from "node:path";
 import { Hono } from "hono";
+import { AccountState, getTokenDecoder } from "@solana-program/token";
 import { requireBearerToken } from "./auth.ts";
 import { bodyLimit } from "hono/body-limit";
 import { getCookie, setCookie } from "hono/cookie";
 import { type Address, getBase64Encoder, getTransactionDecoder, getCompiledTransactionMessageDecoder, getSignatureFromTransaction, getPublicKeyFromAddress, verifySignature, isAddress, type SignatureBytes, type Transaction } from "@solana/kit";
 import { createDurableFile, ensureDurableDirectory, replaceDurableFile } from "./durable-file.ts";
-import { decodePayment, paymentAddress, type Payment } from "./program.ts";
+import { ata, TOKEN_PROGRAM_ADDRESS, decodePayment, paymentAddress, type Payment } from "./program.ts";
 import { acceptedDeadlines, freshRequirements, peekAuthorize, settle, type ResourceServerConfig } from "./resource-server.ts";
 import { encodeHeader, decodeHeader, parsePaymentPayload, PAYMENT_REQUIRED_HEADER, PAYMENT_SIGNATURE_HEADER, PAYMENT_RESPONSE_HEADER, type PaymentRequired } from "./http-transport.ts";
 import { authorizeInstruction, encodeTransaction, captureInstruction, capturePayload, voidInstruction, voidPayload, refundInstruction, refundPayload, reclaimInstruction } from "./transactions.ts";
@@ -59,6 +60,61 @@ const digest = (s: string) => createHash("sha256").update(s).digest("hex");
 const equalMessage = (a: Transaction, b: Transaction) => Buffer.from(a.messageBytes).equals(Buffer.from(b.messageBytes));
 const money = (n: bigint) => Number(n) / Number(DEMO_UNIT);
 const labels: Record<Action, string> = { authorize: "Budget authorized", beer: "Beer + Ribs", salmon: "Salmon", finish: "Order finished · remainder released", void: "Order cancelled · hold released", refund: "Consumed budget refunded", reclaim: "Payer reclaimed unused budget" };
+const merchantActions = ["beer", "salmon", "finish", "void", "refund"] as const;
+class RestaurantRefusal extends Error {}
+
+// One policy for read-only eligibility and signing preflight. Onchain Clock and (H,F)
+// remain authoritative at execution, including races after this finalized snapshot.
+function actionReasons(c: RestaurantConfig, order: Order, p: Payment | null, now: bigint, blocked: boolean) {
+  const completed = (a: Action) => order.events.some(e => e.action === a && e.status === "finalized");
+  function reason(a: Exclude<Action, "authorize">): string {
+    if (blocked) return "Original operation pending or reserved; inspect its signatures.";
+    if (!p) return "Wallet approval is not finalized authorization. Authorize the original offer first.";
+    if (c.orders.attempted(order.id, a)) return "This action already has an original attempt; no retry is permitted.";
+    if (a === "reclaim") {
+      if (p.held <= 0n) return "No remaining hold to reclaim.";
+      return now < p.captureDeadline ? "Payer reclaim opens at the onchain capture deadline." : "";
+    }
+    // Preserve the original application authorization gate for merchant signing.
+    // A matching funded PDA does not reconcile a draft; payer reclaim is separate.
+    if (order.status === "draft") return "Original application authorization is still draft; merchant signing is blocked.";
+    if (order.scenario === "unavailable") return "Merchant unavailable scenario permits payer reclaim only.";
+    if (a === "refund") {
+      if (now >= p.refundDeadline) return "Onchain refund deadline expired.";
+      return p.refundable <= 0n ? "No refundable captured balance." : "";
+    }
+    if (now >= p.captureDeadline) return "Onchain capture deadline expired; payer reclaim may be eligible.";
+    if (p.held <= 0n) return "No remaining hold.";
+    if (a === "beer") {
+      if (order.scenario === "cancelled") return "Cancelled scenario permits explicit void only.";
+      return p.held < 40n * DEMO_UNIT ? "Remaining hold is below 40 test tokens." : "";
+    }
+    if (a === "salmon") {
+      if (order.scenario !== "normal") return "Capture 25 belongs to the normal scenario.";
+      if (!completed("beer")) return "Finalize capture 40 first.";
+      return p.held < 25n * DEMO_UNIT ? "Remaining hold is below 25 test tokens." : "";
+    }
+    if (a === "finish") {
+      if (order.scenario === "normal") return !completed("salmon") || p.held !== 35n * DEMO_UNIT ? "Finalize captures 40 and 25 before voiding the remaining 35." : "";
+      return order.scenario !== "refund" || !completed("refund") ? "Complete the refund scenario before releasing the remaining hold." : "";
+    }
+    return ""; // Explicit void of a positive eligible hold.
+  }
+  return Object.fromEntries([...merchantActions, "reclaim"].map(a => [a, reason(a as Exclude<Action, "authorize">)]));
+}
+
+async function tokenBalance(c: RestaurantConfig, owner: Address) {
+  try {
+    const snapshot = await c.ledger.getAccountAtLeast(await ata(owner, c.asset), 0n);
+    if (snapshot.kind !== "ok") return { amount: null, reason: "Finalized token balance unavailable." };
+    if (!snapshot.account) return { amount: 0, reason: "Test-mint token account missing; operator funding required." };
+    const decoder = getTokenDecoder();
+    if (snapshot.account.owner !== TOKEN_PROGRAM_ADDRESS || snapshot.account.data.length !== decoder.fixedSize) return { amount: null, reason: "Test-mint token account invalid." };
+    const t = decoder.decode(snapshot.account.data);
+    if (t.owner !== owner || t.mint !== c.asset || t.state !== AccountState.Initialized) return { amount: null, reason: "Test-mint token account cannot transfer." };
+    return { amount: money(t.amount), reason: "" };
+  } catch { return { amount: null, reason: "Finalized token balance unavailable." }; }
+}
 
 export async function restaurantSnapshot(c: RestaurantConfig, order: Order): Promise<Payment | null> {
   let slot = 0n;
@@ -101,7 +157,7 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
     await next();
   });
   // SDK/provider errors can embed private credential URLs. Never echo them to the browser.
-  app.onError((error, ctx) => ctx.json({ error: error.message.includes("ENOENT") ? "order unavailable" : error.message.includes("EEXIST") ? "action reserved; inspect original outcome before any new consent" : "action refused or chain evidence unavailable; refresh and inspect the original order" }, 409));
+  app.onError((error, ctx) => ctx.json({ error: error instanceof RestaurantRefusal ? error.message : error.message.includes("ENOENT") ? "order unavailable" : error.message.includes("EEXIST") ? "action reserved; inspect original outcome before any new consent" : "Finalized RPC evidence unavailable or order conflict; refresh and inspect original signatures." }, 409));
 
   async function publicSignatureStatus(signature: string) {
     const status = await c.ledger.getSignatureStatus(signature);
@@ -112,21 +168,17 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
     const p = await restaurantSnapshot(c, order);
     const now = await c.now();
     const blocked = order.status === "pending" || c.orders.busy(order.id);
-    const done = (action: Action) => c.orders.attempted(order.id, action);
     const captured = order.events.filter(e => e.status === "finalized" && ["beer", "salmon"].includes(e.action)).reduce((s,e) => s + BigInt(e.amount), 0n);
     const refunded = order.events.filter(e => e.status === "finalized" && e.action === "refund").reduce((s,e) => s + BigInt(e.amount), 0n);
-    const active = p !== null && !blocked;
+    const reasons = actionReasons(c, order, p, now, blocked);
+    const balances = { payer: await tokenBalance(c, order.payer), merchant: await tokenBalance(c, c.server.address) };
+    if (!reasons.refund && (balances.merchant.amount === null || balances.merchant.amount < money(p!.refundable))) reasons.refund = balances.merchant.reason || "Merchant test-token balance cannot fund this refund.";
     return { id: order.id, payer: order.payer, payment: order.payment, scenario: order.scenario,
       status: blocked ? "pending" : p ? p.held === 0n ? "closed" : "active" : order.status,
       authorized: p ? money(p.maximum) : 0, captured: money(captured), remaining: p ? money(p.held) : 0, refunded: money(refunded), released: p ? money(p.maximum - p.held - captured) : 0,
       heldBaseUnits: p?.held.toString(), refundableBaseUnits: p?.refundable.toString(),
       captureDeadline: Number(order.required.accepts[0]!.extra!.captureDeadline), refundDeadline: Number(order.required.accepts[0]!.extra!.refundDeadline), now: Number(now),
-      actions: { beer: active && order.scenario !== "cancelled" && order.scenario !== "unavailable" && !done("beer") && p!.held >= 40n * DEMO_UNIT && now < p!.captureDeadline,
-        salmon: active && order.scenario === "normal" && done("beer") && captured >= 40n * DEMO_UNIT && !done("salmon") && p!.held >= 25n * DEMO_UNIT && now < p!.captureDeadline,
-        finish: active && p!.held > 0n && now < p!.captureDeadline && !done("finish") && (order.scenario === "normal" ? done("salmon") && captured === 65n * DEMO_UNIT : order.scenario === "refund" && refunded > 0n),
-        void: active && order.scenario !== "unavailable" && p!.held > 0n && now < p!.captureDeadline && !done("void"),
-        refund: active && order.scenario !== "unavailable" && p!.refundable > 0n && now < p!.refundDeadline && !done("refund"),
-        reclaim: active && p!.held > 0n && now >= p!.captureDeadline && !done("reclaim") },
+      actions: Object.fromEntries(Object.entries(reasons).map(([action, reason]) => [action, !reason])), actionReasons: reasons, balances,
       events: await Promise.all(order.events.map(async e => ({ action: e.action, label: e.label, amount: money(BigInt(e.amount)), at: e.at, status: e.status, signature: e.transaction, ...(e.transaction ? { chainStatus: await publicSignatureStatus(e.transaction) } : {}) }))),
       ...(order.status === "draft" ? { required: order.required, unsigned: order.unsigned } : {}),
     };
@@ -159,11 +211,14 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
         const old = owned(previous.split(".")[0]!, previous);
         const p = await restaurantSnapshot(c, old);
         if (c.orders.busy(old.id) || old.status === "pending" || (p && p.held > 0n)) return ctx.json({ error: "finish or reconcile the existing budget before opening another" }, 409);
+        if (old.status === "draft" && (old.events.length !== 0 || await c.now() < BigInt(old.required.accepts[0]!.extra!.captureDeadline as number))) return ctx.json({ error: "Original unsigned offer is still valid or has an attempt; inspect it before replacement." }, 409);
       } catch (e) { if (!(e instanceof Error) || !e.message.includes("ENOENT")) throw e; }
     }
     const id = randomBytes(16).toString("hex"); const capability = `${id}.${randomBytes(32).toString("hex")}`;
     const salt = randomBytes(32); const requirements = await freshRequirements(c);
-    const required: PaymentRequired = { x402Version: 2, resource: { url: `${c.origin}/resource`, description: "Pivovar Marina · 7-day hackathon food budget (compressed demo timing)", mimeType: "application/json" }, accepts: [requirements] };
+    const balance = await tokenBalance(c, payer);
+    if (balance.amount === null || balance.amount < 100) return ctx.json({ error: balance.reason || "Payer needs 100 test-mint tokens; operator funding required. No authorization submitted." }, 402);
+    const required: PaymentRequired = { x402Version: 2, resource: { url: `${c.origin}/resource`, description: "Pivovar Marina · 100 test-token Devnet budget", mimeType: "application/json" }, accepts: [requirements] };
     const tx = await buildDemoTransaction({ feePayer: c.feePayer, signers: [], lifetime: await c.getLatestBlockhash(), instructions: [await authorizeInstruction({ programId: c.programId, payer, server: c.server.address, mint: c.asset, funder: c.feePayer, salt, maximum: DEMO_BUDGET, captureDeadline: BigInt(requirements.extra!.captureDeadline as number), refundDeadline: BigInt(requirements.extra!.refundDeadline as number) })] }, c.ledger);
     const order: Order = { id, capabilityHash: digest(capability), payer, payment: await paymentAddress(c.programId, payer, salt), scenario: scenario as Scenario, required, unsigned: encodeTransaction(tx), createdAt: Number(await c.now()), status: "draft", events: [] };
     c.orders.create(order);
@@ -194,23 +249,32 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
     if (!merchantAuth) return ctx.json({ error: "merchant operations disabled" }, 503);
     return merchantAuth(ctx, next);
   });
+  // Order-scoped read-only preflight on the existing action surface, behind the
+  // very same bearer check as POST. Invalid credentials cannot cause economics.
+  app.get("/api/orders/:id/actions/:action", async ctx => {
+    if (!(merchantActions as readonly string[]).includes(ctx.req.param("action"))) return ctx.json({ error: "unsupported menu action" }, 400);
+    const snapshot = await view(c.orders.read(ctx.req.param("id")));
+    const { required: _required, unsigned: _unsigned, ...publicView } = snapshot;
+    return ctx.json({ ...publicView, operatorAccess: true });
+  });
   app.post("/api/orders/:id/actions/:action", async ctx => {
     let order = c.orders.read(ctx.req.param("id")); const action = ctx.req.param("action") as Action;
-    if (!["beer", "salmon", "finish", "void", "refund"].includes(action)) return ctx.json({ error: "unsupported menu action" }, 400);
+    if (!(merchantActions as readonly string[]).includes(action)) return ctx.json({ error: "unsupported menu action" }, 400);
     c.orders.reserve(order.id, action);
     order = c.orders.read(order.id);
     let prepared = false;
     try {
       const p = await restaurantSnapshot(c, order);
       // No new consent while an earlier attempt is unresolved.
-      if (!p || order.status === "pending" || order.status === "draft" || order.scenario === "unavailable") throw new Error("merchant action unavailable for this budget");
       const now = await c.now();
+      const reason = actionReasons(c, order, p, now, order.status === "pending")[action];
+      if (reason) throw new RestaurantRefusal(reason);
+      if (!p) throw new RestaurantRefusal("Original finalized payment unavailable.");
       const amount = action === "beer" ? 40n * DEMO_UNIT : action === "salmon" ? 25n * DEMO_UNIT : action === "refund" ? p.refundable : p.held;
-      const consumed = order.events.filter(e => e.status === "finalized").map(e => e.action);
-      if (action === "beer" && (order.scenario === "cancelled" || consumed.includes("beer"))) throw new Error("first item unavailable");
-      if (action === "salmon" && (order.scenario !== "normal" || !consumed.includes("beer") || consumed.includes("salmon"))) throw new Error("serve Beer + Ribs before Salmon");
-      if (action === "finish" && (order.scenario === "normal" ? !consumed.includes("salmon") || p.held !== 35n * DEMO_UNIT : order.scenario !== "refund" || !consumed.includes("refund"))) throw new Error("complete the selected menu scenario before finishing");
-      if (amount <= 0n || (action === "refund" ? now >= p.refundDeadline : now >= p.captureDeadline) || (action === "beer" || action === "salmon") && amount > p.held) throw new Error("amount/deadline no longer eligible");
+      if (action === "refund") {
+        const balance = await tokenBalance(c, p.server);
+        if (balance.amount === null || balance.amount < money(p.refundable)) throw new RestaurantRefusal(balance.reason || "Merchant test-token balance cannot fund this refund.");
+      }
       const stored = { programId: c.programId, payment: order.payment, payer: p.payer, server: p.server, mint: p.mint };
       const ix = action === "beer" || action === "salmon" ? await captureInstruction(stored, amount, false, p.held, p.refundable) : action === "refund" ? await refundInstruction(stored, amount, p.held, p.refundable) : await voidInstruction(stored, p.held, p.refundable);
       const tx = await buildDemoTransaction({ feePayer: c.feePayer, signers: [c.server], lifetime: await c.getLatestBlockhash(), instructions: [ix] }, c.ledger);

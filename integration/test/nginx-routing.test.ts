@@ -203,6 +203,23 @@ http {
     expect(h.ledger.submissions).toHaveLength(0);
   });
 
+  test("order-action GET preflight passes the same bearer boundary through HTTPS without economics", async () => {
+    const prepared = await https("/api/orders", "POST", { origin, "content-type": "application/json" }, JSON.stringify({ payer: h.payer.address }));
+    const { order } = JSON.parse(prepared.body);
+    const files = readdirSync(config.orders.dir).sort(), simulations = h.ledger.simulated.length;
+    const path = `/api/orders/${order}/actions/beer`;
+    for (const token of [undefined, "incorrect", config.bearerToken]) {
+      expect((await https(path, "GET", token ? { authorization: `Bearer ${token}` } : {})).status).toBe(401);
+    }
+    const access = await https(path, "GET", { authorization: `Bearer ${config.merchantToken}` });
+    expect(access.status).toBe(200);
+    expect(JSON.parse(access.body)).toMatchObject({ id: order, operatorAccess: true, actions: { beer: false } });
+    expect(access.headers["cache-control"]).toBe("no-store");
+    expect(access.body).not.toContain(config.merchantToken);
+    expect(readdirSync(config.orders.dir).sort()).toEqual(files);
+    expect(h.ledger.simulated).toHaveLength(simulations); expect(h.ledger.submissions).toHaveLength(0);
+  });
+
   test.each(["GET", "HEAD", "PUT", "PATCH", "DELETE", "OPTIONS"])("%s /api/orders returns 405 before reaching the backend", async method => {
     const before = upstream.length;
     expect((await https("/api/orders", method)).status).toBe(405);

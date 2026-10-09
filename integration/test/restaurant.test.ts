@@ -3,14 +3,14 @@ import { mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getBase64Encoder, getTransactionDecoder, partiallySignTransaction, type Address } from "@solana/kit";
-import { getMintToInstruction } from "@solana-program/token";
+import { getMintToInstruction, getTransferInstruction } from "@solana-program/token";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { demoSponsorComputeBounds } from "../src/demo-compute.js";
 import { createRestaurantApp, DEMO_BUDGET, DEMO_UNIT, RestaurantOrders, type RestaurantConfig } from "../src/restaurant.js";
 import { createPresentationApp } from "../src/restaurant-server.js";
 import { OperationStore } from "../src/operation-store.js";
 import { FileSubmissionJournal } from "../src/submission-journal.js";
-import { encodeTransaction } from "../src/transactions.js";
+import { encodeTransaction, reclaimInstruction } from "../src/transactions.js";
 import { decodeHeader, encodeHeader, type PaymentRequired } from "../src/http-transport.js";
 import { createHarness, type Harness, NOW, inspect } from "./fixture.js";
 import type { Hono } from "hono";
@@ -333,5 +333,141 @@ describe("restaurant budget lifecycle", () => {
     const info = await (await ui.request("/api/config")).json(); expect(info).toMatchObject({ configured:false,budget:100,cluster:"devnet",walletChain:"solana:devnet",timing:{captureSeconds:150,refundSecondsAfterCapture:30} });
     expect(JSON.stringify(info)).not.toContain(c.bearerToken); expect((await ui.request("/resource")).status).toBe(503);
     expect(h.ledger.submissions).toHaveLength(0);
+  });
+});
+
+
+describe("issue #45 read-only operator preflight and fail-closed eligibility", () => {
+  const spyMerchant = () => { const sign = vi.fn(c.server.signTransactions); c.server = { ...c.server, signTransactions: sign }; app = createRestaurantApp(c); return sign; };
+  const preflight = (s: Session, token = merchantToken, a = "beer") => app.request(`${origin}/api/orders/${s.id}/actions/${a}`, { headers: { authorization: `Bearer ${token}` } });
+  test.each(["", "incorrect", "local-only-test"])("invalid preflight bearer %s cannot reserve, simulate, sign or submit", async token => {
+    const s = await offer(); await authorize(s);
+    const reserve = vi.spyOn(c.orders, "reserve"), read = vi.spyOn(c.orders, "read"), simulate = vi.spyOn(c.ledger, "simulate"), sign = spyMerchant();
+    const files = readdirSync(c.orders.dir).sort(), original = readFileSync(c.orders.path(s.id), "utf8");
+    expect((await preflight(s, token)).status).toBe(401);
+    for (const call of [reserve, read, simulate, sign]) expect(call).not.toHaveBeenCalled();
+    expect(readdirSync(c.orders.dir).sort()).toEqual(files); expect(readFileSync(c.orders.path(s.id), "utf8")).toBe(original);
+    expect(h.ledger.submissions).toHaveLength(1);
+  });
+  test("matching finalized funded PDA does not reconcile a draft or permit merchant signing; payer reclaim policy stays intact", async () => {
+    const s = await offer();
+    // Fund the exact offered PDA outside application orchestration, leaving its original
+    // authorization draft and economic records untouched. This is a local LiteSVM fixture.
+    const signed = await partiallySignTransaction([h.payer.keyPair, h.facilitatorKey.keyPair], getTransactionDecoder().decode(getBase64Encoder().encode(s.unsigned)));
+    expect(await c.ledger.submit(signed)).toMatchObject({ kind: "submitted", outcome: { status: "succeeded", commitment: "finalized" } });
+    const original = readFileSync(c.orders.path(s.id), "utf8"), files = readdirSync(c.orders.dir).sort();
+    const payment = c.orders.read(s.id).payment, originalState = h.state(payment);
+    expect(c.orders.read(s.id)).toMatchObject({ status: "draft", events: [] });
+    expect(originalState).toMatchObject({ held: DEMO_BUDGET, refundable: 0n });
+    const sign = spyMerchant(), simulate = vi.spyOn(c.ledger, "simulate"), write = vi.spyOn(c.orders, "write"), prepare = vi.spyOn(c.orders, "prepare");
+    const v = await (await preflight(s)).json() as any;
+    for (const a of ["beer", "salmon", "finish", "void", "refund"]) {
+      expect(v.actions[a]).toBe(false); expect(v.actionReasons[a]).toContain("authorization is still draft");
+      const response = await action(s, a); expect(response.status).toBe(409); expect(await response.text()).toContain("authorization is still draft");
+      expect(c.orders.attempted(s.id, a as any)).toBe(false);
+    }
+    for (const call of [sign, simulate, write, prepare]) expect(call).not.toHaveBeenCalled();
+    expect(h.ledger.submissions).toHaveLength(1); expect(h.state(payment)).toEqual(originalState);
+    expect(readFileSync(c.orders.path(s.id), "utf8")).toBe(original); expect(readdirSync(c.orders.dir).sort()).toEqual(files);
+    expect(c.orders.busy(s.id)).toBe(false);
+    h.setTime(NOW + 150n);
+    const expired = await (await preflight(s)).json() as any;
+    expect(expired.actions.reclaim).toBe(true);
+    for (const a of ["beer", "salmon", "finish", "void", "refund"]) expect(expired.actions[a]).toBe(false);
+    expect(readFileSync(c.orders.path(s.id), "utf8")).toBe(original);
+  });
+  test("verified access is scoped to an original order and never signs, writes, or discloses unsigned wire", async () => {
+    const s = await offer();
+    const reserve = vi.spyOn(c.orders, "reserve"), write = vi.spyOn(c.orders, "write"), simulate = vi.spyOn(c.ledger, "simulate"), sign = spyMerchant();
+    const r = await preflight(s); expect(r.status).toBe(200); expect(r.headers.get("cache-control")).toBe("no-store");
+    const v = await r.json() as any;
+    expect(v).toMatchObject({ id: s.id, operatorAccess: true, actions: { beer: false }, balances: { payer: { amount: 1000.01 } } });
+    expect(v.actionReasons.beer).toContain("not finalized");
+    for (const field of ["required", "unsigned", "capabilityHash", "transactionBase64"]) expect(v).not.toHaveProperty(field);
+    expect(JSON.stringify(v)).not.toContain(merchantToken);
+    for (const call of [reserve, write, simulate, sign]) expect(call).not.toHaveBeenCalled();
+    expect(h.ledger.submissions).toHaveLength(0);
+  });
+  test("forged action/order preflight and POST never sign", async () => {
+    const s = await offer(); await authorize(s);
+    const sign = spyMerchant(), simulate = vi.spyOn(c.ledger, "simulate");
+    expect((await preflight(s, merchantToken, "authorize")).status).toBe(400);
+    expect((await action(s, "reclaim")).status).toBe(400);
+    expect((await preflight({ ...s, id: "f".repeat(32) })).status).toBe(409);
+    expect((await action({ ...s, id: "f".repeat(32) }, "beer")).status).toBe(409);
+    expect(sign).not.toHaveBeenCalled(); expect(simulate).not.toHaveBeenCalled(); expect(h.ledger.submissions).toHaveLength(1);
+  });
+  test("preflight uses current finalized state, specific deadline reasons and never extends an offer", async () => {
+    const s = await offer(); await authorize(s); const terms = s.required.accepts[0]!.extra;
+    const initial = await (await preflight(s)).json() as any;
+    expect(initial).toMatchObject({ actions: { beer: true, salmon: false, refund: false } });
+    expect(initial.actionReasons.salmon).toBe("Finalize capture 40 first.");
+    h.setTime(NOW + 150n);
+    const expired = await (await preflight(s)).json() as any;
+    expect(expired).toMatchObject({ actions: { beer: false, reclaim: true }, captureDeadline: terms!.captureDeadline, refundDeadline: terms!.refundDeadline });
+    expect(expired.actionReasons.beer).toContain("deadline expired");
+    expect((await action(s, "beer")).status).toBe(409); expect(h.ledger.submissions).toHaveLength(1);
+    expect(c.orders.attempted(s.id, "beer")).toBe(false);
+  });
+  test("unavailable or stale finalized signature evidence cannot reach merchant signing", async () => {
+    const s = await offer(); await authorize(s);
+    c.ledger.getSignatureStatus = async () => ({ kind: "found", commitment: "confirmed", slot: 1n, err: null });
+    const sign = spyMerchant(), simulate = vi.spyOn(c.ledger, "simulate");
+    expect((await preflight(s)).status).toBe(409); expect((await action(s, "beer")).status).toBe(409);
+    expect(sign).not.toHaveBeenCalled(); expect(simulate).not.toHaveBeenCalled(); expect(h.ledger.submissions).toHaveLength(1);
+  });
+  test("pending original settlement cannot unlock eligibility even with valid operator access", async () => {
+    const s = await offer(); await authorize(s); h.ledger.failSubmit = "after-landing"; await action(s, "beer");
+    const disk = readFileSync(c.orders.path(s.id), "utf8");
+    const v = await (await preflight(s)).json() as any;
+    expect(v.status).toBe("pending"); expect(Object.values(v.actions)).toEqual(Array(6).fill(false));
+    expect(v.actionReasons.salmon).toContain("pending");
+    expect(readFileSync(c.orders.path(s.id), "utf8")).toBe(disk); expect(h.ledger.submissions).toHaveLength(2);
+  });
+  test("a valid unsigned offer cannot be replaced or extended", async () => {
+    const s = await offer(); const original = readFileSync(c.orders.path(s.id), "utf8");
+    const r = await app.request(`${origin}/api/orders`, { method: "POST", headers: { origin, cookie: s.cookie, "content-type": "application/json" }, body: JSON.stringify({ payer: h.payer.address }) });
+    expect(r.status).toBe(409); expect(readdirSync(c.orders.dir)).toHaveLength(1);
+    expect(readFileSync(c.orders.path(s.id), "utf8")).toBe(original); expect(h.ledger.submissions).toHaveLength(0);
+  });
+  test("payer funding blocker is explicit before simulation, order creation or signing", async () => {
+    const simulate = vi.spyOn(c.ledger, "simulate"), create = vi.spyOn(c.orders, "create");
+    const r = await app.request(`${origin}/api/orders`, { method: "POST", headers: { origin, "content-type": "application/json" }, body: JSON.stringify({ payer: h.outsider.address }) });
+    expect(r.status).toBe(402); expect(await r.text()).toContain("funding required");
+    expect(simulate).not.toHaveBeenCalled(); expect(create).not.toHaveBeenCalled(); expect(h.ledger.submissions).toHaveLength(0);
+  });
+  test("merchant liquidity loss disables refund and refuses before signing or simulation", async () => {
+    const s = await offer("refund"); await authorize(s); await expectAction(s, "beer");
+    h.ok(await h.direct([getTransferInstruction({ source: await h.serverAta(), destination: await h.payerAta(), authority: h.server, amount: 40n * DEMO_UNIT })], [h.server]));
+    const sign = spyMerchant(), simulate = vi.spyOn(c.ledger, "simulate");
+    const v = await (await preflight(s, merchantToken, "refund")).json() as any;
+    expect(v).toMatchObject({ actions: { refund: false }, balances: { merchant: { amount: 0 } }, refundableBaseUnits: "40000000" });
+    expect(v.actionReasons.refund).toContain("cannot fund");
+    const r = await action(s, "refund"); expect(r.status).toBe(409); expect(await r.text()).toContain("cannot fund");
+    expect(sign).not.toHaveBeenCalled(); expect(simulate).not.toHaveBeenCalled(); expect(h.ledger.submissions).toHaveLength(2);
+    expect(c.orders.attempted(s.id, "refund")).toBe(false);
+  });
+  test("capture crossing the deadline before inclusion fails atomically and preserves payer reclaim", async () => {
+    const s = await offer(); await authorize(s); const payment = (await view(s)).payment;
+    const submit = c.ledger.submit.bind(c.ledger);
+    vi.spyOn(c.ledger, "submit").mockImplementation(async tx => { h.setTime(NOW + 150n); return submit(tx); });
+    expect((await action(s, "beer")).status).toBe(409);
+    expect(h.state(payment)).toMatchObject({ held: DEMO_BUDGET, refundable: 0n });
+    expect(await view(s)).toMatchObject({ actions: { beer: false, reclaim: true } });
+    expect(h.ledger.submissions).toHaveLength(2); expect(c.orders.attempted(s.id, "beer")).toBe(true);
+  });
+  test("payer reclaim winning a merchant capture race prevents a second transition", async () => {
+    const s = await offer(); await authorize(s); const payment = (await view(s)).payment;
+    const submit = c.ledger.submit.bind(c.ledger);
+    vi.spyOn(c.ledger, "submit").mockImplementation(async tx => {
+      h.setTime(NOW + 150n);
+      h.ok(await h.direct([await reclaimInstruction({ programId: c.programId, payment, payer: h.payer.address, server: h.server.address, mint: h.mint })], [h.payer]));
+      return submit(tx);
+    });
+    expect((await action(s, "beer")).status).toBe(409);
+    expect(h.state(payment)).toMatchObject({ held: 0n, refundable: 0n });
+    expect(h.tokens(await h.serverAta())).toBe(0n);
+    expect(await view(s)).toMatchObject({ status: "closed", remaining: 0, released: 100 });
+    expect(h.ledger.submissions).toHaveLength(2);
   });
 });

@@ -1,0 +1,143 @@
+// Browser/DOM fixtures only: no RPC, keypairs, signatures, wallet approvals or broadcasts.
+// Run in an isolated network namespace with existing Playwright and Chromium:
+// RESTAURANT_PLAYWRIGHT_MODULE=/path/to/playwright/index.mjs node browser/restaurant-check.mjs
+import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { createServer } from 'node:https';
+import { once } from 'node:events';
+import { serve } from '@hono/node-server';
+import { createPresentationApp } from '../src/restaurant-server.ts';
+const { chromium } = await import(pathToFileURL(process.env.RESTAURANT_PLAYWRIGHT_MODULE));
+const temp = mkdtempSync(join(tmpdir(), 'issue45-dom-'));
+const output = process.env.RESTAURANT_QA_OUTPUT || temp;
+execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-subj', '/CN=localhost', '-keyout', join(temp, 'key.pem'), '-out', join(temp, 'cert.pem')], { stdio: 'pipe' });
+const info = { programId:'11111111111111111111111111111111', network:'solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1', configured:true, merchant:'11111111111111111111111111111111', mint:'11111111111111111111111111111111', sponsor:'11111111111111111111111111111111' };
+const app = createPresentationApp(info); // No economic backend exists in this fixture.
+const server = serve({ fetch:app.fetch, hostname:'127.0.0.1', port:0, createServer, serverOptions:{ key:readFileSync(join(temp,'key.pem')), cert:readFileSync(join(temp,'cert.pem')) } });
+await once(server, 'listening');
+const origin = `https://127.0.0.1:${server.address().port}`;
+let browser;
+const report = { scope:'Local HTTPS DOM fixtures; no Devnet, wallet signing or economic E2E claim.', browser:'', checks:[], viewports:[], requests:[] };
+let state, rpcFailure = false, posts = 0, gets = 0, loseResponse = false, delayPreflight = false, missingAuthority = false;
+const secret = 'local-browser-fixture-credential-' + 'x'.repeat(32);
+const id = 'a'.repeat(32);
+const draft = () => ({ id, payer:info.merchant, payment:info.programId, scenario:'normal', status:'draft', authorized:0, captured:0, remaining:0, refunded:0, released:0, captureDeadline:Math.floor(Date.now()/1000)-5, refundDeadline:Math.floor(Date.now()/1000)+25, now:Math.floor(Date.now()/1000), events:[], actions:{beer:false,salmon:false,finish:false,void:false,refund:false,reclaim:false}, actionReasons:{beer:'Wallet approval is not finalized authorization.'}, balances:{payer:{amount:100,reason:''},merchant:{amount:0,reason:''}}, required:{accepts:[]}, unsigned:'unsigned-DOM-fixture-never-signed' });
+const held = () => ({ ...draft(), status:'active', authorized:100, remaining:100, heldBaseUnits:'100000000', refundableBaseUnits:'0', captureDeadline:Math.floor(Date.now()/1000)+140, refundDeadline:Math.floor(Date.now()/1000)+170, actions:{beer:true,salmon:false,finish:false,void:true,refund:false,reclaim:false}, actionReasons:{beer:'',salmon:'Finalize capture 40 first.',finish:'Finalize captures 40 and 25 first.',void:'',refund:'No refundable captured balance.',reclaim:'Payer reclaim opens at the onchain capture deadline.'}, events:[{action:'authorize',label:'Local DOM authorize fixture',amount:100,at:new Date().toISOString(),status:'finalized',signature:'fixture-original-signature-not-onchain',chainStatus:{commitment:'finalized'}}] });
+const check = name => report.checks.push(name);
+try {
+  browser = await chromium.launch({ headless:true }); report.browser = browser.version();
+  const context = await browser.newContext({ ignoreHTTPSErrors:true, viewport:{width:1440,height:900} });
+  const page = await context.newPage();
+  const errors = [];
+  page.on('pageerror', error => errors.push(error.message));
+  page.on('request', req => { const u = new URL(req.url()); assert.equal(u.origin, origin, 'All runtime requests must be same origin'); assert(!req.url().includes(secret)); report.requests.push({path:u.pathname,method:req.method(),operatorBearer:!!req.headers().authorization}); });
+  await page.route('**/api/orders**', async route => {
+    const req = route.request(), path = new URL(req.url()).pathname;
+    if (path === '/api/orders' && req.method() === 'POST') {
+      posts++;
+      const next = { ...draft(), id:'b'.repeat(32), captureDeadline:Math.floor(Date.now()/1000)+150, refundDeadline:Math.floor(Date.now()/1000)+180 };
+      state = next;
+      return route.fulfill({ status:402, contentType:'application/json', headers:{'PAYMENT-REQUIRED':Buffer.from(JSON.stringify(next.required)).toString('base64')}, body:JSON.stringify({order:next.id,unsigned:next.unsigned,required:next.required}) });
+    }
+    if (path.includes('/actions/')) {
+      if (req.method() === 'GET') {
+        gets++;
+        if (delayPreflight) await new Promise(resolve => setTimeout(resolve, 250));
+        if (missingAuthority || req.headers().authorization !== `Bearer ${secret}`) return route.fulfill({status:401,contentType:'application/json',body:JSON.stringify({error:'fixture-refused'})});
+        if (rpcFailure) return route.fulfill({status:409,contentType:'application/json',body:JSON.stringify({error:'fixture-RPC-unavailable'})});
+        return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({...state,operatorAccess:true})});
+      }
+      posts++;
+      if (loseResponse) return route.abort('failed');
+      return route.fulfill({status:409,contentType:'application/json',body:JSON.stringify({receipt:{success:false,errorReason:'settlement_pending',transaction:''}})});
+    }
+    return route.fulfill({status:rpcFailure?409:200,contentType:'application/json',body:JSON.stringify(rpcFailure?{error:'Finalized RPC state unavailable.'}:state)});
+  });
+  async function load(next, wallet = false) {
+    state = next; rpcFailure = false; posts = 0; gets = 0; loseResponse = false; missingAuthority = false;
+    await page.goto(origin + '/customer');
+    await page.evaluate(({state,id,wallet}) => {
+      localStorage.clear(); if(state) localStorage.setItem('capture402-order',state.id);
+      if(wallet) window.addEventListener('wallet-standard:app-ready', event => event.detail.register({name:'Local DOM wallet — cannot sign',features:{'standard:connect':{connect:async()=>({accounts:[{address:id,chains:['solana:devnet'],features:['solana:signTransaction']}]})},'solana:signTransaction':{supportedTransactionVersions:['legacy'],signTransaction:async()=>{window.fixtureSigns=(window.fixtureSigns||0)+1;throw new Error('DOM fixture cannot sign');}}}}), {once:true});
+    }, {state:next,id:info.merchant,wallet});
+    // Install registry before the module discovers wallets on the next navigation.
+    await page.addInitScript(({wallet,id}) => { if(wallet) window.addEventListener('wallet-standard:app-ready', e=>e.detail.register({name:'Local DOM wallet — cannot sign',features:{'standard:connect':{connect:async()=>({accounts:[{address:id,chains:['solana:devnet'],features:['solana:signTransaction']}]})},'solana:signTransaction':{supportedTransactionVersions:['legacy'],signTransaction:async()=>{window.fixtureSigns=(window.fixtureSigns||0)+1;throw new Error('DOM fixture cannot sign');}}}}),{once:true}); }, {wallet,id:info.merchant});
+    await page.reload(); if(next) await page.waitForFunction(()=>document.getElementById('payment-id').querySelector('a')); else await page.waitForFunction(()=>document.getElementById('clock-label').textContent.includes('no offer yet'));
+  }
+  await load(undefined);
+  assert.equal(await page.locator('#clock').textContent(),'02:30'); assert(await page.locator('#authorize').isDisabled());
+  assert((await page.locator('#authorize-reason').textContent()).includes('Connect')); check('Absent wallet, no offer: 02:30 and explicit disabled reason');
+  assert.equal(await page.locator('img').count(),0); assert(!(await page.content()).includes('praguemarina.cz')); check('No photograph or external photo dependency');
+  await load(held(), true);
+  await page.locator('#connect-wallet').click(); await page.locator('#wallet-list button').first().click();
+  assert.equal(await page.locator('#payer-key').textContent(),info.merchant); assert(await page.locator('[data-action=beer]').isDisabled());
+  check('Connected payer wallet and original order grant no merchant authority');
+  for (const [width,height] of [[1440,900],[1024,768],[768,1024],[390,844],[320,740]]) {
+    await page.setViewportSize({width,height});
+    const layout = await page.evaluate(() => ({scrollWidth:document.documentElement.scrollWidth,pageHeight:document.documentElement.scrollHeight,merchantBottom:document.getElementById('merchant-panel').getBoundingClientRect().bottom,receiptTop:document.getElementById('history-heading').getBoundingClientRect().top,receiptBottom:document.querySelector('.history-card').getBoundingClientRect().bottom}));
+    assert.equal(layout.scrollWidth,width,`${width}px horizontal overflow`);
+    assert(layout.merchantBottom<=height,`${width}px operator panel must fit the opening screen`);
+    if(width>=390) assert(layout.receiptBottom<=height,`${width}px original receipt must fit the opening screen`);
+    report.viewports.push({width,height,...layout});
+    if(width===1440||width===390||width===320) await page.screenshot({path:join(output,`restaurant-${width}.png`),fullPage:true});
+  }
+  check('Responsive layout at five viewports and screenshot evidence');
+  await page.setViewportSize({width:1440,height:900});
+  const before = posts;
+  await page.locator('#merchant-secret').fill('wrong-but-long-fixture-credential-000000'); await page.locator('#unlock-merchant').click();
+  await page.waitForFunction(()=>document.getElementById('action-status').textContent.includes('no economic request'));
+  assert.equal(posts,before); assert(await page.locator('[data-action=beer]').isDisabled()); assert.equal(await page.locator('#merchant-secret').inputValue(),'');
+  check('Invalid credential uses GET only; clears input and never posts an economic action');
+  async function unlock() { await page.locator('#merchant-secret').fill(secret); await page.locator('#unlock-merchant').click(); await page.waitForFunction(()=>document.getElementById('operator-status').textContent.includes('verified')); await page.waitForFunction(()=>!document.getElementById('unlock-merchant').disabled); }
+  await unlock(); assert(!(await page.locator('[data-action=beer]').isDisabled())); assert(await page.locator('[data-action=salmon]').isDisabled());
+  assert.equal(await page.locator('#merchant-secret').inputValue(),'');
+  async function noSecretLeak() {
+    const contents = await page.evaluate(()=>({html:document.documentElement.outerHTML,local:JSON.stringify(localStorage),session:JSON.stringify(sessionStorage),cookie:document.cookie,url:location.href}));
+    for(const value of Object.values(contents)) assert(!value.includes(secret),'Credential must remain absent from DOM/storage/cookie/URL');
+  }
+  await noSecretLeak(); check('Verified operator unlock enables only eligible action; no secret in DOM or persistent storage');
+  await page.locator('#lock-merchant').click(); assert(await page.locator('[data-action=beer]').isDisabled()); check('Explicit lock clears operator access');
+  await unlock(); await page.reload(); await page.waitForFunction(()=>document.getElementById('payment-state').textContent.includes('Finalized'));
+  assert(await page.locator('[data-action=beer]').isDisabled()); await noSecretLeak(); check('Navigation clears operator secret and access');
+  await unlock(); missingAuthority = true;
+  await page.locator('[data-action=beer]').click(); await page.waitForFunction(()=>document.getElementById('action-status').textContent.includes('credential refused'));
+  assert.equal(posts,0); assert(await page.locator('[data-action=beer]').isDisabled()); check('Authority revoked before action preflight cannot produce an economic POST');
+  missingAuthority = false;
+  state.events[0].label = '<img src=x onerror="window.fixtureXss=true">';
+  await page.locator('#refresh').click(); await page.waitForFunction(()=>document.getElementById('timeline').textContent.includes('<img'));
+  assert.equal(await page.locator('#timeline img').count(),0); assert.equal(await page.evaluate(()=>window.fixtureXss),undefined); check('XSS-sensitive event labels render as escaped text');
+  await unlock(); rpcFailure = true;
+  await page.locator('#refresh').click(); await page.waitForFunction(()=>document.getElementById('payment-state').textContent.includes('RPC unavailable'));
+  assert(await page.locator('[data-action=beer]').isDisabled()); assert((await page.locator('[data-reason=beer]').textContent()).includes('RPC')); check('RPC failure pauses state and merchant actions');
+  await load({...held(),status:'pending',actions:Object.fromEntries(Object.keys(held().actions).map(a=>[a,false])),actionReasons:{beer:'Original operation pending or reserved; inspect its signatures.'}});
+  await unlock(); assert(await page.locator('[data-action=beer]').isDisabled()); assert((await page.locator('[data-reason=beer]').textContent()).includes('pending')); check('Pending original payment stays ineligible after valid operator authentication');
+  await load({...held(),captureDeadline:Math.floor(Date.now()/1000)-1,actions:{...held().actions,beer:false,void:false,reclaim:true},actionReasons:{beer:'Onchain capture deadline expired.',reclaim:''}});
+  await unlock(); assert.equal(await page.locator('#clock').textContent(),'00:00'); assert(await page.locator('[data-action=beer]').isDisabled()); assert(await page.locator('#new-budget').isHidden());
+  check('Funded expired hold never resets deadlines or exposes replacement');
+  await load(held()); missingAuthority = true;
+  await page.locator('#merchant-secret').fill(secret); await page.locator('#unlock-merchant').click(); await page.waitForFunction(()=>document.getElementById('action-status').textContent.includes('no economic request'));
+  assert.equal(posts,0); assert(await page.locator('[data-action=beer]').isDisabled()); check('Missing operator authority fails closed without an economic POST');
+  await load(draft(),true); await page.locator('#connect-wallet').click(); await page.locator('#wallet-list button').first().click();
+  assert.equal(await page.locator('#clock').textContent(),'00:00'); assert(await page.locator('#authorize').isDisabled());
+  await page.locator('#new-budget').click(); await page.waitForFunction(()=>localStorage.getItem('capture402-order')==='b'.repeat(32)&&document.getElementById('payment-state').textContent.includes('Unsigned'));
+  assert.equal(posts,1); assert.equal(await page.evaluate(()=>window.fixtureSigns||0),0); assert.equal(await page.evaluate(()=>localStorage.getItem('capture402-order')),'b'.repeat(32));
+  check('Expired never-submitted draft replaced only by explicit click; separate unsigned offer, no wallet signing');
+  await load(held()); await unlock(); delayPreflight = true;
+  await page.evaluate(()=>{const b=document.querySelector('[data-action=beer]');b.click();b.click();});
+  await page.waitForFunction(()=>document.getElementById('payment-state').textContent.includes('Unknown') || document.getElementById('payment-state').textContent.includes('Pending'));
+  assert.equal(posts,1); assert(await page.locator('[data-action=beer]').isDisabled()); check('Concurrent clicks produce one POST; pending response stays locked');
+  delayPreflight = false;
+  await load(held()); await unlock(); loseResponse = true;
+  await page.locator('[data-action=beer]').click(); await page.waitForFunction(()=>document.getElementById('payment-state').textContent.includes('Unknown'));
+  assert.equal(posts,1); assert(await page.locator('[data-action=beer]').isDisabled());
+  await page.reload(); await page.waitForFunction(()=>document.getElementById('payment-state').textContent.includes('Unknown'));
+  assert(await page.locator('[data-action=beer]').isDisabled()); assert(await page.locator('#new-budget').isHidden()); await noSecretLeak(); check('Lost economic response persists non-secret lock through reload and blocks replacement');
+  assert.equal(errors.length,0,errors.join('\n'));
+  check('No browser page errors or external runtime requests');
+  writeFileSync(join(output,'restaurant-browser-report.json'),JSON.stringify(report,null,2));
+  console.log(JSON.stringify({checks:report.checks.length,viewports:report.viewports,browser:report.browser,output,scope:report.scope}));
+} finally { if(browser) await browser.close(); await new Promise(resolve=>server.close(resolve)); rmSync(temp,{recursive:true,force:true}); }
