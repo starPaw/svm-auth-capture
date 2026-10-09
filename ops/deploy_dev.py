@@ -60,7 +60,7 @@ RELEASE_UNIT_PREFIX = 'capture402-dev-release-'
 ATTEMPT_RE = re.compile(r'[0-9]{20}-[a-f0-9]{32}')
 PHASES = {'allocated', 'launch', 'lock', 'recovery', 'current', 'units', 'health',
           'production', 'payment', 'private', 'rpc', 'release', 'staging', 'assets',
-          'acceptance', 'prepared', 'gate', 'freeze', 'stop', 'switch', 'start',
+          'acceptance', 'gate', 'freeze', 'stop', 'switch', 'start',
           'rollback', 'complete'}
 OUTCOMES = {'INCOMPLETE', 'FAILED', 'DEPLOYED', 'ALREADY_CURRENT', 'ROLLED_BACK',
             'ROLLBACK_UNVERIFIED', 'RECOVERED', 'INTERRUPTED_UNKNOWN'}
@@ -188,7 +188,6 @@ class Attempt:
             pass  # Durable previous checkpoint remains explicitly incomplete.
 
 
-
 def read_attempt(ident):
     source.require(bool(ATTEMPT_RE.fullmatch(ident)), 'invalid attempt identity')
     root = BASE / 'attempts'
@@ -215,6 +214,8 @@ def read_attempt(ident):
     source.require((r['outcome'] == 'INCOMPLETE') == (r['endedNs'] is None), 'incomplete terminal record')
     source.require(r['unit'] is None or r['unit'] == RELEASE_UNIT_PREFIX + ident, 'invalid job correlation')
     source.require(r['invocation'] is None or isinstance(r['invocation'], str) and re.fullmatch('[a-f0-9]{32}', r['invocation']), 'invalid invocation')
+    if r['outcome'] in ('DEPLOYED', 'ALREADY_CURRENT'):
+        source.require(r['phase'] == 'complete' and r['currentSha'] == r['requestedSha'], 'invalid success record')
     prod = r['production']
     source.require(isinstance(prod, dict) and set(prod) == {'before', 'after', 'classification', 'causality'} and
                    prod['classification'] in ('unavailable', 'changed', 'unchanged') and prod['causality'] == 'not-established', 'invalid production evidence')
@@ -224,7 +225,8 @@ def read_attempt(ident):
         source.require(isinstance(value, dict) and set(value) in ({'collectedNs', 'scope', 'state'}, {'collectedNs', 'scope', 'state', 'sha256'}, {'collectedNs', 'scope', 'state', 'sha256', 'processes', 'routingSha256'}) and
                        type(value['collectedNs']) is int and value['scope'] == 'production-config-state-current-routing-services-v1' and
                        value['state'] in ('available', 'unavailable') and
-                       (value['state'] != 'available' or re.fullmatch('[a-f0-9]{64}', value.get('sha256', ''))), 'invalid observation')
+                       ((value['state'] == 'unavailable' and set(value) == {'collectedNs', 'scope', 'state'}) or
+                        (value['state'] == 'available' and re.fullmatch('[a-f0-9]{64}', value.get('sha256', '')))), 'invalid observation')
         if 'processes' in value:
             source.require(re.fullmatch('[a-f0-9]{64}', value['routingSha256']) and
                            isinstance(value['processes'], dict) and set(value['processes']) == set((*host.LEGACY_SERVICES, *host.PRODUCT_SERVICES)), 'invalid process coverage')
@@ -235,6 +237,7 @@ def read_attempt(ident):
                                item['cwd'] in ('release-integration', 'unverified') and
                                (item['entrypointSha256'] is None or re.fullmatch('[a-f0-9]{64}', item['entrypointSha256'])) and
                                re.fullmatch('[a-f0-9]{64}', item['serviceIdentitySha256']), 'invalid process identity')
+    source.require(prod == evidence_pair(prod['before'], prod['after']) if prod['after'] else prod['classification'] == 'unavailable', 'inconsistent production classification')
     return r
 
 
@@ -287,7 +290,7 @@ def failure_summary(attempt=None):
         return 'dev deployment blocked; reporting unavailable'
     gate = r.get('gate', 'REPORT_UNAVAILABLE')
     return ('dev deployment blocked; gate=' + GATE_LABELS.get(gate, gate) +
-            '; attempt=' + r.get('id', 'unavailable') + '; outcome=' + r['outcome'] +
+            '; attempt=' + r.get('id', 'unavailable') + '; outcome=' + ('INTERRUPTED_UNKNOWN' if r['outcome'] == 'INCOMPLETE' else r['outcome']) +
             '; job=' + (r.get('unit') or 'not-launched'))
 
 
@@ -770,6 +773,10 @@ def recover():
 def deploy(sha, api, attempt=None):
     attempt = attempt or Attempt.create(sha)
     try:
+        application = safe_current()
+        attempt.record.update(previousSha=application, currentSha=application)
+        if attempt.record['production']['before'] is None:
+            attempt.record['production']['before'] = observation()
         attempt.step('lock')
         with locked():
             attempt.step('recovery')
@@ -789,7 +796,8 @@ def _deploy(sha, api, attempt):
     previous = check('current', current)
     attempt.record.update(previousSha=previous, currentSha=previous)
     # Capture before any fallible preflight, including units/health/payment refusal.
-    attempt.record['production']['before'] = observation()
+    if attempt.record['production']['before'] is None:
+        attempt.record['production']['before'] = observation()
     check('units', units)
     check('health', lambda: health(previous))
     baseline = check('production', production)
@@ -872,7 +880,6 @@ def report_json(path, value):
         return True
     except Exception:
         return False
-
 
 
 # Read-only operator diagnostics. Never authorize, sign, replay, unlock or mutate journals.
@@ -1263,8 +1270,13 @@ def dispatch(argv):
     source.require(os.geteuid() == 0, 'dev deployment requires authorized local sudo')
     if len(argv) == 2 and argv[0] == 'deploy' and source.SHA_RE.fullmatch(argv[1]):
         attempt = None
+        launched = False
+        launch_refused = False
         try:
             attempt = Attempt.create(argv[1])
+            application = safe_current()
+            attempt.record.update(previousSha=application, currentSha=application)
+            attempt.record['production']['before'] = observation()
             attempt.step('lock')
             with locked():
                 attempt.step('recovery')
@@ -1274,16 +1286,20 @@ def dispatch(argv):
             unit = RELEASE_UNIT_PREFIX + attempt.record['id']
             attempt.step('launch', unit=unit)
             print('Dev deployment attempt: ' + attempt.record['id'] + '; job: ' + unit, flush=True)
-            result = subprocess.run(['systemd-run', '--unit=' + unit, '--wait', '--property=Type=exec',
-                '--property=UMask=0077', '--property=RuntimeMaxSec=900',
-                '--property=ExecStopPost=/usr/bin/python3 -B ' + controller + ' recover',
-                '/usr/bin/python3', '-B', controller, *argv, attempt.record['id']],
-                capture_output=True, text=True)
-            # Never print systemd/subprocess bodies. Worker failure is already correlated.
+            launched = True
+            try:
+                result = subprocess.run(['systemd-run', '--unit=' + unit, '--wait', '--property=Type=exec',
+                    '--property=UMask=0077', '--property=RuntimeMaxSec=900',
+                    '--property=ExecStopPost=/usr/bin/python3 -B ' + controller + ' recover',
+                    '/usr/bin/python3', '-B', controller, *argv, attempt.record['id']],
+                    capture_output=True, text=True)
+            except OSError:
+                launch_refused = True  # Local exec failure, before systemd-run could launch a job.
+                raise
+            # Never print systemd/subprocess bodies or infer that an unreported job ended.
+            # A lost waiter/DBus connection can leave the worker running. Do not overwrite it.
             worker = read_attempt(attempt.record['id'])
-            if worker['outcome'] == 'INCOMPLETE':
-                attempt.record = worker
-                attempt.finish('INTERRUPTED_UNKNOWN')
+            attempt.record = worker
             source.require(result.returncode == 0 and worker['outcome'] in ('DEPLOYED', 'ALREADY_CURRENT'), 'job failed')
         except BaseException:
             if attempt and attempt.record['outcome'] == 'INCOMPLETE':
@@ -1292,7 +1308,7 @@ def dispatch(argv):
                     attempt.record = read_attempt(attempt.record['id'])
                 except Exception:
                     pass
-                if attempt.record['outcome'] == 'INCOMPLETE':
+                if attempt.record['outcome'] == 'INCOMPLETE' and (not launched or launch_refused):
                     attempt.finish('FAILED')
             summary = failure_summary(attempt) if attempt else 'dev deployment blocked; gate=REPORTING; attempt=unavailable; outcome=INCOMPLETE; job=not-launched'
             print(summary, file=sys.stderr)
@@ -1327,6 +1343,11 @@ def main(argv):
     source.require(len(argv) in (2, 3) and argv[0] == 'deploy' and source.SHA_RE.fullmatch(argv[1]), 'usage: capture402 dev deploy <40-hex-sha>|status|doctor|tx <signature>|reconcile <signature> [--record]|recover')
     attempt = Attempt.load(argv[2], argv[1]) if len(argv) == 3 else Attempt.create(argv[1])
     try:
+        application = safe_current()
+        attempt.record.update(previousSha=application, currentSha=application)
+        if attempt.record['production']['before'] is None:
+            attempt.record['production']['before'] = observation()
+        attempt.step('lock')
         invocation = os.environ.get('INVOCATION_ID')
         if invocation and re.fullmatch('[a-f0-9]{32}', invocation):
             attempt.step('lock', invocation=invocation)

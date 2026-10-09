@@ -1,12 +1,10 @@
 """Synthetic operator evidence failure/crash tests. No live services or stores."""
 from contextlib import redirect_stdout, redirect_stderr, nullcontext
 from concurrent.futures import ThreadPoolExecutor
-import hashlib
 import io
 import json
 import os
 from pathlib import Path
-import signal
 import subprocess
 import sys
 import unittest
@@ -25,9 +23,9 @@ class AttemptTests(fixtures.TransactionTests):
 
     def test_stale_already_current_with_original_unknown_closes_gate_and_reports_new_attempt(self):
         self.write(dev.BASE / 'last-result.json', {'verdict': 'ALREADY_CURRENT', 'sha': fixtures.OLD})
-        self.write(self.journal / 'original.json', {'operation': 'authorize', 'attempts': [{'outcome': {'result': 'unresolved'}}]})
+        self.write(self.journal / 'original.json', {**dict.fromkeys(('messageHash', 'transactionBase64', 'blockhash', 'payment', 'payer', 'expectedHeld', 'expectedRefundable'), 'synthetic-original'), 'signature': 'original', 'operation': 'authorize', 'attempts': [{'outcome': {'result': 'unresolved'}}]})
         before = self.snapshot()
-        with self.assertRaises(RuntimeError): dev.deploy(fixtures.NEW, object())
+        with self.assertRaisesRegex(RuntimeError, '^unresolved dev submission$'): dev.deploy(fixtures.NEW, object())
         latest = dev.latest_attempt()
         self.assertEqual(latest['gate'], 'PAYMENT_JOURNALS')
         self.assertEqual(latest['outcome'], 'FAILED')
@@ -76,6 +74,25 @@ class AttemptTests(fixtures.TransactionTests):
         self.assertEqual(dev.latest_attempt()['gate'], 'PAYMENT_JOURNALS')
         self.assertEqual(dev.latest_attempt()['invocation'], 'e' * 32)
         self.assertNotIn('SECRET', out.getvalue() + err.getvalue())
+
+    def test_waiter_loss_does_not_overwrite_running_worker_checkpoint(self):
+        a = dev.Attempt.create(fixtures.NEW)
+        def lost_waiter(args, **kwargs):
+            worker = dev.Attempt.load(args[-1], fixtures.NEW)
+            worker.step('payment', invocation='e' * 32)
+            raise KeyboardInterrupt()
+        with mock.patch.object(dev, 'locked', side_effect=nullcontext), mock.patch.object(dev.Attempt, 'create', return_value=a), mock.patch.object(dev.os, 'geteuid', return_value=0), mock.patch.object(dev.subprocess, 'run', side_effect=lost_waiter), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            with self.assertRaisesRegex(dev.OperationBlocked, 'INTERRUPTED_UNKNOWN'): dev.dispatch(['deploy', fixtures.NEW])
+        self.assertEqual(dev.read_attempt(a.record['id'])['outcome'], 'INCOMPLETE')
+        self.assertEqual(dev.latest_attempt()['gate'], 'PAYMENT_JOURNALS')
+        worker = dev.Attempt.load(a.record['id']); worker.finish('FAILED')
+        self.assertEqual(dev.latest_attempt()['outcome'], 'FAILED')
+
+    def test_semantically_corrupt_success_is_not_presented_as_success(self):
+        a = dev.Attempt.create(fixtures.NEW)
+        a.record.update(outcome='DEPLOYED', endedNs=a.record['startedNs'] + 1)
+        a.save()
+        self.assertEqual(dev.latest_attempt()['outcome'], 'INCOMPLETE')
 
     def test_lock_contention_retains_separate_attempt_without_effects(self):
         with dev.locked():
@@ -161,6 +178,33 @@ class AttemptTests(fixtures.TransactionTests):
             if dev.PENDING.exists():
                 dev.recover()
 
+    def test_crash_after_freeze_stop_switch_start_preserves_recovery_order(self):
+        for phase in ('freeze', 'stop', 'switch', 'start'):
+            original = getattr(dev, phase)
+            def crash(*args, **kwargs):
+                original(*args, **kwargs)
+                # Fail only the candidate transition; rollback of previous code works.
+                if phase != 'start' or args[0] == fixtures.NEW:
+                    raise SystemExit(77)
+            before = self.snapshot()
+            with self.subTest(phase=phase), mock.patch.object(dev, phase, side_effect=crash):
+                with self.assertRaises(BaseException): dev.deploy(fixtures.NEW, object())
+            if dev.PENDING.exists(): dev.recover()
+            self.assertEqual(dev.current(), fixtures.OLD)
+            self.assert_preserved(before)
+            self.assertFalse(dev.PENDING.exists())
+
+    def test_unknown_busy_and_orphan_reservation_still_block_with_safe_attempt(self):
+        for path in (self.orders / 'id.json.busy', self.journal / 'unknown.json', dev.STATE / 'restaurant/reclaim/orphan.lock'):
+            with self.subTest(path=path.name):
+                path.write_text('{}')
+                before = self.snapshot()
+                with self.assertRaises(Exception): dev.deploy(fixtures.NEW, object())
+                self.assertEqual(dev.latest_attempt()['gate'], 'PAYMENT_JOURNALS')
+                self.assert_preserved(before)
+                self.assertNotIn('stop', self.calls)
+                path.unlink()
+
     def test_offline_recovery_survives_all_operator_reporting_failure(self):
         a = dev.Attempt.create(fixtures.NEW)
         self.write(dev.PENDING, {'previous': fixtures.OLD, 'target': fixtures.NEW, 'production': 'f' * 64,
@@ -188,6 +232,14 @@ class AttemptTests(fixtures.TransactionTests):
             self.assertNotIn('SECRET', json.dumps(dev.latest_attempt()))
             self.assertEqual(dev.latest_attempt()['outcome'], 'INCOMPLETE')
         self.assertFalse(dev.PENDING.exists())
+
+    def test_unavailable_evidence_cannot_smuggle_secret_fields(self):
+        a = dev.Attempt.create(fixtures.NEW)
+        a.record['production']['before'] = {'scope': 'production-config-state-current-routing-services-v1',
+            'collectedNs': 1, 'state': 'unavailable', 'sha256': SECRET}
+        a.save()
+        self.assertEqual(dev.latest_attempt()['outcome'], 'INCOMPLETE')
+        self.assertNotIn('SECRET', json.dumps(dev.latest_attempt()))
 
     def test_symlink_record_and_traversal_rejected(self):
         a = dev.Attempt.create(fixtures.NEW); a.path.unlink(); a.path.symlink_to(self.journal / 'secret')
