@@ -377,23 +377,37 @@ export class RpcLedger implements Ledger, ChainReader {
       const entries = await byDeadline(deadline, (abortSignal) =>
         this.rpc.getSignaturesForAddress(address, { limit: MESSAGE_SEARCH_LIMIT, commitment: "confirmed" }).send({ abortSignal }),
       );
+      if (!Array.isArray(entries) || entries.length > MESSAGE_SEARCH_LIMIT) {
+        return { kind: "unavailable", detail: "malformed or oversized transaction history" };
+      }
       for (const entry of entries) {
         const tx = await byDeadline(deadline, (abortSignal) =>
-          this.rpc.getTransaction(entry.signature, { encoding: "base64", commitment: "confirmed", maxSupportedTransactionVersion: 0 }).send({ abortSignal }),
+          this.rpc.getTransaction(entry.signature, { encoding: "base64", commitment: "confirmed", maxSupportedTransactionVersion: 1 }).send({ abortSignal }),
         );
         if (!tx) return { kind: "unavailable", detail: `history for ${entry.signature} is listed but not retrievable` };
+        if (!Array.isArray(tx.transaction) || tx.transaction.length !== 2 || typeof tx.transaction[0] !== "string" || tx.transaction[1] !== "base64") {
+          return { kind: "unavailable", detail: "malformed transaction history wire response" };
+        }
         const decoded = transactionDecoder.decode(decodeBase64(tx.transaction[0]));
         if (getSignatureFromTransaction(decoded) !== entry.signature) {
           return { kind: "unavailable", detail: "transaction history signature does not match its wire bytes" };
         }
+        // The wire decoder extracts the signer prefix only. Decode the entire message before
+        // filtering an unrelated entry; malformed or future-version history is not absence.
+        const [message, end] = getCompiledTransactionMessageDecoder().read(decoded.messageBytes, 0);
+        if (end !== decoded.messageBytes.length) {
+          return { kind: "unavailable", detail: "transaction history message has trailing bytes" };
+        }
+        const payer = message.staticAccounts[0];
+        const signature = payer && decoded.signatures[payer];
+        // Authenticate the listed fee-payer signature even for nonmatches. Key import and
+        // verification share the search deadline, just like the RPC requests.
+        if (!payer || !signature || !(await byDeadline(deadline, async () =>
+          verifySignature(await getPublicKeyFromAddress(payer), signature as SignatureBytes, decoded.messageBytes),
+        ))) {
+          return { kind: "unavailable", detail: "transaction history signature does not authenticate its message" };
+        }
         if (sameBytes(new Uint8Array(decoded.messageBytes), messageBytes)) {
-          // Wire decoding only extracts signatures. Prove the listed signature binds this
-          // exact message to its fee payer before using another RPC result as finality evidence.
-          const payer = getCompiledTransactionMessageDecoder().decode(decoded.messageBytes).staticAccounts[0]!;
-          const signature = decoded.signatures[payer];
-          if (!signature || !(await verifySignature(await getPublicKeyFromAddress(payer), signature as SignatureBytes, decoded.messageBytes))) {
-            return { kind: "unavailable", detail: "transaction history signature does not authenticate its message" };
-          }
           return { kind: "ok", signatures: [entry.signature], truncated: false };
         }
       }
