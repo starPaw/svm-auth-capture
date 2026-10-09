@@ -2,6 +2,7 @@
 from contextlib import redirect_stdout, redirect_stderr, nullcontext
 from concurrent.futures import ThreadPoolExecutor
 import io
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -318,6 +319,16 @@ class ProductionObservationTests(fixtures.DevFixture):
         a.record['production']['before'] = r
         with mock.patch.object(dev, 'observation', return_value=r): a.finish('FAILED')
         self.assertEqual(dev.latest_attempt()['production']['classification'], 'unchanged')
+
+    def test_legacy_transaction_production_digest_contract_is_unchanged(self):
+        names = (*dev.host.LEGACY_SERVICES, *dev.host.PRODUCT_SERVICES)
+        services = {name: {'MainPID': '123', 'ActiveState': 'active', 'FragmentPath': ''} for name in names}
+        files = {'synthetic-root': ('file', 'f' * 64, 0o600, 0, 0)}
+        expected = hashlib.sha256(json.dumps({'services': services, 'files': files}, sort_keys=True).encode()).hexdigest()
+        def run(*args, **kwargs):
+            return services[args[-1]][args[args.index('-p') + 1]]
+        with mock.patch.object(dev.source, 'run', side_effect=run), mock.patch.object(dev.host, 'inventory', return_value=files), mock.patch.object(dev.os, 'readlink', side_effect=AssertionError('reporting must not affect legacy gate')):
+            self.assertEqual(dev.production(), expected)
 
     def test_unavailable_process_inventory_has_no_raw_exception(self):
         with mock.patch.object(dev.source, 'run', side_effect=RuntimeError(SECRET)):

@@ -447,11 +447,16 @@ def production(with_scope=False):
     services = {}
     for name in (*host.LEGACY_SERVICES, *host.PRODUCT_SERVICES):
         services[name] = {key: source.run('systemctl', 'show', '-p', key, '--value', name)
-                          for key in ('MainPID', 'ActiveState', 'FragmentPath', 'InvocationID', 'ExecStart', 'WorkingDirectory')}
-        pid = services[name]['MainPID']
-        if pid.isdigit() and int(pid) > 0:
-            services[name]['processCwd'] = os.readlink('/proc/' + pid + '/cwd')
-            services[name]['processEntrypointSha256'] = hashlib.sha256(Path('/proc/' + pid + '/cmdline').read_bytes()).hexdigest()
+                          for key in ('MainPID', 'ActiveState', 'FragmentPath')}
+        if with_scope:
+            # Preserve the historical gate/transaction digest algorithm. Extra
+            # process observations belong only to non-authoritative reporting.
+            services[name].update({key: source.run('systemctl', 'show', '-p', key, '--value', name)
+                                   for key in ('InvocationID', 'ExecStart', 'WorkingDirectory')})
+            pid = services[name]['MainPID']
+            if pid.isdigit() and int(pid) > 0:
+                services[name]['processCwd'] = os.readlink('/proc/' + pid + '/cwd')
+                services[name]['processEntrypointSha256'] = hashlib.sha256(Path('/proc/' + pid + '/cmdline').read_bytes()).hexdigest()
         fragment = services[name]['FragmentPath']
         if fragment:
             roots.append(Path(fragment))
