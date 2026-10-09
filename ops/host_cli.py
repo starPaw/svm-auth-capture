@@ -116,6 +116,8 @@ def main(argv):
         import deploy_dev
         try:
             deploy_dev.dispatch(argv[1:])
+        except deploy_dev.OperationBlocked as error:
+            raise RuntimeError(str(error)) from None
         except Exception:
             raise RuntimeError('dev deployment blocked; inspect dev receipts and retained transaction') from None
         return

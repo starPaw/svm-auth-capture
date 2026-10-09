@@ -474,6 +474,74 @@ class DevFreezerTests(unittest.TestCase):
         host.durable_remove(dev.PERMIT)
 
 
+@unittest.skipUnless(ENABLED, 'explicit disposable Linux systemd test required')
+class DevAttemptJobTests(unittest.TestCase):
+    """Real transient job launch, invocation correlation and SIGKILL; synthetic preflight."""
+    def setUp(self):
+        self.assertEqual(os.geteuid(), 0)
+        self.assertEqual(os.environ.get('GITHUB_ACTIONS'), 'true', 'never run on VPS')
+        self.tmp = tempfile.TemporaryDirectory(prefix='capture402-test-attempt-', dir='/run')
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.unit_prefix = self.root.name + '-'
+        self.units = []
+        self.addCleanup(self.cleanup_jobs)
+        for name, value in {'BASE': self.root, 'RELEASES': self.root / 'releases',
+                            'CURRENT': self.root / 'current', 'PENDING': self.root / 'transaction.json',
+                            'RELEASE_UNIT_PREFIX': self.unit_prefix}.items():
+            patch = mock.patch.object(dev, name, value); patch.start(); self.addCleanup(patch.stop)
+        dev.RELEASES.mkdir()
+        (dev.RELEASES / ('a' * 40)).mkdir()
+        dev.CURRENT.symlink_to(dev.RELEASES / ('a' * 40))
+        self.script = self.root / 'controller.py'
+        # Only preflight and evidence collection are synthetic. Launch and cgroup/job
+        # termination use the real runner's systemd. No payment application is run.
+        self.script.write_text('import sys, os, signal\nfrom pathlib import Path\nsys.path.insert(0, ' +
+            repr(str(Path(dev.__file__).parent)) + ')\nimport deploy_dev as d\nd.BASE=Path(' + repr(str(self.root)) +
+            ')\nd.RELEASES=d.BASE/"releases"\nd.CURRENT=d.BASE/"current"\nd.PENDING=d.BASE/"transaction.json"\n' +
+            'd.RELEASE_UNIT_PREFIX=' + repr(self.unit_prefix) + '\nd.production=lambda **kw: "f"*64\n' +
+            'if sys.argv[1:] == ["recover"]: d.main(["recover"]); sys.exit(0)\n' +
+            'a=d.Attempt.load(sys.argv[-1], sys.argv[-2])\na.step("payment", invocation=os.environ["INVOCATION_ID"])\n' +
+            'if (d.BASE/"kill").exists(): os.kill(os.getpid(), signal.SIGKILL)\n' +
+            'a.finish("FAILED")\nprint(d.failure_summary(a), file=sys.stderr)\nsys.exit(1)\n')
+
+    def cleanup_jobs(self):
+        for unit in self.units:
+            subprocess.run(['systemctl', 'stop', unit], capture_output=True, timeout=10)
+            subprocess.run(['systemctl', 'reset-failed', unit], capture_output=True, timeout=10)
+
+    def launch(self):
+        # __file__ points dispatch at a synthetic fixture executable only here.
+        with mock.patch.object(dev, '__file__', str(self.script)), mock.patch.object(dev, 'production', return_value='f' * 64):
+            try:
+                dev.dispatch(['deploy', 'b' * 40])
+            except dev.OperationBlocked:
+                pass
+        r = dev.latest_attempt()
+        self.units.append(r['unit'])
+        return r
+
+    def test_real_launch_payment_refusal_has_exact_invocation_and_job(self):
+        r = self.launch()
+        self.assertEqual(r['outcome'], 'FAILED')
+        self.assertEqual(r['gate'], 'PAYMENT_JOURNALS')
+        self.assertRegex(r['invocation'], r'^[a-f0-9]{32}$')
+        actual = NATIVE_RUN('systemctl', 'show', '-p', 'InvocationID', '--value', r['unit'])
+        self.assertEqual(r['invocation'], actual)
+        self.assertEqual(dev.current(), 'a' * 40)
+        self.assertFalse(dev.PENDING.exists())
+
+    def test_real_sigkill_is_interrupted_unknown_not_old_success(self):
+        source.write_json(self.root / 'last-result.json', {'verdict': 'ALREADY_CURRENT', 'sha': 'a' * 40})
+        (self.root / 'kill').touch()
+        r = self.launch()
+        self.assertEqual(r['outcome'], 'INTERRUPTED_UNKNOWN')
+        self.assertEqual(r['gate'], 'PAYMENT_JOURNALS')
+        self.assertRegex(r['invocation'], r'^[a-f0-9]{32}$')
+        self.assertEqual(dev.safe_last_result()['verdict'], 'ALREADY_CURRENT')
+        self.assertEqual(NATIVE_RUN('systemctl', 'show', '-p', 'Result', '--value', r['unit']), 'signal')
+
+
 if __name__=='__main__':
     if len(sys.argv)==4 and sys.argv[1]=='--unit':
         driver(Path(sys.argv[2]),sys.argv[3])

@@ -93,6 +93,73 @@ class DiagnosticsTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             dev.inspect_tx(SIGNATURE)
 
+    def test_genuine_pre_post_identity_and_authentication_report(self):
+        before = self.path.read_bytes()
+        with mock.patch.object(dev, '_validate_original_wire', return_value=('a' * 64, 'genesis', 'program')), mock.patch.object(dev, '_dev_rpc_call', side_effect=RuntimeError(SECRET_URL)), mock.patch.object(dev.source, 'write_json', side_effect=AssertionError('diagnostic write')), mock.patch.object(dev, 'reconcile_original', side_effect=AssertionError('recovery')), redirect_stdout(io.StringIO()):
+            r = dev.inspect_tx(SIGNATURE)
+        import hashlib
+        self.assertEqual(r['before']['sha256'], hashlib.sha256(before).hexdigest())
+        self.assertEqual(r['before'], r['after'])
+        self.assertEqual(r['authentication'], 'authenticated')
+        self.assertEqual(r['consistency'], 'unchanged')
+        self.assertIn('cannot reproduce', r['rawBytes'])
+
+    def test_concurrent_replacement_same_bytes_is_changed_not_frozen(self):
+        def change(*args):
+            replacement = self.root / 'replacement'
+            replacement.write_bytes(self.path.read_bytes())
+            replacement.replace(self.path)
+            raise RuntimeError(SECRET_URL)
+        with mock.patch.object(dev, '_dev_rpc_call', side_effect=change), redirect_stdout(io.StringIO()):
+            r = dev.inspect_tx(SIGNATURE)
+        self.assertEqual(r['before']['sha256'], r['after']['sha256'])
+        self.assertNotEqual(r['before']['identity'], r['after']['identity'])
+        self.assertEqual(r['consistency'], 'changed')
+
+    def test_concurrent_content_change_and_symlink_post_are_inconsistent(self):
+        def change(*args):
+            self.path.write_text('{"new":"private"}')
+            raise RuntimeError(SECRET_URL)
+        with mock.patch.object(dev, '_dev_rpc_call', side_effect=change), redirect_stdout(io.StringIO()):
+            r = dev.inspect_tx(SIGNATURE)
+        self.assertEqual(r['consistency'], 'changed')
+        self.path.write_text(json.dumps(self.entry))
+        def replace(*args):
+            self.path.unlink(); self.path.symlink_to(self.root / 'private')
+            raise RuntimeError(SECRET_URL)
+        with mock.patch.object(dev, '_dev_rpc_call', side_effect=replace), redirect_stdout(io.StringIO()):
+            r = dev.inspect_tx(SIGNATURE)
+        self.assertEqual(r['consistency'], 'inconsistent')
+        self.assertIsNone(r['after'])
+
+    def test_replacement_during_bounded_read_refused(self):
+        original = dev.os.read
+        def change(fd, length):
+            data = original(fd, length)
+            replacement = self.root / 'replacement'
+            replacement.write_bytes(self.path.read_bytes())
+            replacement.replace(self.path)
+            return data
+        with mock.patch.object(dev.os, 'read', side_effect=change):
+            with self.assertRaisesRegex(RuntimeError, 'changed during read'): dev.stable_bytes(self.path, 4096)
+
+    def test_repeated_diagnosis_is_byte_identical_no_authority_calls(self):
+        before = self.path.read_bytes()
+        with mock.patch.object(dev, '_validate_original_wire', side_effect=RuntimeError(SECRET_URL)), mock.patch.object(dev.source, 'write_json', side_effect=AssertionError('write')), mock.patch.object(dev, 'reconcile_original', side_effect=AssertionError('recovery')):
+            for _ in range(3):
+                self.run_inspection()
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_rpc_slots_private_strings_never_published(self):
+        def response(url, method, params):
+            if method == 'getSignatureStatuses': return {'context': {'slot': SECRET_URL}, 'value': [None]}
+            return {'context': {'slot': SECRET_URL}, 'value': False if method == 'isBlockhashValid' else None}
+        out = io.StringIO()
+        with mock.patch.object(dev, '_dev_rpc_call', side_effect=response), redirect_stdout(out):
+            r = dev.inspect_tx(SIGNATURE)
+        self.assertNotIn('DO_NOT_PRINT', out.getvalue())
+        self.assertTrue(all(value is None for value in r['rpcSlots'].values()))
+
     def test_doctor_identifies_unresolved_without_modifying_state(self):
         checks = {
             "current": mock.patch.object(dev, "current", return_value="a" * 40),
