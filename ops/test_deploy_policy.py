@@ -49,6 +49,15 @@ class ReleasePolicyTests(PolicyFixture):
         receipt = policy.verify(NEW, self.api)
         self.assertEqual((receipt['sha'], receipt['reviewedHead'], receipt['reviewer'], receipt['ciRun']), (NEW, OLD, 'gwinpin', 3))
 
+    def test_missing_merge_identity_cannot_be_replaced_by_green_ci_and_review(self):
+        for value in (None, OLD):
+            self.pull['merge_commit_sha'] = value
+            with self.assertRaisesRegex(RuntimeError, 'unambiguous merged PR'):
+                policy.verify(NEW, self.api)
+        self.pull.pop('merge_commit_sha')
+        with self.assertRaisesRegex(RuntimeError, 'unambiguous merged PR'):
+            policy.verify(NEW, self.api)
+
     def test_successful_workflow_cannot_hide_skipped_or_missing_job(self):
         for jobs in ([self.jobs[0]], [{**j, 'conclusion': 'skipped'} for j in self.jobs], self.jobs + [self.jobs[0]]):
             original = self.jobs
@@ -165,6 +174,7 @@ class HostCommandTests(unittest.TestCase):
             request = opener.open.call_args.args[0]
             self.assertNotIn('fixture-token', request.full_url)
             self.assertEqual(request.get_header('Authorization'), 'Bearer fixture-token')
+            self.assertEqual(request.get_header('X-github-api-version'), '2022-11-28')
 
     def test_pending_recovery_precedes_credentials_and_network(self):
         with mock.patch.object(source.os, 'geteuid', return_value=0), mock.patch.object(cli, 'recover_first', return_value=True), mock.patch.object(cli, 'GitHub') as api:

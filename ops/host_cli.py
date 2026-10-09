@@ -19,6 +19,9 @@ TOKEN = Path('/etc/capture402/github-release-readonly')
 COMMAND = Path('/usr/local/sbin/capture402')
 OLD_COMMAND = Path('/usr/local/sbin/capture402-deploy')
 FILES = ('deploy_demo.py', 'deploy_vps.py', 'host_cli.py', 'release_policy.py', 'deploy_dev.py')
+# The release policy requires merge_commit_sha, removed in API 2026-03-10.
+# GitHub supports this compatible schema until at least 2028-03-10.
+API_VERSION = '2022-11-28'
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -46,7 +49,7 @@ class GitHub:
         source.require(remaining > 0, 'release API deadline exceeded')
         request = urllib.request.Request('https://api.github.com/' + route, headers={
             'Authorization': 'Bearer ' + self.token, 'Accept': 'application/vnd.github+json',
-            'X-GitHub-Api-Version': '2026-03-10', 'User-Agent': 'Capture402-release'})
+            'X-GitHub-Api-Version': API_VERSION, 'User-Agent': 'Capture402-release'})
         try:
             with self.opener.open(request, timeout=min(10, remaining)) as response:
                 data = response.read(2 * 1024 * 1024 + 1)
