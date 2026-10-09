@@ -16,6 +16,8 @@ import { createDurableFile, ensureDurableDirectory, replaceDurableFile } from ".
 import type { Operation } from "./types.ts";
 import type { SubmitResult } from "./ledger.ts";
 
+import type { RelayProvenance } from "./lifetime-provenance.ts";
+
 export type SubmissionOutcome = "not-submitted" | "unresolved" | "finalized-succeeded" | "finalized-failed" | "submit-threw";
 
 /** One classification for relay/reclaim responses and their durable outcome evidence. */
@@ -44,7 +46,9 @@ export type PreparedSubmission = {
   payer: string;
   expectedHeld: string;
   expectedRefundable: string;
-  /** Finalized origin and lifetime returned when preparing reclaim; legacy entries lack these. */
+  /** Relay evidence only; does not feed the legacy reclaim/receipt gates. */
+  lifetimeProvenance?: RelayProvenance;
+  /** Legacy reclaim fields; relay observations never backfill these. */
   blockhashSlot?: string;
   lastValidBlockHeight?: string;
   /** Reclaim-only proof retained on the successor; original outcome remains unmodified. */

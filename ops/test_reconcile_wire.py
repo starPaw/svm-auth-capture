@@ -243,6 +243,36 @@ class RecoveryFixtures(unittest.TestCase):
                 self.assertEqual(self.journal_path.read_bytes(), before)
                 self.receipt.unlink()  # Test isolation only, never operator behavior.
 
+    def test_real_wire_with_additive_provenance_requires_original_finality(self):
+        # Metadata does not supply a receipt; real signature binding remains required.
+        for operation in ('authorize', 'capture', 'void', 'refund', 'compute'):
+            with self.subTest(operation=operation):
+                entry = copy.deepcopy(self.fixtures[operation])
+                network = 'solana:' + 'EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG'[:32]
+                entry['lifetimeProvenance'] = {
+                    'version': 1, 'messageHash': entry['messageHash'], 'blockhash': entry['blockhash'],
+                    'observation': {'state': 'recorded', 'source': 'request', 'value': {
+                        'version': 1, 'messageHash': entry['messageHash'], 'blockhash': entry['blockhash'],
+                        'lastValidBlockHeight': '18446744073709551615', 'contextSlot': '9007199254740993',
+                        'commitment': 'finalized', 'network': network,
+                        'genesisHash': 'EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG'}},
+                    'origin': {'state': 'verified', 'blockhash': entry['blockhash'], 'slot': '9007199254740993',
+                               'commitment': 'finalized', 'network': network,
+                               'genesisHash': 'EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG'}}
+                self.set_entry(entry)
+                before = self.journal_path.read_bytes()
+                with self.assertRaisesRegex(RuntimeError, 'unresolved dev submission'):
+                    dev.clean_operations()
+                result, _ = self.reconcile_status(None, record=False)
+                self.assertFalse(result)
+                self.assertFalse(self.receipt.exists())
+                result, _ = self.reconcile_status(FINALIZED)
+                self.assertTrue(result)
+                dev.clean_operations()
+                self.assertEqual(self.journal_path.read_bytes(), before)
+                self.assertEqual(json.loads(self.receipt.read_text())['journalSha256'], hashlib.sha256(before).hexdigest())
+                self.receipt.unlink()  # Synthetic fixture isolation only.
+
     def test_finalized_failure_receipt_allows_gate(self):
         result, _ = self.reconcile_status({**FINALIZED, 'err': {'Custom': 1}})
         self.assertTrue(result)

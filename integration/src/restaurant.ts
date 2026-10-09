@@ -1,6 +1,7 @@
 // Restaurant orchestration only. All economic movements use the unchanged SAC-006 builders,
 // receipt validation, facilitator and SBF. A durable order binds one signed budget to its menu
 // actions. HttpOnly per-order capabilities are application session control, not onchain authority.
+import { transactionObservation, type LifetimeObservation } from "./lifetime-provenance.ts";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync, readFileSync, unlinkSync, openSync, fsyncSync, closeSync } from "node:fs";
 import { join } from "node:path";
@@ -26,8 +27,8 @@ export const DEMO_BUDGET = 100n * DEMO_UNIT;
 export const SCENARIOS = ["normal", "refund", "cancelled", "unavailable"] as const;
 type Scenario = typeof SCENARIOS[number];
 type Action = "authorize" | "beer" | "salmon" | "finish" | "void" | "refund" | "reclaim";
-type Event = { action: Action; label: string; amount: string; at: string; status: "prepared" | "pending" | "finalized" | "rejected"; transaction: string; transactionBase64: string; receipt?: SettleResponse };
-type Order = { id: string; capabilityHash: string; payer: Address; payment: Address; scenario: Scenario; required: PaymentRequired; unsigned: string; createdAt: number; status: "draft" | "active" | "closed" | "pending" | "rejected"; events: Event[]; reclaimUnsigned?: string; reclaimLifetime?: { blockhash: string; lastValidBlockHeight: string; blockhashSlot?: string } };
+type Event = { lifetimeObservation?: LifetimeObservation; action: Action; label: string; amount: string; at: string; status: "prepared" | "pending" | "finalized" | "rejected"; transaction: string; transactionBase64: string; receipt?: SettleResponse };
+type Order = { authorizeLifetime?: LifetimeObservation; id: string; capabilityHash: string; payer: Address; payment: Address; scenario: Scenario; required: PaymentRequired; unsigned: string; createdAt: number; status: "draft" | "active" | "closed" | "pending" | "rejected"; events: Event[]; reclaimUnsigned?: string; reclaimLifetime?: { blockhash: string; lastValidBlockHeight: string; blockhashSlot?: string } };
 export type RestaurantConfig = ResourceServerConfig & { ledger: Ledger & Pick<ChainReader, "getSignatureStatus" | "getAccountAtLeast">; orders: RestaurantOrders; reclaimJournal: SubmissionJournal; origin: string; merchantToken?: string };
 
 export class RestaurantOrders {
@@ -220,7 +221,7 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
     if (balance.amount === null || balance.amount < 100) return ctx.json({ error: balance.reason || "Payer needs 100 test-mint tokens; operator funding required. No authorization submitted." }, 402);
     const required: PaymentRequired = { x402Version: 2, resource: { url: `${c.origin}/resource`, description: "Pivovar Marina · 100 test-token Devnet budget", mimeType: "application/json" }, accepts: [requirements] };
     const tx = await buildDemoTransaction({ feePayer: c.feePayer, signers: [], lifetime: await c.getLatestBlockhash(), instructions: [await authorizeInstruction({ programId: c.programId, payer, server: c.server.address, mint: c.asset, funder: c.feePayer, salt, maximum: DEMO_BUDGET, captureDeadline: BigInt(requirements.extra!.captureDeadline as number), refundDeadline: BigInt(requirements.extra!.refundDeadline as number) })] }, c.ledger);
-    const order: Order = { id, capabilityHash: digest(capability), payer, payment: await paymentAddress(c.programId, payer, salt), scenario: scenario as Scenario, required, unsigned: encodeTransaction(tx), createdAt: Number(await c.now()), status: "draft", events: [] };
+    const order: Order = { id, capabilityHash: digest(capability), payer, payment: await paymentAddress(c.programId, payer, salt), scenario: scenario as Scenario, required, unsigned: encodeTransaction(tx), authorizeLifetime: transactionObservation(tx), createdAt: Number(await c.now()), status: "draft", events: [] };
     c.orders.create(order);
     setCookie(ctx, cookieName, capability, { httpOnly: true, secure: secured, sameSite: "Strict", path: "/", maxAge: 86400 });
     ctx.header(PAYMENT_REQUIRED_HEADER, encodeHeader(required));
@@ -238,9 +239,9 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
     const tx = decode(payload.payload.transaction); const signed = await peekAuthorize(c, tx);
     if (signed.payer !== order.payer || !equalMessage(tx, decode(order.unsigned))) return ctx.json({ error: "wallet must sign the exact offered budget" }, 400);
     c.orders.reserve(order.id, "authorize");
-    const event: Event = { action: "authorize", label: labels.authorize, amount: DEMO_BUDGET.toString(), at: new Date().toISOString(), status: "prepared", transaction: "", transactionBase64: payload.payload.transaction };
+    const event: Event = { action: "authorize", label: labels.authorize, amount: DEMO_BUDGET.toString(), at: new Date().toISOString(), status: "prepared", transaction: "", transactionBase64: payload.payload.transaction, lifetimeObservation: order.authorizeLifetime };
     c.orders.prepare(order, event);
-    const result = await settle(c, { x402Version: 2, paymentPayload: payload, paymentRequirements: order.required.accepts[0]! }, tx, order.payer);
+    const result = await settle(c, { x402Version: 2, paymentPayload: { ...payload, extensions: undefined }, paymentRequirements: order.required.accepts[0]! }, tx, order.payer, order.authorizeLifetime);
     await recordResult(order, event, result.receipt, result.kind);
     ctx.header(PAYMENT_RESPONSE_HEADER, encodeHeader(result.receipt));
     return ctx.json({ receipt: result.receipt, order: order.id }, result.kind === "succeeded" ? 200 : 402);
@@ -279,7 +280,7 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
       const ix = action === "beer" || action === "salmon" ? await captureInstruction(stored, amount, false, p.held, p.refundable) : action === "refund" ? await refundInstruction(stored, amount, p.held, p.refundable) : await voidInstruction(stored, p.held, p.refundable);
       const tx = await buildDemoTransaction({ feePayer: c.feePayer, signers: [c.server], lifetime: await c.getLatestBlockhash(), instructions: [ix] }, c.ledger);
       const scheme = action === "beer" || action === "salmon" ? capturePayload(order.payment, tx, amount, false, p.held, p.refundable) : action === "refund" ? refundPayload(order.payment, tx, amount, p.held, p.refundable) : voidPayload(order.payment, tx, p.held, p.refundable);
-      const event: Event = { action, label: labels[action], amount: amount.toString(), at: new Date().toISOString(), status: "prepared", transaction: "", transactionBase64: encodeTransaction(tx) };
+      const event: Event = { action, label: labels[action], amount: amount.toString(), at: new Date().toISOString(), status: "prepared", transaction: "", transactionBase64: encodeTransaction(tx), lifetimeObservation: transactionObservation(tx) };
       c.orders.prepare(order, event); prepared = true;
       const req = order.required.accepts[0]!;
       const result = await settle(c, { x402Version: 2, paymentPayload: { x402Version: 2, accepted: req, payload: scheme }, paymentRequirements: req }, tx, order.payer);

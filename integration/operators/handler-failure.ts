@@ -20,8 +20,8 @@ export async function runHandlerFailure(c: Awaited<ReturnType<typeof context>>, 
   const { ledger, record, sponsor, payer, server, mint } = c;
   const journal = new FileSubmissionJournal(join(outDir, "handler-failure-facilitator-journal"));
   const store = new OperationStore(join(outDir, "handler-failure-operation-store"));
-  const facilitator = new Facilitator({ network: record.network.caip2, programId: record.programId, feePayer: sponsor, ledger, journal });
   const bearerToken = crypto.randomUUID();
+  const facilitator = new Facilitator({ network: record.network.caip2, programId: record.programId, feePayer: sponsor, ledger, journal, observationKey: bearerToken });
   const gateway = createGatewayApp(facilitator, {
     bearerToken,
     sponsorship: new SponsorshipGuard({ ledger, feePayer: sponsor.address, maxAttempts: 2, minLamportsBalance: 10_000_000n }),

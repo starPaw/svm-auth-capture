@@ -4,6 +4,7 @@
 // `lost` strips the outcome; `weak` relabels it `confirmed`. Lines tagged [FAULT INJECTED] are
 // injected; everything else is NATURAL. Any deviation exits non-zero.
 //   node --experimental-strip-types evidence/fault-injection.ts      (env: see run-all.sh)
+import type { OriginReader } from "../src/lifetime-provenance.ts";
 import { mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -47,6 +48,10 @@ export class FaultyLedger implements Ledger {
   }
   getAccount(address: Address): Promise<LedgerAccount | null> {
     return this.real.getAccount(address);
+  }
+  verifyBlockhashOrigin(...args: Parameters<OriginReader["verifyBlockhashOrigin"]>) {
+    if ("verifyBlockhashOrigin" in this.real) return (this.real as Ledger & OriginReader).verifyBlockhashOrigin(...args);
+    return Promise.resolve({ state: "unverified" as const, reason: "lookup-unavailable" as const });
   }
   simulate(transaction: Transaction): Promise<SimulationOutcome> {
     return this.real.simulate(transaction);
@@ -95,9 +100,9 @@ async function main(): Promise<void> {
   const faulty = new FaultyLedger(real);
   const journalDir = join(outDir, "fault-facilitator-journal");
   const journal = new FileSubmissionJournal(journalDir);
-  const facilitator = new Facilitator({ network: record.network.caip2, programId: record.programId, feePayer: sponsor, ledger: faulty, journal });
-  const sponsorship = new SponsorshipGuard({ ledger: real, feePayer: sponsor.address, maxAttempts: 1000, minLamportsBalance: 1n });
   const bearer = crypto.randomUUID();
+  const facilitator = new Facilitator({ network: record.network.caip2, programId: record.programId, feePayer: sponsor, ledger: faulty, journal, observationKey: bearer });
+  const sponsorship = new SponsorshipGuard({ ledger: real, feePayer: sponsor.address, maxAttempts: 1000, minLamportsBalance: 1n });
   const gateway = await startApp(createGatewayApp(facilitator, { bearerToken: bearer, sponsorship, allowlist: { merchant: server.address, mint } }));
 
   let handlerCalls = 0;

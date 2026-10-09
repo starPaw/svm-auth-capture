@@ -58,6 +58,8 @@ export type PreSubmission = {
   signature: string;
   blockhash: string;
   lastValidBlockHeight?: string;
+  /** Recorded observation only; authoritative relay provenance is in the facilitator journal. */
+  lifetimeObservation?: unknown;
   payment: string;
   expectedHeld: string;
   expectedRefundable: string;

@@ -14,6 +14,7 @@
 // path; a refused or unresolved terminal settle never becomes a completed-payment response.
 // Every facilitator receipt — including a pending one and its signature — is journaled; a lost
 // facilitator response stays unresolved for manual reconciliation (`reconciliation.ts`).
+import { attestObservation, requestObservation, transactionObservation } from "./lifetime-provenance.ts";
 import {
   type Address,
   getBase58Encoder,
@@ -257,7 +258,7 @@ function isSettleResponse(v: unknown): v is SettleResponse {
  * refusal (or a gateway refusal that never reached the facilitator) counts as "did not execute";
  * a lost, malformed, pending, or unrecognized answer stays unresolved.
  */
-export async function settle(config: ResourceServerConfig, body: ReturnType<typeof facilitatorBody>, transaction: Transaction, payer: Address): Promise<SettleOutcome> {
+export async function settle(config: ResourceServerConfig, body: ReturnType<typeof facilitatorBody>, transaction: Transaction, payer: Address, firstPartyObservation = transactionObservation(transaction)): Promise<SettleOutcome> {
   const pending = (detail: string): SettleOutcome => ({
     kind: "unresolved",
     receipt: { success: false, errorReason: Reason.settlementPending, transaction: "", network: config.network },
@@ -269,7 +270,12 @@ export async function settle(config: ResourceServerConfig, body: ReturnType<type
     res = await (config.fetchImpl ?? fetch)(`${config.facilitatorUrl}/settle`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${config.bearerToken}` },
-      body: JSON.stringify(body),
+      body: JSON.stringify({ ...body,
+        lifetimeObservation: firstPartyObservation
+          ? attestObservation(firstPartyObservation, config.bearerToken)
+          // Never attest client metadata, even if it claims a trusted source or includes a MAC.
+          : requestObservation(body.paymentPayload.extensions),
+      }),
       signal,
     });
   } catch (e) {
@@ -364,6 +370,7 @@ export function createResourceApp(config: ResourceServerConfig): Hono {
         transactionBase64: paymentPayload.payload.transaction as string,
         signature: "",
         blockhash: signed.blockhash,
+        lifetimeObservation: requestObservation(paymentPayload.extensions),
         payment,
         // Before an authorize lands, the payment does not exist: expected (H,F) is (0,0).
         expectedHeld: "0",
@@ -415,6 +422,7 @@ export function createResourceApp(config: ResourceServerConfig): Hono {
         signature: "",
         blockhash: lifetime.blockhash,
         lastValidBlockHeight: lifetime.lastValidBlockHeight.toString(),
+        lifetimeObservation: { observation: transactionObservation(terminalTx) },
         payment,
         expectedHeld: config.amount.toString(),
         expectedRefundable: "0",

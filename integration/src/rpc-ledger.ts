@@ -35,6 +35,8 @@ import type { Lifetime } from "./transactions.ts";
 import { isObject } from "./types.ts";
 import type { DeploymentRecord } from "./deployment-record.ts";
 
+import { isU64Decimal, type CanonicalOrigin } from "./lifetime-provenance.ts";
+
 const CLOCK_SYSVAR = "SysvarC1ock11111111111111111111111111111111" as Address;
 const base64Encoder = getBase64Encoder();
 const decodeBase64 = (data: string): Uint8Array => new Uint8Array(base64Encoder.encode(data));
@@ -268,8 +270,28 @@ export class RpcLedger implements Ledger, ChainReader {
   /** A finalized blockhash and its last valid block height, for building a new transaction. */
   async latestBlockhash(): Promise<Lifetime> {
     const { context, value } = await this.request((abortSignal) => this.rpc.getLatestBlockhash({ commitment: "finalized" }).send({ abortSignal }));
-    if (!validSlot(context?.slot)) throw new Error("malformed blockhash context");
-    return { blockhash: value.blockhash, lastValidBlockHeight: value.lastValidBlockHeight, blockhashSlot: BigInt(context.slot) };
+    if (!validSlot(context?.slot) || !isU64Decimal(context.slot.toString()) ||
+        !(typeof value.lastValidBlockHeight === "bigint" || (typeof value.lastValidBlockHeight === "number" && Number.isSafeInteger(value.lastValidBlockHeight))) ||
+        !isU64Decimal(value.lastValidBlockHeight.toString())) throw new Error("malformed blockhash lifetime");
+    return { blockhash: value.blockhash, lastValidBlockHeight: BigInt(value.lastValidBlockHeight), blockhashSlot: BigInt(context.slot),
+      contextSlot: BigInt(context.slot), commitment: "finalized", network: this.network, genesisHash: this.genesisHash };
+  }
+
+  /** Authenticate one origin candidate; no fresh hash, slot search, validity/expiry inference or retry. */
+  async verifyBlockhashOrigin(blockhash: string, candidateSlot: bigint, genesisHash: string, network: string): Promise<CanonicalOrigin> {
+    const unavailable = (reason: "network-mismatch" | "origin-unavailable" | "lookup-unavailable"): CanonicalOrigin => ({ state: "unverified", reason });
+    if (genesisHash !== this.genesisHash || network !== this.network || network !== `solana:${genesisHash.slice(0, 32)}`) return unavailable("network-mismatch");
+    if (!isU64Decimal(candidateSlot.toString())) return unavailable("origin-unavailable");
+    const deadline = Date.now() + this.requestTimeoutMs;
+    try {
+      const observed = await byDeadline(deadline, abortSignal => this.rpc.getGenesisHash().send({ abortSignal }));
+      if (observed !== this.genesisHash) return unavailable("network-mismatch");
+      const block = await byDeadline(deadline, abortSignal => this.rpc.getBlock(candidateSlot, {
+        commitment: "finalized", transactionDetails: "none", rewards: false,
+      }).send({ abortSignal }));
+      if (!block || block.blockhash !== blockhash) return unavailable("origin-unavailable");
+      return { state: "verified", blockhash, slot: candidateSlot.toString(), commitment: "finalized", network: this.network, genesisHash: this.genesisHash };
+    } catch { return unavailable("lookup-unavailable"); }
   }
 
   async getAccount(address: Address): Promise<LedgerAccount | null> {

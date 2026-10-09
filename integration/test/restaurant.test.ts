@@ -471,3 +471,60 @@ describe("issue #45 read-only operator preflight and fail-closed eligibility", (
     expect(h.ledger.submissions).toHaveLength(2);
   });
 });
+
+describe("#52 exact-offer provenance through restaurant persistence and relay", () => {
+  test("restart uses the original offer observation; client substitution cannot overwrite it", async () => {
+    const s = await offer(); const original = c.orders.read(s.id).authorizeLifetime!;
+    expect(original.messageHash).toBe((await import("../src/submission-journal.ts")).messageHash(getTransactionDecoder().decode(getBase64Encoder().encode(s.unsigned)).messageBytes));
+    const journal = new FileSubmissionJournal(join(dir, "relay"));
+    const { Facilitator } = await import("../src/facilitator.ts");
+    const f = new Facilitator({ network: c.network, programId: c.programId, feePayer: h.facilitatorKey,
+      ledger: h.ledger, journal, observationKey: c.bearerToken, ...demoSponsorComputeBounds() });
+    const { LIFETIME_EXTENSION, attestObservation } = await import("../src/lifetime-provenance.ts");
+    c.fetchImpl = async (_url, init) => {
+      const body = JSON.parse(init!.body as string);
+      expect(body.lifetimeObservation).toEqual(attestObservation(original, c.bearerToken));
+      expect(body.paymentPayload.extensions).toBeUndefined();
+      expect(c.orders.read(s.id).events[0]!.lifetimeObservation).toEqual(original);
+      return Response.json(await f.settle(body));
+    };
+    c.getLatestBlockhash = vi.fn(async () => { throw new Error("must not refetch an authorize lifetime"); });
+    app = createRestaurantApp(c); // persisted offer survives application restart.
+    const signed = await sign(s.unsigned);
+    const response = await app.request(`${origin}/resource?order=${s.id}`, { method: "POST", headers: { cookie: s.cookie, origin,
+      "PAYMENT-SIGNATURE": encodeHeader({ x402Version: 2, resource: s.required.resource, accepted: s.required.accepts[0],
+        payload: { transaction: signed }, extensions: { [LIFETIME_EXTENSION]: { observation: { ...original, lastValidBlockHeight: "1" }, attestation: "forged" } } }) } });
+    expect(response.status).toBe(200); expect(c.getLatestBlockhash).not.toHaveBeenCalled();
+    const entry = journal.list()[0]!;
+    expect(entry.lifetimeProvenance!.observation).toEqual({ state: "recorded", source: "first-party", value: original });
+    expect(entry.messageHash).toBe(original.messageHash);
+    expect(c.orders.read(s.id).events[0]!.transactionBase64).toBe(signed);
+  });
+  test("legacy offer never borrows caller observation or fetches new provenance", async () => {
+    const s = await offer(); const order = c.orders.read(s.id); delete order.authorizeLifetime; c.orders.write(order);
+    const { LIFETIME_EXTENSION } = await import("../src/lifetime-provenance.ts");
+    let sent: any;
+    c.fetchImpl = async (_url, init) => { sent = JSON.parse(init!.body as string); return Response.json(await h.facilitator.settle(sent)); };
+    c.getLatestBlockhash = vi.fn(async () => { throw new Error("must not backfill"); });
+    const response = await app.request(`${origin}/resource?order=${s.id}`, { method: "POST", headers: { cookie: s.cookie, origin,
+      "PAYMENT-SIGNATURE": encodeHeader({ x402Version: 2, resource: s.required.resource, accepted: s.required.accepts[0],
+        payload: { transaction: await sign(s.unsigned) }, extensions: { [LIFETIME_EXTENSION]: { observation: { version: 1, source: "first-party" } } } }) } });
+    expect(response.status).toBe(200); expect(sent.lifetimeObservation).toBeUndefined();
+    expect(c.orders.read(s.id).events[0]!.lifetimeObservation).toBeUndefined(); expect(c.getLatestBlockhash).not.toHaveBeenCalled();
+  });
+  test.each(["beer", "finish", "void", "refund"])("%s persists builder observation before relay", async a => {
+    const s = await offer(); expect((await authorize(s)).status).toBe(200);
+    if (a === "refund" || a === "finish") await expectAction(s, "beer");
+    if (a === "finish") await expectAction(s, "salmon");
+    const { attestObservation } = await import("../src/lifetime-provenance.ts");
+    c.fetchImpl = async (_url, init) => {
+      const body = JSON.parse(init!.body as string);
+      const event = c.orders.read(s.id).events.at(-1)!;
+      expect(event.action).toBe(a); expect(event.lifetimeObservation).toBeDefined();
+      expect(body.lifetimeObservation).toEqual(attestObservation(event.lifetimeObservation!, c.bearerToken));
+      expect(event.transactionBase64).toBe(body.paymentPayload.payload.transaction);
+      return Response.json(await h.facilitator.settle(body));
+    };
+    await expectAction(s, a);
+  });
+});

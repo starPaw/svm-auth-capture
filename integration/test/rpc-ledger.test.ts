@@ -1083,3 +1083,78 @@ describe("reclaim finalized origin and expiry", () => {
     if (["missing-origin", "different-fork", "rpc-unavailable"].includes(mode)) expect(hashReads).toBe(0);
   });
 });
+
+// #52: origin authentication is evidence, separate from validity/expiry or admission.
+describe("relay lifetime observation and canonical origin", () => {
+  const make = (rpc: Rpc<SolanaRpcApi>, requestTimeoutMs = 1000) => new RpcLedger({ network: NETWORK, genesisHash: GENESIS,
+    rpcUrl: "http://synthetic.invalid", rpc, requestTimeoutMs });
+  test("original finalized lifetime records pinned full identity and u64 precision", async () => {
+    const ledger = make(fakeRpc({ getLatestBlockhash: () => sendable({ context: { slot: 9007199254740993n },
+      value: { blockhash: GENESIS, lastValidBlockHeight: 18446744073709551615n } }) }));
+    expect(await ledger.latestBlockhash()).toEqual({ blockhash: GENESIS, lastValidBlockHeight: 18446744073709551615n,
+      blockhashSlot: 9007199254740993n, contextSlot: 9007199254740993n, commitment: "finalized", network: NETWORK, genesisHash: GENESIS });
+  });
+  test.each([9007199254740992, -1n, 1.1, 18446744073709551616n, "123", null])("corrupt lifetime height %s is never rounded", async height => {
+    const ledger = make(fakeRpc({ getLatestBlockhash: () => sendable({ context: { slot: 1n }, value: { blockhash: GENESIS, lastValidBlockHeight: height } }) }));
+    await expect(ledger.latestBlockhash()).rejects.toThrow(/malformed/);
+  });
+  test.each([9007199254740992, -1n, 1.1, 18446744073709551616n, "123", null])("corrupt context slot %s is never rounded", async slot => {
+    const ledger = make(fakeRpc({ getLatestBlockhash: () => sendable({ context: { slot }, value: { blockhash: GENESIS, lastValidBlockHeight: 1n } }) }));
+    await expect(ledger.latestBlockhash()).rejects.toThrow(/malformed/);
+  });
+  test("candidate slot requires matching finalized block on genesis-checked network", async () => {
+    const getBlock = vi.fn(() => sendable({ blockhash: GENESIS }));
+    const getGenesisHash = vi.fn(() => sendable(GENESIS));
+    const getLatestBlockhash = vi.fn(); const isBlockhashValid = vi.fn();
+    const ledger = make(fakeRpc({ getGenesisHash, getBlock, getLatestBlockhash, isBlockhashValid }));
+    expect(await ledger.verifyBlockhashOrigin(GENESIS, 9007199254740993n, GENESIS, NETWORK)).toEqual({ state: "verified",
+      blockhash: GENESIS, slot: "9007199254740993", commitment: "finalized", genesisHash: GENESIS, network: NETWORK });
+    expect(getBlock).toHaveBeenCalledWith(9007199254740993n, { commitment: "finalized", transactionDetails: "none", rewards: false });
+    expect(getLatestBlockhash).not.toHaveBeenCalled(); expect(isBlockhashValid).not.toHaveBeenCalled();
+  });
+  test.each([null, {}, { blockhash: "different" }])("pruned/skipped/nonfinal/mismatched candidate %j is unverified", async block => {
+    const ledger = make(fakeRpc({ getGenesisHash: () => sendable(GENESIS), getBlock: () => sendable(block) }));
+    expect(await ledger.verifyBlockhashOrigin(GENESIS, 123n, GENESIS, NETWORK)).toEqual({ state: "unverified", reason: "origin-unavailable" });
+  });
+  test.each(["pruned", "nonfinal", "unavailable"])("%s origin RPC error does not imply expiry or non-execution", async reason => {
+    const ledger = make(fakeRpc({ getGenesisHash: () => sendable(GENESIS), getBlock: () => ({ send: async () => { throw new Error(reason); } }) }));
+    expect(await ledger.verifyBlockhashOrigin(GENESIS, 123n, GENESIS, NETWORK)).toEqual({ state: "unverified", reason: "lookup-unavailable" });
+  });
+  test("wrong provider genesis refuses before getBlock", async () => {
+    const getBlock = vi.fn(); const ledger = make(fakeRpc({ getGenesisHash: () => sendable("wrong"), getBlock }));
+    expect(await ledger.verifyBlockhashOrigin(GENESIS, 123n, GENESIS, NETWORK)).toEqual({ state: "unverified", reason: "network-mismatch" });
+    expect(getBlock).not.toHaveBeenCalled();
+  });
+  test.each(["genesis", "network"])("forged %s never reaches RPC", async field => {
+    const getGenesisHash = vi.fn(); const ledger = make(fakeRpc({ getGenesisHash }));
+    expect(await ledger.verifyBlockhashOrigin(GENESIS, 123n, field === "genesis" ? "wrong" : GENESIS, field === "network" ? "wrong" : NETWORK))
+      .toEqual({ state: "unverified", reason: "network-mismatch" });
+    expect(getGenesisHash).not.toHaveBeenCalled();
+  });
+  test("genesis and block share one absolute deadline even when transport ignores abort", async () => {
+    vi.useFakeTimers();
+    try {
+      const signals: AbortSignal[] = [];
+      const slow = <T>(value: T) => ({ send: ({ abortSignal }: { abortSignal: AbortSignal }) => {
+        signals.push(abortSignal); return new Promise<T>(r => setTimeout(() => r(value), 20));
+      } });
+      const getBlock = vi.fn(() => slow({ blockhash: GENESIS }));
+      const ledger = make(fakeRpc({ getGenesisHash: () => slow(GENESIS), getBlock }), 30);
+      const proof = ledger.verifyBlockhashOrigin(GENESIS, 123n, GENESIS, NETWORK);
+      await vi.advanceTimersByTimeAsync(30);
+      expect(await proof).toEqual({ state: "unverified", reason: "lookup-unavailable" });
+      expect(getBlock).toHaveBeenCalledTimes(1); expect(signals[1]!.aborted).toBe(true);
+      await vi.advanceTimersByTimeAsync(20); // Late resolution cannot upgrade already retained evidence.
+    } finally { vi.useRealTimers(); }
+  });
+  test("an entirely stalled genesis is bounded and no origin search starts", async () => {
+    vi.useFakeTimers();
+    try {
+      const getBlock = vi.fn();
+      const ledger = make(fakeRpc({ getGenesisHash: () => ({ send: () => new Promise(() => {}) }), getBlock }), 30);
+      const proof = ledger.verifyBlockhashOrigin(GENESIS, 123n, GENESIS, NETWORK);
+      await vi.advanceTimersByTimeAsync(30);
+      expect(await proof).toEqual({ state: "unverified", reason: "lookup-unavailable" }); expect(getBlock).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
+  });
+});

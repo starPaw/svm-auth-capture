@@ -56,6 +56,8 @@ import {
   type VerifyResponse,
 } from "./types.ts";
 
+import { relayProvenance, type OriginReader } from "./lifetime-provenance.ts";
+
 export const COMPUTE_BUDGET_PROGRAM_ADDRESS = "ComputeBudget111111111111111111111111111111" as Address;
 
 export type FacilitatorConfig = {
@@ -75,6 +77,8 @@ export type FacilitatorConfig = {
    * for the bounded SAC-004 endpoint exercise, which claims no recovery behavior.
    */
   journal?: SubmissionJournal;
+  /** Existing trusted-caller bearer key; authenticates recording only, never economic consent. */
+  observationKey?: string;
 };
 
 class Rejection extends Error {
@@ -163,6 +167,7 @@ export class Facilitator {
   private readonly maxUnitLimit: number;
   private readonly maxUnitPrice: bigint;
   private readonly journal?: SubmissionJournal;
+  private readonly observationKey?: string;
   /**
    * Settlements in flight in this process, keyed by the exact message bytes of the validated
    * transaction. A concurrent identical `/settle` must not submit twice for one economic event;
@@ -182,6 +187,7 @@ export class Facilitator {
     this.maxUnitLimit = config.maxComputeUnitLimit ?? 400_000;
     this.maxUnitPrice = config.maxComputeUnitPriceMicroLamports ?? 10_000n;
     this.journal = config.journal;
+    this.observationKey = config.observationKey;
   }
 
   get feePayerAddress(): Address {
@@ -277,18 +283,21 @@ export class Facilitator {
     } catch (e) {
       return this.rejectionResponse(e);
     }
-    return this.broadcast(verified);
+    return this.broadcast(verified, isObject(body) ? body.lifetimeObservation : undefined);
   }
 
   /** Co-signs as fee payer, submits once, and maps the adapter's three-way outcome. */
-  private async broadcast(verified: Verified): Promise<SettleResponse> {
+  private async broadcast(verified: Verified, observation: unknown): Promise<SettleResponse> {
     const signed = await partiallySignTransaction([this.feePayer.keyPair], verified.transaction);
     const signature = getSignatureFromTransaction(signed);
     const base = { transaction: signature, network: this.network, payer: verified.payer };
     if (this.journal) {
+      const reader = "verifyBlockhashOrigin" in this.ledger ? this.ledger as Ledger & OriginReader : undefined;
+      const lifetimeProvenance = await relayProvenance(signed, observation, this.network, reader, this.observationKey);
       try {
         this.journal.prepare({
           signature,
+          lifetimeProvenance,
           messageHash: messageHash(signed.messageBytes),
           transactionBase64: getBase64EncodedWireTransaction(signed),
           blockhash: messageDecoder.decode(signed.messageBytes).lifetimeToken,
