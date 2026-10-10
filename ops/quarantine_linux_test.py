@@ -15,6 +15,7 @@ import socket
 import subprocess
 import sys
 import time
+import threading
 
 import quarantine as q
 import quarantine_prepare as prep
@@ -23,6 +24,35 @@ SOURCE = Path('/opt/b2-test/src')
 LOG = Path('/opt/b2-test/results.json')
 FIXTURE = SOURCE.parent / 'fixture.json'
 TESTS = []
+REMOTE = None
+
+
+class DelayedRemote:
+    """Neutral loopback HTTP peer; never reads keys or any economic store."""
+    def __init__(self):
+        self.release = threading.Event(); self.requests = 0; self.replies = 0
+        self.listener = socket.socket(); self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.listener.bind(('127.0.0.1', 15957)); self.listener.listen(2)
+        threading.Thread(target=self.serve, daemon=True).start()
+
+    def serve(self):
+        for _ in range(2):
+            conn, _ = self.listener.accept()
+            threading.Thread(target=self.reply, args=(conn,), daemon=True).start()
+
+    def reply(self, conn):
+        with conn:
+            q.require(conn.recv(1024).startswith(b'GET /synthetic-late '))
+            self.requests += 1
+            self.release.wait(60)
+            try: conn.sendall(b'HTTP/1.0 200 OK\r\n\r\nLATE_SYNTHETIC_RESULT')
+            except OSError: pass  # Cessation does not cancel the remote result.
+            self.replies += 1
+
+    def wait_for(self, field):
+        deadline = time.monotonic() + 10
+        while getattr(self, field) != 2:
+            q.require(time.monotonic() < deadline); time.sleep(.02)
 
 
 def record(name, action):
@@ -59,6 +89,8 @@ def assert_equal(a, b):
 
 
 def setup(f):
+    global REMOTE
+    REMOTE = DelayedRemote()
     q.run('groupadd', '--system', 'capture402-dev-runtime')
     for n in ('capture402-dev-setup', *q.SERVICES, 'capture402-deploy'):
         q.run('useradd', '--system', '--no-create-home', '--gid', 'capture402-dev-runtime', '--shell', '/usr/sbin/nologin', n)
@@ -94,7 +126,8 @@ def setup(f):
         q.exclusive(p, b'SYNTHETIC_NO_ECONOMIC_AUTHORITY', 0o600)
         u = pwd.getpwnam(name); os.chown(p, u.pw_uid, u.pw_gid)
     # Real supported env/path semantics; only economic entrypoint bodies are
-    # substituted with a no-network synthetic loaded-key/fork writer below.
+    # substituted with a synthetic loaded-key/fork writer and neutral delayed
+    # loopback HTTP peer below. This is not an RPC/payment request.
     for role in ('facilitator', 'restaurant'):
         text = (SOURCE / ('integration/deploy/dev/' + role + '.env.example')).read_text()
         values = {'SAC006_BEARER_TOKEN': 'synthetic-only', 'SAC006_MERCHANT_TOKEN': 'synthetic-merchant-only', 'SAC006_FEE_PAYER': f['input']['genesisHash'], 'SAC006_ASSET_MINT': f['input']['genesisHash'], 'SAC006_ALLOWLIST_MERCHANT': f['input']['genesisHash'], 'SAC006_ALLOWLIST_MINT': f['input']['genesisHash']}
@@ -111,15 +144,18 @@ def setup(f):
     # Recreate the socket directory on reboot, with no inherited socket activation FDs.
     Path('/etc/tmpfiles.d/capture402-b2-test.conf').write_text(f'd /run/capture402-dev-view 0750 {q.SERVICES[1]} capture402-dev-runtime -\n')
     writer = SOURCE.parent / 'writer.py'
-    writer.write_text('''import os,time,pwd
+    writer.write_text('''import os,time,pwd,socket
 key=open(os.environ['SAC006_FACILITATOR_KEYPAIR_PATH'] if 'SAC006_FACILITATOR_KEYPAIR_PATH' in os.environ else os.environ['SAC006_SERVER_KEYPAIR_PATH']).read()
 if os.fork()==0:
+ conn=socket.create_connection(('127.0.0.1',15957))
+ conn.sendall(b'GET /synthetic-late HTTP/1.0\\r\\n\\r\\n')
+ conn.recv(1024)
+ open('/var/lib/capture402-dev/post-fence-effect','w').write(key)
+else:
  while True:
   if os.path.exists('/tmp/b2-late-result'):
    open('/var/lib/capture402-dev/post-fence-effect','w').write(key)
   time.sleep(.02)
-else:
- while True: time.sleep(.02)
 ''')
     os.chown(q.STATE, user.pw_uid, user.pw_gid)
     os.chmod(q.STATE, 0o755)
@@ -190,6 +226,7 @@ def campaign(f):
     q.run('systemctl', 'stop', 'b2-unknown-writer')
     q.run('systemctl', 'reset-failed', 'b2-unknown-writer') if q.run('systemctl', 'show', '-p', 'ActiveState', '--value', 'b2-unknown-writer') == 'failed' else None
     transition = q.Transition(q.ROOT, host, e, projection)
+    record('queued-loopback-HTTP-already-admitted-before-fence', lambda: REMOTE.wait_for('requests'))
     record('real-freeze-frozen-kill-descendants-populated-zero-and-view-start', transition.enter)
     host.open_view_ingress()
     baseline = q.journal_phase(q.ROOT)[2]['attestation']['inventory']
@@ -202,8 +239,10 @@ def campaign(f):
         record('forbidden-' + method + '-' + path.replace('/', '_'), lambda method=method, path=path: assert_equal(http(path, method=method)[0], 403))
     record('lost-cookie-no-private-data', lambda: assert_equal(http('/api/orders/' + f['projection']['orders'][0]['id'])[0], 403))
     Path('/tmp/b2-late-result').touch()
+    REMOTE.release.set(); REMOTE.wait_for('replies'); REMOTE.listener.close()
     time.sleep(.15)
     record('late-result-old-descendants-have-zero-local-continuations', lambda: q.require(not (q.STATE / 'post-fence-effect').exists() and q.inventory()[0] == baseline))
+    record('real-delayed-HTTP-replies-cannot-resume-old-key-holding-children', lambda: q.require(REMOTE.requests == REMOTE.replies == 2 and not (q.STATE / 'post-fence-effect').exists()))
     record('ordinary-start-and-legacy-permit-do-not-admit-economic-profile', lambda: (q.run('systemctl', 'start', q.SERVICES[0]), assert_equal(q.run('systemctl', 'show', '-p', 'MainPID', '--value', q.SERVICES[0]), '0')))
     (q.BASE / 'transaction.json').write_text('{"previous":"' + 'a' * 40 + '"}')
     Path('/run/capture402-dev-deploy-permit').write_text('a' * 40)
