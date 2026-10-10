@@ -581,7 +581,12 @@ def activation_inventory(e=None):
                             for token in shlex.split(value):
                                 source = (token.split(':', 1)[-1] if directive.startswith('LoadCredential') else token.split(':', 1)[0]).lstrip('-+')
                                 if source.startswith('/'):
-                                    source = source.replace('%p', p.name.removesuffix('.service').split('@', 1)[0]).replace('%n', p.name)
+                                    if '%' in source:
+                                        unit_name = p.parent.name.removesuffix('.d') if p.parent.name.endswith('.service.d') else p.name if p.name.endswith('.service') else ''
+                                        # Global/template fragments do not name the
+                                        # instantiated unit. Never guess their path.
+                                        require(unit_name and '@' not in unit_name)
+                                        source = source.replace('%p', unit_name.removesuffix('.service')).replace('%n', unit_name)
                                     require('%' not in source)
                                     target = Path(source).resolve()
                                     require(not any(target == root or target.is_relative_to(root) for root in (PRIVATE, STATE, BASE)))
