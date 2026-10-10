@@ -18,7 +18,7 @@ import release_policy as policy
 TOKEN = Path('/etc/capture402/github-release-readonly')
 COMMAND = Path('/usr/local/sbin/capture402')
 OLD_COMMAND = Path('/usr/local/sbin/capture402-deploy')
-FILES = ('deploy_demo.py', 'deploy_vps.py', 'host_cli.py', 'release_policy.py', 'deploy_dev.py')
+FILES = ('deploy_demo.py', 'deploy_vps.py', 'host_cli.py', 'release_policy.py', 'deploy_dev.py', 'quarantine.py', 'quarantine_prepare.py')
 # The release policy requires merge_commit_sha, removed in API 2026-03-10.
 # GitHub supports this compatible schema until at least 2028-03-10.
 API_VERSION = '2022-11-28'
