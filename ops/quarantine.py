@@ -549,6 +549,9 @@ def activation_inventory(e=None):
                 elif p.is_file():
                     data = read(p, 4 * 1024 * 1024, owner=0, allow_empty=True)[0]
                     source_text = data.decode('utf-8', errors='replace')
+                    # Cron/timer/wrapper references can instantiate a template
+                    # that has no enabled unit file or current process yet.
+                    unit_names.update(re.findall(r'(?<![\w@.-])([\w@:.\\-]+\.service)(?![\w@.-])', source_text))
                     primary = p in {UNITS / (n + '.service') for n in SERVICES}
                     approved_dropin = p.parent in {UNITS / (n + '.service.d') for n in SERVICES} and p.name in ('10-deploy-gate.conf', '95-independent-admission.conf', '99-quarantine.conf')
                     ingress_tmpfiles = p.parent == Path('/etc/tmpfiles.d') and re.fullmatch(r'd /run/capture402-dev-view 0750 capture402-dev-restaurant capture402-dev-runtime -\n', source_text)
