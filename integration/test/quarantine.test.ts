@@ -162,6 +162,23 @@ test.each(['amount', 'payment', 'payer', 'network', 'signature', 'held', 'succes
   input.stores.orders[0] = member(`${id}.json`, retained);
   await expect(project(input)).rejects.toThrow(); expect(h!.ledger.submissions).toHaveLength(0);
 });
+test.each(['finalized-succeeded', 'finalized-failed', 'not-submitted'])('actual restaurant reclaim preserves action and payment-chain locks (%s)', async result => {
+  const { input, retained } = await terminalFixture();
+  // Replace the void with an actual payer-signed reclaim, without submitting it.
+  input.stores.facilitator.pop(); retained.events.pop(); input.stores.orders.pop();
+  const payment = retained.payment;
+  const ix = await reclaimInstruction({ programId: h!.facilitator.programId, payer: h!.payer.address, server: h!.server.address, mint: h!.mint, payment });
+  const tx = await buildTransaction({ feePayer: h!.payer.address, instructions: [ix], signers: [h!.payer], lifetime: { blockhash: '1'.repeat(32) as Blockhash, lastValidBlockHeight: 1000n } });
+  const signature = getSignatureFromTransaction(tx), wire = encodeTransaction(tx);
+  input.stores.reclaim.push(member(`${signature}.json`, { signature, messageHash: hash(tx.messageBytes), transactionBase64: wire, blockhash: getCompiledTransactionMessageDecoder().decode(tx.messageBytes).lifetimeToken, operation: 'reclaim', payment, payer: h!.payer.address, expectedHeld: '100', expectedRefundable: '0', attempts: [{ preparedAt: at, outcome: { result, recordedAt: at } }] }) as never, member(`reclaim-${payment}.lock`, signature) as never);
+  const event = { action: 'reclaim', label: 'Retained reclaim', amount: '100', at, status: result === 'finalized-succeeded' ? 'finalized' : 'rejected', transaction: signature, transactionBase64: wire, receipt: { success: result === 'finalized-succeeded', transaction: signature, network: input.network, payer: h!.payer.address, ...(result === 'finalized-succeeded' ? {} : { errorReason: 'invalid_transaction_state' }) } };
+  retained.events.push(event); retained.status = result === 'finalized-succeeded' ? 'closed' : 'active';
+  input.stores.orders[0] = member(`${id}.json`, retained);
+  input.stores.orders.push(member(`${id}.json.reclaim.lock`, { ...event, status: 'prepared', receipt: undefined }));
+  expect((await project(input)).orders[0]!.events.at(-1)!.action).toBe('reclaim');
+  input.stores.orders.pop(); await expect(project(input)).rejects.toThrow();
+  expect(h!.ledger.submissions).toHaveLength(0);
+});
 test("export only synthetic Linux fixture when requested", async () => {
   const { input } = await fixture(); const p = await project(input);
   if (process.env.B2_SYNTHETIC_FIXTURE) writeFileSync(process.env.B2_SYNTHETIC_FIXTURE, JSON.stringify({ input, projection: p, auth: { merchantHash: hash(merchant), operatorHash: hash(operator) }, cookie, merchant, operator }));

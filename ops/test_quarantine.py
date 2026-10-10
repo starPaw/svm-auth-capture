@@ -184,6 +184,19 @@ class QuarantineTests(unittest.TestCase):
             with self.assertRaises((RuntimeError, ValueError, UnicodeDecodeError)):
                 q.strict_json(b)
 
+    def test_pending_bootstrap_preserves_A_but_never_entered_denial(self):
+        guard = self.root / 'guard'
+        with patch.object(q, 'GUARD', guard):
+            q.exclusive(self.admission / 'BOOTSTRAP_PENDING', q.encoded(dict(version=1, candidate='c' * 40, guardSha256=q.digest(b'guard'))))
+            q.ordinary_allowed()
+            q.exclusive(guard, b'guard')
+            q.ordinary_allowed()
+            q.exclusive(self.admission / 'ECONOMICS_DENIED', b'denial')
+            with self.assertRaises(RuntimeError): q.ordinary_allowed()
+            (self.admission / 'ECONOMICS_DENIED').unlink()
+            q.exclusive(self.admission / 'BOOTSTRAP_COMMITTED', b'B2_ENROLLED v1\n')
+            with self.assertRaises(FileNotFoundError): q.ordinary_allowed()
+
     def test_candidate_no_raw_credential_network_or_ipc_capabilities_in_unit(self):
         unit = q.viewer_unit(self.e)
         for value in ('RootDirectory=', 'PrivateNetwork=yes', 'SystemCallFilter=~connect', 'NoNewPrivileges=yes', 'CapabilityBoundingSet=\n', 'EnvironmentFile=\n', 'ReadWritePaths=\n', 'RestrictNamespaces=yes'):

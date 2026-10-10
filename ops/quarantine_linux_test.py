@@ -142,6 +142,18 @@ def campaign(f):
     delayed.write_text('[Service]\nUser=' + q.SERVICES[0] + '\nSlice=other.slice\nLoadCredential=key:/etc/capture402-dev/keys/sponsor.json\nExecStart=/usr/bin/sleep 60\n')
     record('pre-enrolled-idle-timer-credential-source-refused', lambda: failed(lambda: q.activation_inventory(e)))
     delayed.unlink()
+    template = q.UNITS / 'b2-idle@.service'
+    template.write_text('[Service]\nUser=%i\nExecStart=/usr/bin/sleep 60\n')
+    instance = q.UNITS / ('b2-idle@' + str(e['uids'][0]) + '.service')
+    instance.symlink_to(template)
+    q.run('systemctl', 'daemon-reload')
+    record('specifier-instance-and-enabled-alias-UID-source-refused', lambda: failed(lambda: q.activation_inventory(e)))
+    instance.unlink(); template.unlink(); q.run('systemctl', 'daemon-reload')
+    alias = Path('/opt/b2-key-alias'); alias.symlink_to(q.PRIVATE / 'keys/sponsor.json')
+    delayed.write_text('[Service]\nLoadCredential=key:/opt/b2-key-alias\nExecStart=/usr/bin/sleep 60\n')
+    q.run('systemctl', 'daemon-reload')
+    record('resolved-credential-alias-source-refused', lambda: failed(lambda: q.activation_inventory(e)))
+    delayed.unlink(); alias.unlink(); q.run('systemctl', 'daemon-reload')
     inherited = q.UNITS / (q.SERVICES[1] + '.service.d') / '98-inherited.conf'
     inherited.write_text('[Service]\nOpenFile=/etc/capture402-dev/keys/merchant.json\nLoadCredential=key:/etc/capture402-dev/keys/merchant.json\n')
     record('inherited-viewer-credential-and-open-FD-source-refused', lambda: failed(lambda: q.activation_inventory(e)))

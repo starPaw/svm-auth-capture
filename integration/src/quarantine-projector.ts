@@ -163,7 +163,7 @@ export async function project(input: unknown) {
     if (!j) { check(!r.success && signature === ""); return; }
     const outcome = j.entry.attempts.at(-1).outcome?.result;
     if (r.success) check(outcome === "finalized-succeeded" && signature === j.entry.signature);
-    else if (outcome === "not-submitted") check(signature === "" && r.errorReason === "settlement_not_submitted");
+    else if (outcome === "not-submitted") check(w.op.op === "reclaim" ? signature === j.entry.signature && r.errorReason === "invalid_transaction_state" : signature === "" && r.errorReason === "settlement_not_submitted");
     else if (outcome === "finalized-failed") check(signature === j.entry.signature && r.errorReason === "invalid_transaction_state");
     else check(signature === j.entry.signature && r.errorReason === "settlement_pending");
   };
@@ -255,11 +255,14 @@ export async function project(input: unknown) {
         check(association === null || association === r.id); association = r.id;
       }
       const lockName = `${r.id}.json.${e.action}.lock`, lock = stores.orders!.get(lockName);
-      // Reclaim is reserved in its journal; authorize/action attempts use immutable event locks.
-      if (e.action !== "reclaim") {
+      // Every restaurant attempt has its immutable action lock. Reclaim additionally
+      // has the journal's payment-chain reservation and preserves its signed wire.
+      {
         check(lock); object(lock.value, ["action", "label", "amount", "at", "status", "transaction", "transactionBase64"], ["receipt", "lifetimeObservation"]);
         const l = lock.value; check(l.action === e.action && l.status === "prepared" && l.transactionBase64 === e.transactionBase64 && l.at === e.at && l.amount === e.amount && l.label === e.label);
-        check(l.transaction === "" && l.receipt === undefined); if (l.lifetimeObservation !== undefined) observation(l.lifetimeObservation, w, network); usedLocks.add(lockName);
+        check(l.transaction === (e.action === "reclaim" ? e.transaction : "") && l.receipt === undefined);
+        if (e.action === "reclaim") check(journals.get(e.transaction)?.entry.transactionBase64 === e.transactionBase64);
+        if (l.lifetimeObservation !== undefined) observation(l.lifetimeObservation, w, network); usedLocks.add(lockName);
       }
       events.push({ action: e.action, amount: e.amount, at: e.at, status: e.status, signature: e.transaction });
     }

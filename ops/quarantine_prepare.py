@@ -59,7 +59,8 @@ def prepare(request):
     # Application archives intentionally do not carry ops code. D* is the
     # independently authenticated immutable controller directory, not C*.
     q.require(re.fullmatch('[a-f0-9]{40}', CONTROLLER_ROOT.name))
-    q.require(q.read(CONTROLLER_ROOT / 'quarantine.py', owner=0)[0] == q.read(q.GUARD, owner=0)[0])
+    guard_source = q.read(CONTROLLER_ROOT / 'quarantine.py', owner=0)[0]
+    q.require(guard_source == Path(q.__file__).read_bytes())
     root = q.BASE / 'views' / request['candidate']
     projector = q.BASE / 'projectors' / request['candidate']
     q.require(not q.exists(root) and not q.exists(projector))
@@ -85,7 +86,7 @@ def prepare(request):
     inv = q.tree(root)
     e = dict(version=1, uids=[__import__('pwd').getpwnam(n).pw_uid for n in
                             ('capture402-dev-setup', *q.SERVICES, 'capture402-deploy')],
-             guardSha256=q.digest(q.read(q.GUARD, owner=0)[0]), activation={},
+             guardSha256=q.digest(guard_source), activation={},
              selected=request['selected'], public=request['public'], ownerDisposition=request['ownerDisposition'],
              viewerRoot=str(root), viewerInventory=inv)
     e['tuple'] = dict(candidate=request['candidate'], previous=request['previous'], controllerRevision=CONTROLLER_ROOT.name,
@@ -142,22 +143,32 @@ def bootstrap(request):
     ingress = Path('/run/capture402-dev-view')
     s = ingress.lstat(); user = __import__('pwd').getpwnam(q.SERVICES[1])
     q.require(ingress.is_dir() and not ingress.is_symlink() and s.st_uid == user.pw_uid and s.st_gid == user.pw_gid and s.st_mode & 0o777 == 0o750)
-    # Source copied as immutable independent guard, never changed by controller install.
-    q.GUARD.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
-    q.exclusive(q.GUARD, Path(q.__file__).read_bytes(), 0o555)
+    # Stage and authenticate all runtime/data/activation inputs before publishing
+    # independent admission. No bootstrap failure grants a B2 exception.
     e, routing = prepare(request)
+    q.activation_inventory(e)
+    inv, stores = q.inventory()
+    offline_projector(e)(stores, inv)
+    q.require(q.inventory()[0] == inv)
     q.ROOT.mkdir(mode=0o700)
     q.fsync_dir(q.ROOT.parent)
+    q.exclusive(q.ROOT / 'BOOTSTRAP_PENDING', q.encoded(dict(version=1, candidate=request['candidate'], guardSha256=e['guardSha256'])))
+    # Pending enrollment preserves ordinary A, including after a publication crash.
+    q.GUARD.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    q.exclusive(q.GUARD, Path(q.__file__).read_bytes(), 0o555)
     for name in q.SERVICES:
         drop = q.UNITS / (name + '.service.d')
         drop.mkdir(mode=0o755, exist_ok=True)
         q.exclusive(drop / '95-independent-admission.conf',
-                    ('[Unit]\nConditionPathExists=!' + str(q.ROOT / 'ECONOMICS_DENIED') + '\n[Service]\nExecCondition=+/usr/bin/python3 -I -B ' + str(q.GUARD) + ' economic\n').encode(), 0o644)
+                    admission_hook(), 0o644)
     q.exclusive(q.ROOT / 'routing.conf', routing, 0o600)
     q.run('systemctl', 'daemon-reload')
     e['activation'] = q.activation_inventory(e)
     q.exclusive(q.ROOT / 'enrollment.json', q.encoded(e))
-    q.LinuxHost(q.enrollment()).verify()
+    q.LinuxHost(e).verify()
+    q.exclusive(q.ROOT / 'BOOTSTRAP_COMMITTED', b'B2_ENROLLED v1\n')
+    (q.ROOT / 'BOOTSTRAP_PENDING').unlink(); q.fsync_dir(q.ROOT)
+    q.enrollment()
     return e
 
 
@@ -187,8 +198,46 @@ def offline_projector(e):
     return project
 
 
+def abort_bootstrap(request):
+    candidate = request['candidate']
+    q.require(isinstance(candidate, str) and re.fullmatch('[a-f0-9]{40}', candidate))
+    # This is staging recovery only. A committed enrollment or any denial/history
+    # cannot be removed here, even when its other metadata is corrupt.
+    if q.exists(q.ROOT):
+        q.require(not q.exists(q.ROOT / 'BOOTSTRAP_COMMITTED') and q.exists(q.ROOT / 'BOOTSTRAP_PENDING'))
+        q.require({p.name for p in q.ROOT.iterdir()} <= {'BOOTSTRAP_PENDING', 'routing.conf', 'enrollment.json', 'controller.lock'})
+        with q.locked():
+            pending = q.strict_json(q.read(q.ROOT / 'BOOTSTRAP_PENDING', owner=0)[0])
+            q.shape(pending, ('version', 'candidate', 'guardSha256'))
+            q.require(pending['version'] == 1 and pending['candidate'] == candidate and pending['guardSha256'] == q.digest(Path(q.__file__).read_bytes()))
+            for name in q.SERVICES:
+                hook = q.UNITS / (name + '.service.d') / '95-independent-admission.conf'
+                if q.exists(hook):
+                    q.require(q.read(hook, owner=0)[0] == admission_hook())
+                    hook.unlink(); q.fsync_dir(hook.parent)
+            q.run('systemctl', 'daemon-reload')
+            if q.exists(q.GUARD):
+                q.require(q.read(q.GUARD, owner=0)[0] == Path(q.__file__).read_bytes())
+                q.GUARD.unlink(); q.fsync_dir(q.GUARD.parent)
+            shutil.rmtree(q.ROOT); q.fsync_dir(q.ROOT.parent)
+    else:
+        q.require(not q.exists(q.GUARD))
+    for kind in ('views', 'projectors'):
+        path = q.BASE / kind / candidate
+        if q.exists(path):
+            q.require(path.is_dir() and not path.is_symlink() and path.stat().st_uid == 0)
+            shutil.rmtree(path); q.fsync_dir(path.parent)
+    return {'mode': 'A', 'bootstrap': 'ABORTED_BEFORE_COMMIT', 'economicsException': False}
+
+
+def admission_hook():
+    return ('[Unit]\nConditionPathExists=!' + str(q.ROOT / 'ECONOMICS_DENIED') + '\n[Service]\nExecCondition=+/usr/bin/python3 -I -B ' + str(q.GUARD) + ' economic\n').encode()
+
+
 def control(argv):
     q.require(os.geteuid() == 0)
+    if len(argv) == 2 and argv[0] == 'bootstrap-abort':
+        return abort_bootstrap(q.strict_json(q.read(Path(argv[1]), owner=0)[0]))
     if len(argv) == 2 and argv[0] == 'bootstrap':
         request = q.strict_json(q.read(Path(argv[1]), owner=0)[0])
         # Preserve normal release eligibility. No draft/unmerged/force flag exists.

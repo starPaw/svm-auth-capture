@@ -145,10 +145,17 @@ def ordinary_allowed():
     # Any marker, including a corrupt/symlink/incomplete one, is denial.
     require(not exists(ROOT / 'ECONOMICS_DENIED'))
     require(not list(ROOT.glob('*-*.json')) and not exists(ROOT / 'projection.json') and not exists(BASE / 'read-only-maintenance'))
+    if exists(ROOT / 'BOOTSTRAP_PENDING') and not exists(ROOT / 'BOOTSTRAP_COMMITTED'):
+        pending = strict_json(read(ROOT / 'BOOTSTRAP_PENDING', owner=0)[0])
+        shape(pending, ('version', 'candidate', 'guardSha256'))
+        require(pending['version'] == 1 and re.fullmatch('[a-f0-9]{40}', pending['candidate']) and re.fullmatch('[a-f0-9]{64}', pending['guardSha256']))
+        require(not exists(GUARD) or digest(read(GUARD, owner=0)[0]) == pending['guardSha256'])
+        return  # No exception exists until verified enrollment is durably committed.
     enrollment()  # Deletion/corruption does not implicitly unenroll.
 
 
 def enrollment():
+    require(read(ROOT / 'BOOTSTRAP_COMMITTED', owner=0)[0] == b'B2_ENROLLED v1\n')
     e = strict_json(read(ROOT / 'enrollment.json', owner=0)[0])
     shape(e, ('version', 'uids', 'guardSha256', 'activation', 'tuple', 'selected', 'public', 'viewerRoot', 'viewerInventory', 'ownerDisposition'))
     require(e['version'] == 1 and e['ownerDisposition'] == 'ACCEPTED_CONTINUED_OUTAGE_AND_INERT_ROLLBACK')
@@ -483,6 +490,36 @@ class LinuxHost:
                 connection.close()
 
 
+def effective_activation(e, names):
+    # Resolve loaded instances and installed aliases through systemd, rather than
+    # trusting literal template text (User=%i) or enabled symlink filenames.
+    names.update(line.split()[0] for line in run('systemctl', 'list-units', '--all', '--no-legend', '--no-pager', '--plain', '--type=service').splitlines() if line.strip())
+    names = sorted(n for n in names if n.endswith('.service') and '@.' not in n)
+    props = ('Id', 'Names', 'User', 'Group', 'LoadCredential', 'LoadCredentialEncrypted', 'ImportCredential', 'OpenFile', 'EnvironmentFiles')
+    raw = run('systemctl', 'show', '--property=' + ','.join(props), *names)
+    enrolled_names = {pwd.getpwuid(uid).pw_name for uid in e['uids']}
+    enrolled_ids = set(map(str, e['uids']))
+    group = pwd.getpwnam(SERVICES[0]).pw_gid
+    for block in raw.strip().split('\n\n'):
+        values = dict(line.split('=', 1) for line in block.splitlines() if '=' in line)
+        name = values.get('Id', '')
+        if name in {n + '.service' for n in SERVICES}:
+            require(set(values.get('Names', '').split()) == {name})
+            continue
+        require(values.get('User', '') not in enrolled_names | enrolled_ids)
+        require(values.get('Group', '') not in {'capture402-dev-runtime', str(group)})
+        # Specifiers in an instantiated identity must already be resolved. Unknown
+        # credential/path sources are unsupported, including aliases to private dirs.
+        require('%' not in values.get('User', '') and '%' not in values.get('Group', ''))
+        for prop in props[4:]:
+            for token in shlex.split(values.get(prop, '')):
+                source = token.split(':', 1)[-1].lstrip('-')
+                if source.startswith('/'):
+                    require('%' not in source)
+                    path = Path(source).resolve()
+                    require(not any(path == root or path.is_relative_to(root) for root in (PRIVATE, STATE, BASE)))
+
+
 def activation_inventory(e=None):
     # Hash the complete launch/configuration surface. Any new source is unsupported.
     roots = [Path('/etc/systemd/system'), Path('/run/systemd/system'), Path('/run/systemd/transient'),
@@ -492,7 +529,7 @@ def activation_inventory(e=None):
              Path('/etc/sudoers.d'), Path('/etc/ssh'), Path('/etc/nginx'),
              Path('/usr/lib/systemd/system'), Path('/usr/lib/systemd/user'), Path('/etc/systemd/user'),
              *(Path('/etc/cron.' + n) for n in ('hourly', 'daily', 'weekly', 'monthly')), Path('/var/spool/at')]
-    result = {}
+    result = {}; unit_names = set()
     for root in roots:
         if not root.exists():
             result[str(root)] = digest(b'ABSENT')
@@ -501,6 +538,7 @@ def activation_inventory(e=None):
         for directory, dirs, files in os.walk(root, followlinks=False):
             for name in sorted(dirs + files):
                 p = Path(directory) / name
+                if name.endswith('.service'): unit_names.add(name)
                 s = p.lstat()
                 # Ubuntu's root-owned sticky crontab spool is writable only via its
                 # setgid crontab helper. Its membership/content are still inventoried.
@@ -547,6 +585,7 @@ def activation_inventory(e=None):
                     result[str(p)] = digest(data)
     for p in (Path('/etc/passwd'), Path('/etc/group'), Path('/etc/shadow'), Path('/etc/sudoers'), Path('/etc/crontab'), Path('/etc/rc.local')):
         result[str(p)] = digest(read(p, owner=0)[0]) if p.exists() else digest(b'ABSENT')
+    if e: effective_activation(e, unit_names)
     return result
 
 
