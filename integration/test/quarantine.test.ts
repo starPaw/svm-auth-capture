@@ -1,8 +1,8 @@
 // Synthetic original + real accepted codecs. All post-projection effects are trapped.
 import { afterEach, expect, test, vi } from "vitest";
 import { readFileSync, writeFileSync } from "node:fs";
-import { getSignatureFromTransaction, partiallySignTransaction, getCompiledTransactionMessageDecoder } from "@solana/kit";
-import { encodeTransaction } from "../src/transactions.js";
+import { getSignatureFromTransaction, partiallySignTransaction, getCompiledTransactionMessageDecoder, type Blockhash } from "@solana/kit";
+import { encodeTransaction, buildTransaction, reclaimInstruction } from "../src/transactions.js";
 import { hash, createQuarantineView, ASSETS, strictJson } from "../src/quarantine-view.js";
 import { project } from "../src/quarantine-projector.js";
 import { createHarness, type Harness } from "./fixture.js";
@@ -95,6 +95,72 @@ test("late remote finality and retained input mutation cannot change sealed UNKN
   const r = await v(new Request("https://view/api/quarantine/status", { headers: { authorization: `Bearer ${operator}` } }));
   expect((await r.json()).original.status).toBe("UNKNOWN"); expect(JSON.stringify(p)).toBe(before);
   expect(h!.ledger.submissions).toHaveLength(0);
+});
+test.each(["missing-busy", "rejected-original", "closed-empty"])("status/reservation conflict %s fails closed", async kind => {
+  const { input, order } = await fixture();
+  if (kind === "missing-busy") input.stores.orders.pop();
+  else {
+    order.status = kind === "closed-empty" ? "closed" : "rejected";
+    if (kind === "closed-empty") order.events = [];
+    else { order.events[0]!.status = "rejected"; order.events[0]!.transaction = '1'.repeat(88) as typeof order.events[0]["transaction"]; }
+    input.stores.orders[0] = member(`${id}.json`, order); input.stores.orders.pop();
+    if (kind === "closed-empty") input.stores.orders.pop();
+  }
+  await expect(project(input)).rejects.toThrow();
+});
+test.each([false, true])("real payer-fee-payer reclaim chain validates legacy/#52 and reverse edges (%s)", async ext => {
+  const { input, journal } = await fixture(true, ext), payment = await h!.paymentFor(h!.newSalt());
+  let prior: string | undefined;
+  for (const blockhash of [journal.blockhash, '1'.repeat(32)]) {
+    const ix = await reclaimInstruction({ programId: h!.facilitator.programId, payer: h!.payer.address, server: h!.server.address, mint: h!.mint, payment });
+    const tx = await buildTransaction({ feePayer: h!.payer.address, instructions: [ix], signers: [h!.payer], lifetime: { blockhash: blockhash as Blockhash, lastValidBlockHeight: 1000n } });
+    const sig = getSignatureFromTransaction(tx), messageHash = hash(tx.messageBytes);
+    const j = { signature: sig, messageHash, transactionBase64: encodeTransaction(tx), blockhash, operation: 'reclaim', payer: h!.payer.address, payment, expectedHeld: '100', expectedRefundable: '0', attempts: [{ preparedAt: at, outcome: { result: 'finalized-failed', recordedAt: at } }], ...(prior ? { retryAfter: prior } : {}), ...(ext ? { lifetimeProvenance: { version: 1, messageHash, blockhash, observation: { state: 'unavailable', reason: 'missing' }, origin: { state: 'unverified', reason: 'missing-observation' } } } : {}) };
+    input.stores.reclaim.push(member(`${sig}.json`, j) as never, member(`reclaim-${payment}${prior ? '-after-' + prior : ''}.lock`, sig) as never); prior = sig;
+  }
+  expect((await project(input)).original.status).toBe('UNKNOWN');
+  input.stores.reclaim.push(member(`reclaim-${payment}-after-${'1'.repeat(88)}.lock`, prior!) as never);
+  await expect(project(input)).rejects.toThrow(); expect(h!.ledger.submissions).toHaveLength(0);
+});
+async function terminalFixture(rejected = false) {
+  const { input, order } = await fixture(false);
+  const salt = h!.newSalt(), tx = await h!.signedAuthorize({ salt }), payment = await h!.paymentFor(salt);
+  const auth = await partiallySignTransaction([h!.facilitatorKey.keyPair], tx);
+  const events: any[] = [];
+  const add = (signed: typeof auth, unsigned: typeof tx, action: string, operation: string, expectedHeld: string, response: any) => {
+    const signature = getSignatureFromTransaction(signed);
+    input.stores.facilitator.push(member(`${signature}.json`, { signature, messageHash: hash(signed.messageBytes), transactionBase64: encodeTransaction(signed), blockhash: getCompiledTransactionMessageDecoder().decode(signed.messageBytes).lifetimeToken, operation, payment, payer: h!.payer.address, expectedHeld, expectedRefundable: '0', attempts: [{ preparedAt: at, outcome: { result: rejected ? 'finalized-failed' : 'finalized-succeeded', recordedAt: at } }] }));
+    const event = { action, label: 'Retained action', amount: '100', at, status: rejected ? 'rejected' : 'finalized', transaction: signature, transactionBase64: encodeTransaction(unsigned), receipt: { transaction: signature, network: input.network, payer: h!.payer.address, ...response } };
+    events.push(event);
+    input.stores.orders.push(member(`${id}.json.${action}.lock`, { ...event, status: 'prepared', transaction: '', receipt: undefined }));
+  };
+  add(auth, tx, 'authorize', 'authorize', '0', rejected ? { success: false, errorReason: 'invalid_transaction_state' } : { success: true, amount: '100', extensions: { 'auth-capture': { operation: 'authorize', payment, amount: '100', held: '100', refundable: '0' } } });
+  if (!rejected) {
+    const unsigned = await h!.signedVoid(payment, 100n, 0n), signed = await partiallySignTransaction([h!.facilitatorKey.keyPair], unsigned);
+    add(signed, unsigned, 'void', 'void', '100', { success: true, extensions: { 'auth-capture': { operation: 'void', payment, amount: '100', held: '0', refundable: '0' } } });
+  }
+  const retained = { ...order, payment, unsigned: encodeTransaction(tx), status: rejected ? 'rejected' : 'closed', events };
+  input.stores.orders.unshift(member(`${id}.json`, retained));
+  return { input, retained };
+}
+test.each([false, true])('authenticated terminal history retains real finalized/rejected timeline (%s)', async rejected => {
+  const { input } = await terminalFixture(rejected), before = JSON.stringify(input);
+  const p = await project(input);
+  expect(p.orders[0]!.status).toBe(rejected ? 'rejected' : 'closed'); expect(p.original.association).toBeNull();
+  expect(JSON.stringify(input)).toBe(before); expect(h!.ledger.submissions).toHaveLength(0);
+});
+test.each(['amount', 'payment', 'payer', 'network', 'signature', 'held', 'success-error', 'outcome'])('terminal receipt binding rejects %s without effects', async field => {
+  const { input, retained } = await terminalFixture(); const r = retained.events[0].receipt;
+  if (field === 'amount') r.amount = '999';
+  else if (field === 'payment') r.extensions['auth-capture'].payment = h!.payer.address;
+  else if (field === 'payer') r.payer = h!.server.address;
+  else if (field === 'network') r.network = 'solana:other';
+  else if (field === 'signature') r.transaction = input.selected.signature;
+  else if (field === 'held') r.extensions['auth-capture'].held = '999';
+  else if (field === 'success-error') r.errorReason = 'settlement_pending';
+  else { const m = input.stores.facilitator[1]!, j = JSON.parse(Buffer.from(m.rawBase64, 'base64').toString()); j.attempts[0].outcome.result = 'finalized-failed'; input.stores.facilitator[1] = member(m.name, j); }
+  input.stores.orders[0] = member(`${id}.json`, retained);
+  await expect(project(input)).rejects.toThrow(); expect(h!.ledger.submissions).toHaveLength(0);
 });
 test("export only synthetic Linux fixture when requested", async () => {
   const { input } = await fixture(); const p = await project(input);

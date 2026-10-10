@@ -71,13 +71,17 @@ def setup(f):
     prep.CONTROLLER_ROOT = q.BASE / 'controllers' / request['candidate']
     prep.CONTROLLER_ROOT.parent.mkdir()
     shutil.copytree(SOURCE / 'ops', prep.CONTROLLER_ROOT)
+    import deploy_dev
+    deploy_dev.seal(prep.CONTROLLER_ROOT)
     # SYNTHETIC owner disposition is solely a fixture, never repository owner acceptance.
     for sha in (request['candidate'], request['previous']):
         target = q.BASE / 'releases' / sha
         target.parent.mkdir(exist_ok=True)
         shutil.copytree(SOURCE, target)
+        import deploy_dev
+        deploy_dev.seal(target)
         identity = target / 'docs/evidence/sac-007/deployment-identity.v1.json'
-        identity.parent.mkdir(parents=True)
+        identity.parent.mkdir(parents=True, exist_ok=True)
         identity.write_bytes(q.encoded({'record_status': 'verified', 'network': {'caip2': request['public']['network'], 'genesis_hash': request['public']['genesisHash']}, 'program': {'program_id': request['public']['programId']}, 'scope': 'SYNTHETIC_DISPOSABLE_FIXTURE_ONLY'}))
     (q.BASE / 'current').symlink_to(q.BASE / 'releases' / request['previous'])
     for role, directory in zip(q.ROLES, q.STORE_PATHS):
@@ -85,10 +89,17 @@ def setup(f):
         for member in f['input']['stores'][role]:
             q.exclusive(directory / member['name'], base64.b64decode(member['rawBase64']))
     (q.PRIVATE / 'keys').mkdir(mode=0o750)
-    for name in q.SERVICES:
-        p = q.PRIVATE / ('keys/' + name)
+    for name, key_file in zip(q.SERVICES, ('sponsor.json', 'merchant.json')):
+        p = q.PRIVATE / ('keys/' + key_file)
         q.exclusive(p, b'SYNTHETIC_NO_ECONOMIC_AUTHORITY', 0o600)
         u = pwd.getpwnam(name); os.chown(p, u.pw_uid, u.pw_gid)
+    # Real supported env/path semantics; only economic entrypoint bodies are
+    # substituted with a no-network synthetic loaded-key/fork writer below.
+    for role in ('facilitator', 'restaurant'):
+        text = (SOURCE / ('integration/deploy/dev/' + role + '.env.example')).read_text()
+        values = {'SAC006_BEARER_TOKEN': 'synthetic-only', 'SAC006_MERCHANT_TOKEN': 'synthetic-merchant-only', 'SAC006_FEE_PAYER': f['input']['genesisHash'], 'SAC006_ASSET_MINT': f['input']['genesisHash'], 'SAC006_ALLOWLIST_MERCHANT': f['input']['genesisHash'], 'SAC006_ALLOWLIST_MINT': f['input']['genesisHash']}
+        for k,v in values.items(): text = text.replace(k + '=\n', k + '=' + v + '\n')
+        q.exclusive(q.PRIVATE / (role + '.env'), text.replace('https://api.devnet.solana.com', 'http://127.0.0.1:1').replace('@DEV_HOST@', 'synthetic.invalid').encode())
     q.exclusive(q.PRIVATE / 'nginx-routes.conf', b'location / { return 503; }\n')
     Path('/etc/nginx/sites-enabled/default').unlink(missing_ok=True)
     Path('/etc/nginx/sites-enabled/b2-test').write_text('server { listen 127.0.0.1:18057; server_name test.invalid; include /etc/capture402-dev/nginx-routes.conf; }\n')
@@ -101,7 +112,7 @@ def setup(f):
     Path('/etc/tmpfiles.d/capture402-b2-test.conf').write_text(f'd /run/capture402-dev-view 0750 {q.SERVICES[1]} capture402-dev-runtime -\n')
     writer = SOURCE.parent / 'writer.py'
     writer.write_text('''import os,time,pwd
-key=open('/etc/capture402-dev/keys/'+pwd.getpwuid(os.getuid()).pw_name).read()
+key=open(os.environ['SAC006_FACILITATOR_KEYPAIR_PATH'] if 'SAC006_FACILITATOR_KEYPAIR_PATH' in os.environ else os.environ['SAC006_SERVER_KEYPAIR_PATH']).read()
 if os.fork()==0:
  while True:
   if os.path.exists('/tmp/b2-late-result'):
@@ -114,7 +125,8 @@ else:
     os.chmod(q.STATE, 0o755)
     for name in q.SERVICES:
         unit = q.UNITS / (name + '.service')
-        unit.write_text(f'[Unit]\n[Service]\nType=simple\nUser={name}\nGroup=capture402-dev-runtime\nSlice=capture402-dev.slice\nExecStart=/usr/bin/python3 {writer}\nRestart=no\n[Install]\nWantedBy=multi-user.target\n')
+        role = 'facilitator' if name == q.SERVICES[0] else 'restaurant'
+        unit.write_text(f'[Unit]\n[Service]\nType=simple\nUser={name}\nGroup=capture402-dev-runtime\nSlice=capture402-dev.slice\nEnvironmentFile=/etc/capture402-dev/{role}.env\nExecStart=/usr/bin/python3 {writer}\nRestart=no\n[Install]\nWantedBy=multi-user.target\n')
         q.run('systemctl', 'enable', name)
     q.run('systemctl', 'daemon-reload')
     for name in q.SERVICES:
@@ -124,6 +136,20 @@ else:
 
 def campaign(f):
     e = setup(f); host = q.LinuxHost(e)
+    # These idle sources are rejected semantically even before their hash could
+    # be accepted into an enrollment. No timer or credential service is started.
+    delayed = q.UNITS / 'b2-delayed.service'
+    delayed.write_text('[Service]\nUser=' + q.SERVICES[0] + '\nSlice=other.slice\nLoadCredential=key:/etc/capture402-dev/keys/sponsor.json\nExecStart=/usr/bin/sleep 60\n')
+    record('pre-enrolled-idle-timer-credential-source-refused', lambda: failed(lambda: q.activation_inventory(e)))
+    delayed.unlink()
+    inherited = q.UNITS / (q.SERVICES[1] + '.service.d') / '98-inherited.conf'
+    inherited.write_text('[Service]\nOpenFile=/etc/capture402-dev/keys/merchant.json\nLoadCredential=key:/etc/capture402-dev/keys/merchant.json\n')
+    record('inherited-viewer-credential-and-open-FD-source-refused', lambda: failed(lambda: q.activation_inventory(e)))
+    inherited.unlink()
+    env_path = q.PRIVATE / 'facilitator.env'; original_env = env_path.read_bytes()
+    env_path.write_bytes(original_env.replace(b'/var/lib/capture402-dev/facilitator/journal', b'/var/lib/alternate/journal'))
+    record('alternate-economic-store-env-refused', lambda: failed(q.configuration))
+    env_path.write_bytes(original_env)
     projection = prep.offline_projector(e)
     inv, stores = q.inventory()
     record('offline-root-no-network-projector-real-original', lambda: q.require(q.strict_json(projection(stores, inv))['original']['status'] == 'UNKNOWN'))
@@ -152,10 +178,12 @@ def campaign(f):
     Path('/run/capture402-dev-deploy-permit').write_text('a' * 40)
     record('independent-guard-denies-valid-old-permit', lambda: failed(q.ordinary_allowed))
     (q.BASE / 'transaction.json').unlink()
-    record('manual-same-UID-raw-key-and-store-open-refused', lambda: failed(lambda: q.run('runuser', '-u', q.SERVICES[0], '--', 'cat', str(q.PRIVATE / 'keys' / q.SERVICES[0]))))
+    record('manual-same-UID-raw-key-and-store-open-refused', lambda: failed(lambda: q.run('runuser', '-u', q.SERVICES[0], '--', 'cat', str(q.PRIVATE / 'keys/sponsor.json'))))
     record('raw-four-store-member-identities-and-bytes-unchanged', lambda: assert_equal(q.inventory()[0], baseline))
     record('actual-viewer-process-root-network-seccomp-isolation', lambda: isolation_probe(e))
+    q.exclusive(q.VIEW_PERMIT, q.encoded({'syntheticCrashedCaller': True}), 0o600)
     record('controller-recovery-keeps-denial-and-stops-viewer', transition.recover)
+    record('crashed-view-start-lease-retired-after-cessation', lambda: assert_equal(q.exists(q.VIEW_PERMIT), False))
     record('P-code-only-rollback-no-legacy-process', transition.rollback)
     record('rollback-preserves-all-evidence', lambda: assert_equal(q.inventory()[0], baseline))
     # Explicitly select C* after testing inert rollback; no unquarantine or new snapshot.
@@ -173,7 +201,7 @@ def isolation_probe(e):
     shutil.copytree(Path(e['viewerRoot']), probe_root)
     # Node script uses the identical restricted service profile through systemd-run.
     script = '''import fs from 'node:fs'; import net from 'node:net';
-let blocked=0; for(const p of ['/etc/capture402-dev/keys/capture402-dev-restaurant','/var/lib/capture402-dev/facilitator/journal','/proc/1/root/app/auth.json','/etc/capture402-dev-admission/enrollment.json']) { try {fs.readFileSync(p);process.exit(1)}catch{blocked++} }
+let blocked=0; for(const p of ['/etc/capture402-dev/keys/merchant.json','/var/lib/capture402-dev/facilitator/journal','/proc/1/root/app/auth.json','/etc/capture402-dev-admission/enrollment.json']) { try {fs.readFileSync(p);process.exit(1)}catch{blocked++} }
 for(const target of [{host:'127.0.0.1',port:18057},{host:'1.1.1.1',port:443},{path:'/run/dbus/system_bus_socket'},{path:'/run/ingress/view.sock'}]) { await new Promise(resolve=>{const s=net.connect(target);s.on('connect',()=>process.exit(2));s.on('error',()=>{blocked++;resolve()});}); }
 if(blocked!==8)process.exit(3);
 '''
@@ -190,8 +218,10 @@ def after_boot():
     f = q.strict_json(LOG.with_name('fixture-public.json').read_bytes())
     baseline = q.strict_json(LOG.with_name('baseline.json').read_bytes())
     record('REAL-REBOOT-independent-economic-startup-denied', lambda: q.require(q.run('systemctl', 'show', '-p', 'MainPID', '--value', q.SERVICES[0]) == '0'))
-    record('REAL-REBOOT-only-sealed-viewer-serves-retained-UNKNOWN', lambda: assert_equal(http('/api/quarantine/status', token=f['operator'])[0], 200))
+    record('REAL-REBOOT-no-automatic-view-resume-maintenance', lambda: q.require(q.run('systemctl', 'show', '-p', 'MainPID', '--value', q.SERVICES[1]) == '0' and http('/api/config')[0] == 503))
     record('REAL-REBOOT-four-store-membership-identity-bytes-preserved', lambda: assert_equal(q.inventory()[0], baseline))
+    host = q.LinuxHost(q.enrollment()); host.verify(stopped=True); host.start_view(); host.open_view_ingress()
+    record('REAL-REBOOT-explicit-exact-sealed-viewer-start-retains-UNKNOWN', lambda: assert_equal(http('/api/quarantine/status', token=f['operator'])[0], 200))
 
 
 if __name__ == '__main__':
@@ -209,6 +239,7 @@ if __name__ == '__main__':
             shutil.rmtree(p, ignore_errors=True)
         q.GUARD.unlink(missing_ok=True)
         Path('/tmp/b2-late-result').unlink(missing_ok=True)
+        q.VIEW_PERMIT.unlink(missing_ok=True)
         q.run('systemctl', 'daemon-reload')
         for n in ('capture402-dev-setup', *q.SERVICES, 'capture402-deploy'):
             subprocess.run(['userdel', n], capture_output=True)

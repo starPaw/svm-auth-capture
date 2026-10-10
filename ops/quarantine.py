@@ -15,6 +15,7 @@ from pathlib import Path
 import pwd
 import re
 import shutil
+import shlex
 import socket
 import stat
 import subprocess
@@ -28,6 +29,7 @@ STATE = Path('/var/lib/capture402-dev')
 PRIVATE = Path('/etc/capture402-dev')
 CGROUP = Path('/sys/fs/cgroup/capture402.slice/capture402-dev.slice')
 UNITS = Path('/etc/systemd/system')
+VIEW_PERMIT = Path('/run/capture402-dev-view-permit')
 SERVICES = ('capture402-dev-facilitator', 'capture402-dev-restaurant')
 PHASES = ('DENY_INTENT', 'FENCED', 'STOPPED', 'SNAPSHOT_SEALED', 'CODE_SELECTED', 'VIEW_RUNNING')
 ROLES = ('facilitator', 'operations', 'reclaim', 'orders')
@@ -126,6 +128,14 @@ def exists(path):
     return os.path.lexists(path)
 
 
+def caller_identity(pid):
+    require(type(pid) is int and pid > 0)
+    root = Path('/proc') / str(pid)
+    ids = next(s.split()[1:] for s in (root / 'status').read_text().splitlines() if s.startswith('Uid:'))
+    require(all(n == '0' for n in ids))
+    return {'pid': pid, 'startTicks': (root / 'stat').read_text().rsplit(')', 1)[1].split()[19], 'bootId': Path('/proc/sys/kernel/random/boot_id').read_text().strip()}
+
+
 def ordinary_allowed():
     if not exists(ROOT):
         require(not exists(GUARD))
@@ -144,7 +154,7 @@ def enrollment():
     require(e['version'] == 1 and e['ownerDisposition'] == 'ACCEPTED_CONTINUED_OUTAGE_AND_INERT_ROLLBACK')
     require(isinstance(e['uids'], list) and e['uids'] and len(set(e['uids'])) == len(e['uids']) and all(type(n) is int and n > 0 for n in e['uids']))
     require(e['guardSha256'] == digest(read(GUARD, owner=0)[0]))
-    shape(e['tuple'], ('candidate', 'previous', 'controllerRevision', 'controller', 'guard', 'validator', 'codecs', 'dependencies', 'build', 'unit', 'routing', 'projectionRuntime'))
+    shape(e['tuple'], ('candidate', 'previous', 'controllerRevision', 'controller', 'guard', 'validator', 'codecs', 'dependencies', 'build', 'unit', 'routing', 'projectionRuntime', 'configuration'))
     for k, v in e['tuple'].items():
         require(isinstance(v, str) and re.fullmatch(r'[a-f0-9]{40}' if k in ('candidate', 'previous', 'controllerRevision') else r'[a-f0-9]{64}', v))
     require(e['tuple']['guard'] == e['guardSha256'])
@@ -281,6 +291,30 @@ def private_capabilities(uids):
             continue
 
 
+def configuration():
+    import deploy_dev
+    require(tuple(deploy_dev.state_paths()) == STORE_PATHS)
+    shared = {'SOLANA_RPC_URL', 'SAC006_BEARER_TOKEN', 'SAC006_DEPLOYMENT_RECORD_PATH', 'SAC006_HOST'}
+    allowed = [shared | {'SAC006_FACILITATOR_KEYPAIR_PATH', 'SAC006_FACILITATOR_JOURNAL_DIR', 'SAC006_ALLOWLIST_MERCHANT', 'SAC006_ALLOWLIST_MINT', 'SAC006_PORT', 'SAC006_SPONSOR_MAX_ATTEMPTS', 'SAC006_SPONSOR_MIN_LAMPORTS'},
+               shared | {'SAC006_MERCHANT_TOKEN', 'SAC006_FACILITATOR_URL', 'SAC006_FEE_PAYER', 'SAC006_SERVER_KEYPAIR_PATH', 'SAC006_STORE_DIR', 'SAC006_RECLAIM_JOURNAL_DIR', 'SAC006_ASSET_MINT', 'SAC006_PUBLIC_ORIGIN', 'SAC006_RESOURCE_PORT'}]
+    hashes = {}
+    for role, supported, key_name, key_file in zip(('facilitator', 'restaurant'), allowed, ('SAC006_FACILITATOR_KEYPAIR_PATH', 'SAC006_SERVER_KEYPAIR_PATH'), ('sponsor.json', 'merchant.json')):
+        raw, meta = read(PRIVATE / (role + '.env'), owner=0); require(meta['mode'] == 0o600)
+        assignments = {}
+        for line in raw.decode().splitlines():
+            if not line.strip() or line.lstrip().startswith('#'): continue
+            parts = shlex.split(line, comments=True); require(len(parts) == 1 and '=' in parts[0])
+            k, v = parts[0].split('=', 1); require(k in supported and k not in assignments and v); assignments[k] = v
+        require(set(assignments) == supported)
+        require(assignments[key_name] == str(PRIVATE / 'keys' / key_file) and assignments['SAC006_HOST'] == '127.0.0.1' and assignments['SAC006_DEPLOYMENT_RECORD_PATH'] == str(BASE / 'current/docs/evidence/sac-007/deployment-identity.v1.json'))
+        if role == 'restaurant': require(assignments['SAC006_FACILITATOR_URL'] == 'http://127.0.0.1:18887' and assignments['SAC006_RESOURCE_PORT'] == '18888')
+        else: require(assignments['SAC006_PORT'] == '18887')
+        key = PRIVATE / 'keys' / key_file; _, key_meta = read(key)
+        require(key_meta['uid'] == pwd.getpwnam('capture402-dev-' + role).pw_uid and key_meta['mode'] == 0o600)
+        hashes[role] = digest(raw)
+    return digest(encoded(hashes))
+
+
 class LinuxHost:
     def __init__(self, e):
         self.e = e
@@ -297,6 +331,7 @@ class LinuxHost:
         expected_uids = {pwd.getpwnam(n).pw_uid for n in ('capture402-dev-setup', *SERVICES, 'capture402-deploy')}
         require(expected_uids == set(self.e['uids']))
         private_capabilities(set(self.e['uids']))
+        require(configuration() == self.e['tuple']['configuration'])
         processes = uid_processes(self.e['uids'])
         prefix = '/' + str(CGROUP.relative_to('/sys/fs/cgroup'))
         require(all(v == prefix or v.startswith(prefix + '/') for v in processes.values()))
@@ -351,6 +386,12 @@ class LinuxHost:
             time.sleep(.02)
         for n in SERVICES:
             run('systemctl', 'stop', n)
+        # Recovery owns the controller lock. Retire a crashed caller's ephemeral
+        # startup lease only after all enrolled processes have ceased; denial stays.
+        if exists(VIEW_PERMIT):
+            require(VIEW_PERMIT.is_file() and not VIEW_PERMIT.is_symlink() and VIEW_PERMIT.stat().st_uid == 0)
+            VIEW_PERMIT.unlink()
+            fsync_dir(VIEW_PERMIT.parent)
         self.verify(stopped=True)
 
     def stop_view(self):
@@ -413,7 +454,13 @@ class LinuxHost:
             require(stat.S_ISSOCK(sock.lstat().st_mode) and sock.lstat().st_uid == pwd.getpwnam(SERVICES[1]).pw_uid)
             sock.unlink()
         run('systemctl', 'daemon-reload')
-        run('systemctl', 'start', SERVICES[1])
+        require(not exists(VIEW_PERMIT))
+        exclusive(VIEW_PERMIT, encoded({'candidate': self.e['tuple']['candidate'], 'tupleSha256': digest(encoded(self.e['tuple'])), 'caller': caller_identity(os.getpid())}), 0o600)
+        try:
+            run('systemctl', 'start', SERVICES[1])
+        finally:
+            VIEW_PERMIT.unlink()
+            fsync_dir(VIEW_PERMIT.parent)
         require(run('systemctl', 'is-active', SERVICES[1]) == 'active')
         # Type=simple reports active before Node has bound the socket. Open ingress
         # only after the sealed read-only profile answers with its exact identity.
@@ -463,6 +510,29 @@ def activation_inventory(e=None):
                     result[str(p)] = digest(('LINK:' + os.readlink(p)).encode())
                 elif p.is_file():
                     data = read(p, 4 * 1024 * 1024, owner=0, allow_empty=True)[0]
+                    source_text = data.decode('utf-8', errors='replace')
+                    primary = p in {UNITS / (n + '.service') for n in SERVICES}
+                    approved_dropin = p.parent in {UNITS / (n + '.service.d') for n in SERVICES} and p.name in ('10-deploy-gate.conf', '95-independent-admission.conf', '99-quarantine.conf')
+                    ingress_tmpfiles = p.parent == Path('/etc/tmpfiles.d') and re.fullmatch(r'd /run/capture402-dev-view 0750 capture402-dev-restaurant capture402-dev-runtime -\n', source_text)
+                    if p.is_relative_to('/etc/nginx'):
+                        # The only private dev reference admitted in an ingress
+                        # server is the pinned routing include, never a key/env.
+                        source_text = source_text.replace('include /etc/capture402-dev/nginx-routes.conf;', '')
+                    if primary or approved_dropin:
+                        if approved_dropin and p.name == '99-quarantine.conf':
+                            require(e and data == viewer_unit(e).encode())
+                            continue
+                        # These are the only supported capable launch sources.
+                        # Descriptor/credential/namespace inheritance is unsupported.
+                        require(not re.search(r'^\s*(?:LoadCredential(?:Encrypted)?|SetCredential(?:Encrypted)?|ImportCredential|OpenFile|Sockets|NetworkNamespacePath|JoinsNamespaceOf|PAMName)\s*=', source_text, re.M))
+                        if p.name != '99-quarantine.conf':
+                            require(not re.search(r'^\s*(?:ExecStartPre|ExecStartPost|ExecStopPost|ExecReload|RootDirectory|RootImage|BindPaths|BindReadOnlyPaths|MountImages|ExtensionImages|ExtensionDirectories)\s*=', source_text, re.M))
+                    elif not ingress_tmpfiles:
+                        # Hashing an idle timer/cron/credential unit is not fencing.
+                        # Refuse every additional source referring to dev capabilities,
+                        # including numeric enrolled UIDs and root launch wrappers.
+                        require(not re.search(r'capture402-dev-|capture402-deploy|/etc/capture402-dev(?:/|\s)|/var/lib/capture402-dev(?:/|\s)|/opt/capture402-dev(?:/|\s)|capture402\s+dev', source_text))
+                        if e: require(not re.search(r'^\s*User\s*=\s*(?:' + '|'.join(map(str, e['uids'])) + r')\s*$', source_text, re.M))
                     if e and p.parent == Path('/run/systemd/transient') and re.fullmatch(r'session-[0-9]+\.scope', p.name):
                         # Logind scopes have volatile IDs on every SSH login/boot.
                         # They cannot be economic launch sources: no enrolled UID
@@ -489,6 +559,7 @@ BindsTo=
 PartOf=
 After=
 ConditionPathExists=
+JoinsNamespaceOf=
 [Service]
 ExecStart=
 ExecStartPre=
@@ -506,6 +577,25 @@ ReadOnlyPaths=
 InaccessiblePaths=
 BindPaths=
 BindReadOnlyPaths=
+LoadCredential=
+LoadCredentialEncrypted=
+SetCredential=
+SetCredentialEncrypted=
+ImportCredential=
+OpenFile=
+Sockets=
+NetworkNamespacePath=
+PAMName=
+RootImage=
+MountImages=
+ExtensionImages=
+ExtensionDirectories=
+TemporaryFileSystem=
+RuntimeDirectory=
+StateDirectory=
+CacheDirectory=
+LogsDirectory=
+ConfigurationDirectory=
 User=capture402-dev-restaurant
 Group=capture402-dev-runtime
 SupplementaryGroups=
@@ -627,6 +717,8 @@ class Transition:
 def viewer_allowed():
     require(exists(ROOT / 'ECONOMICS_DENIED'))
     e = enrollment()
+    permit = strict_json(read(VIEW_PERMIT, owner=0)[0]); shape(permit, ('candidate', 'tupleSha256', 'caller'))
+    require(permit == {'candidate': e['tuple']['candidate'], 'tupleSha256': digest(encoded(e['tuple'])), 'caller': caller_identity(permit['caller']['pid'])} and stat.S_IMODE(VIEW_PERMIT.stat().st_mode) == 0o600)
     h = journal_phase(ROOT)
     require(len(h) >= 5 and h[4]['attestation'] == {'sha': e['tuple']['candidate']})
     require((BASE / 'current').is_symlink() and (BASE / 'current').resolve() == BASE / 'releases' / e['tuple']['candidate'])
@@ -684,6 +776,8 @@ if __name__ == '__main__':
         if sys.argv[1:] == ['economic']:
             ordinary_allowed()
         elif sys.argv[1:] == ['viewer']:
+            if not exists(VIEW_PERMIT) and not exists(BASE / 'read-only-maintenance'):
+                exclusive(BASE / 'read-only-maintenance', b'EXPLICIT_VIEW_START_REQUIRED\n')
             viewer_allowed()
         else:
             require(False)

@@ -95,6 +95,7 @@ def prepare(request):
         codecs=q.digest(q.read(projector / 'app/program.ts', owner=0)[0]),
         dependencies=q.digest(q.read(release / 'integration/package-lock.json', owner=0)[0]),
         build=q.digest(q.encoded(inv)), unit='0' * 64, routing='0' * 64,
+        configuration=q.configuration(),
         projectionRuntime=q.digest(q.encoded(q.tree(projector))))
     e['tuple']['unit'] = q.digest(q.viewer_unit(e).encode())
     # Ingress config uses only an exact route/method allowlist, and the private socket.
@@ -194,6 +195,13 @@ def control(argv):
         import host_cli, release_policy, deploy_dev
         accepted = release_policy.verify_dev(request['candidate'], host_cli.GitHub())
         release_policy.verify_dev(CONTROLLER_ROOT.name, host_cli.GitHub())
+        deploy_dev.units()
+        q.configuration()
+        for name, entry in zip(q.SERVICES, ('devnet-server.ts', 'restaurant-server.ts')):
+            command = q.run('systemctl', 'show', '-p', 'ExecStart', '--value', name)
+            q.require(command.count('path=') == 1 and 'path=/usr/bin/env ; argv[]=/usr/bin/env node --experimental-strip-types src/' + entry + ' ;' in command)
+            q.require(q.run('systemctl', 'show', '-p', 'EnvironmentFiles', '--value', name) == str(q.PRIVATE / (('facilitator' if name == q.SERVICES[0] else 'restaurant') + '.env')) + ' (ignore_errors=no)')
+            q.require(q.run('systemctl', 'show', '-p', 'Environment', '--value', name) == 'PATH=/usr/local/bin:/usr/bin:/bin')
         deploy_dev.stage(request['candidate'], accepted, host_cli.GitHub())
         bootstrap(request)
         return {'mode': 'A', 'enrollment': 'verified', 'economicsException': False}
@@ -237,7 +245,6 @@ def control(argv):
                 host.fence()
                 host.stop()
                 host.verify(stopped=True)
-                q.viewer_allowed()
                 host.start_view()
                 host.open_view_ingress()
                 result = {'mode': 'READ_ONLY_QUARANTINE', 'viewerSha': e['tuple']['candidate'], 'economics': 'DENIED'}

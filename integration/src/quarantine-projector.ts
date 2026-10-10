@@ -71,8 +71,8 @@ async function bind(w: Wire, e: any, program: string) {
   const auth = w.op.op === "authorize", reclaim = w.op.op === "reclaim";
   const a = (ix.accountIndices ?? []).map(n => keys[n]!);
   check(w.op.op === e.operation && w.payment === e.payment && (w.payer === undefined || w.payer === e.payer));
-  const server = a[auth ? 1 : reclaim ? 2 : 0]!, mint = a[auth ? 3 : reclaim ? 3 : 2]!;
-  check(server !== e.payer);
+  const server = reclaim ? e.payer : a[auth ? 1 : 0]!, mint = a[auth ? 3 : 2]!;
+  check(reclaim || server !== e.payer);
   const common = { payer: e.payer as kit.Address, server, payment: e.payment as kit.Address, mint,
     source: await abi.ata(e.payer, mint), payerAta: await abi.ata(e.payer, mint),
     vault: await abi.ata(e.payment, mint), serverAta: await abi.ata(server, mint), funder: keys[0]! };
@@ -80,7 +80,7 @@ async function bind(w: Wire, e: any, program: string) {
   check((ix.accountIndices ?? []).length === slots.length && (ix.accountIndices ?? []).every((n, i) => {
     const s = slots[i]!, signer = n < h.numSignerAccounts;
     const writable = signer ? n < h.numSignerAccounts - h.numReadonlySignerAccounts : n < keys.length - h.numReadonlyNonSignerAccounts;
-    return keys[n] === s.address && signer === s.signer && writable === s.writable;
+    return keys[n] === s.address && signer === (s.signer || n === 0) && writable === (s.writable || n === 0);
   }));
   if (auth) check(e.expectedHeld === "0" && e.expectedRefundable === "0");
   else if (w.op.op !== "reclaim" && w.op.op !== "authorize") check(e.expectedHeld === w.op.expectedHeld.toString() && e.expectedRefundable === w.op.expectedRefundable.toString());
@@ -88,6 +88,7 @@ async function bind(w: Wire, e: any, program: string) {
 function receipt(r: any, network: string) {
   object(r, ["success", "transaction", "network"], ["errorReason", "payer", "amount", "extensions"]);
   check(typeof r.success === "boolean" && r.network === network); if (r.transaction !== "") base58(r.transaction, true);
+  check(!r.success || r.errorReason === undefined);
   if (r.errorReason !== undefined) text(r.errorReason); if (r.payer !== undefined) base58(r.payer); if (r.amount !== undefined) decimal(r.amount);
   if (r.extensions !== undefined) {
     object(r.extensions, ["auth-capture"]); const x = r.extensions["auth-capture"];
@@ -95,6 +96,21 @@ function receipt(r: any, network: string) {
     check(["authorize", "capture", "void", "refund"].includes(x.operation)); base58(x.payment); [x.amount, x.held, x.refundable].forEach(decimal);
     if (x.releaseRemainder !== undefined) check(typeof x.releaseRemainder === "boolean"); if (x.released !== undefined) decimal(x.released);
   }
+}
+function amount(w: Wire): string | undefined {
+  const o = w.op; return o.op === "authorize" ? o.maximum.toString() : o.op === "void" ? o.expectedHeld.toString() : o.op === "capture" || o.op === "refund" ? o.amount.toString() : undefined;
+}
+function boundReceipt(r: any, w: Wire, network: string, payer: string, signature: string) {
+  receipt(r, network); check(r.transaction === signature && (r.payer === undefined || r.payer === payer));
+  if (r.amount !== undefined) check(w.op.op !== "void" && r.amount === amount(w));
+  if (!r.success) { check(r.extensions === undefined && r.amount === undefined); return; }
+  if (w.op.op === "reclaim") { check(r.extensions === undefined); return; }
+  check(r.extensions); const x = r.extensions["auth-capture"], o = w.op;
+  check(x.operation === o.op && x.payment === w.payment && x.amount === amount(w));
+  if (o.op === "authorize") check(x.held === o.maximum.toString() && x.refundable === "0" && x.releaseRemainder === undefined && x.released === undefined);
+  else if (o.op === "capture") check(o.amount <= o.expectedHeld && x.releaseRemainder === o.releaseRemainder && x.held === (o.releaseRemainder ? 0n : o.expectedHeld - o.amount).toString() && x.refundable === (o.expectedRefundable + o.amount).toString() && (o.releaseRemainder ? x.released === (o.expectedHeld - o.amount).toString() : x.released === undefined));
+  else if (o.op === "refund") check(o.amount <= o.expectedRefundable && x.held === o.expectedHeld.toString() && x.refundable === (o.expectedRefundable - o.amount).toString() && x.releaseRemainder === undefined && x.released === undefined);
+  else check(x.held === "0" && x.refundable === o.expectedRefundable.toString() && x.releaseRemainder === undefined && x.released === undefined);
 }
 export async function project(input: unknown) {
   object(input, ["stores", "selected", "network", "genesisHash", "programId", "viewerSha", "inventorySha256", "tupleSha256", "snapshotAt"]);
@@ -141,6 +157,16 @@ export async function project(input: unknown) {
   const selected = journals.get(input.selected.signature); check(selected);
   check(hash(selected.raw) === input.selected.journalSha256 && selected.entry.messageHash === input.selected.messageHash && hash(canonical(selected.entry.transactionBase64, 1232)) === input.selected.wireSha256);
   const original = selected.entry;
+  const validateReceipt = (r: any, w: Wire, payer: string, signature: string) => {
+    boundReceipt(r, w, network, payer, signature);
+    const j = signature ? journals.get(signature) : [...journals.values()].find(j => j.entry.messageHash === hash(w.tx.messageBytes));
+    if (!j) { check(!r.success && signature === ""); return; }
+    const outcome = j.entry.attempts.at(-1).outcome?.result;
+    if (r.success) check(outcome === "finalized-succeeded" && signature === j.entry.signature);
+    else if (outcome === "not-submitted") check(signature === "" && r.errorReason === "settlement_not_submitted");
+    else if (outcome === "finalized-failed") check(signature === j.entry.signature && r.errorReason === "invalid_transaction_state");
+    else check(signature === j.entry.signature && r.errorReason === "settlement_pending");
+  };
   // Validate reclaim reservations in BOTH directions, including every successor.
   const reached = new Set<string>();
   for (const [name, { value: sig }] of stores.reclaim!) if (/^reclaim-[^-]+\.lock$/.test(name)) {
@@ -157,7 +183,11 @@ export async function project(input: unknown) {
     }
   }
   for (const [sig, v] of journals) if (v.role === "reclaim") check(reached.has(sig));
-  for (const [name, v] of stores.reclaim!) if (name.endsWith(".lock")) check(reached.has(v.value) && journals.get(v.value)?.entry.payment === name.slice(8).split("-after-")[0]!.replace(/\.lock$/, ""));
+  for (const [name, v] of stores.reclaim!) if (name.endsWith(".lock")) {
+    const [payment, predecessor] = name.slice(8, -5).split("-after-");
+    check(reached.has(v.value) && journals.get(v.value)?.entry.payment === payment && journals.get(v.value)?.entry.retryAfter === predecessor);
+    if (predecessor) check(reached.has(predecessor) && journals.get(predecessor)?.entry.payment === payment);
+  }
   // Every operation is either terminal or directly authenticated to the one original.
   for (const [name, { value: r }] of stores.operations!) {
     check(name.endsWith(".json")); object(r, ["fingerprint", "caller", "resource", "createdAt", "updatedAt", "status"], ["authorize", "authorizeReceipt", "handlerResult", "terminal", "terminalReceipt", "note"]);
@@ -168,15 +198,16 @@ export async function project(input: unknown) {
       object(a, ["transactionBase64", "signature", "blockhash", "payment", "expectedHeld", "expectedRefundable", ...(terminalOp ? ["op"] : [])], ["lastValidBlockHeight", "lifetimeObservation"]);
       if (a.signature !== "") base58(a.signature, true); base58(a.blockhash); base58(a.payment); decimal(a.expectedHeld); decimal(a.expectedRefundable);
       const w = await wire(a.transactionBase64, program, false); await bind(w, { ...a, payer: r.caller, operation: terminalOp ? a.op : "authorize" }, program); check(w.message.lifetimeToken === a.blockhash);
+      if (a.signature !== "") { const j = journals.get(a.signature); check(j && j.entry.messageHash === hash(w.tx.messageBytes) && j.entry.payer === r.caller && j.entry.payment === a.payment); }
       if (a.lastValidBlockHeight !== undefined) decimal(a.lastValidBlockHeight); if (a.lifetimeObservation !== undefined) observation(a.lifetimeObservation, w, network);
       return w;
     };
     const w = await validatePre(a); check(w.op.op === "authorize");
     check(hash(Buffer.concat([Buffer.from(r.caller), Buffer.from([0]), Buffer.from(r.resource), Buffer.from([0]), Buffer.from(w.op.salt)])) === r.fingerprint);
     if (r.status === "authorizing" || r.status === "authorize-pending") check(hash(w.tx.messageBytes) === original.messageHash && a.payment === original.payment && r.caller === original.payer && (a.signature === original.signature || r.status === "authorizing" && a.signature === "") && r.terminal === undefined && r.handlerResult === undefined);
-    if (r.authorizeReceipt !== undefined) { receipt(r.authorizeReceipt, network); check(r.authorizeReceipt.transaction === a.signature); }
-    if (r.terminal !== undefined) { check(["capture", "void"].includes(r.terminal.op)); await validatePre(r.terminal, true); }
-    if (r.terminalReceipt !== undefined) { receipt(r.terminalReceipt, network); check(r.terminal && r.terminalReceipt.transaction === r.terminal.signature); }
+    if (r.authorizeReceipt !== undefined) validateReceipt(r.authorizeReceipt, w, r.caller, a.signature);
+    if (r.terminal !== undefined) { check(["capture", "void"].includes(r.terminal.op)); const tw = await validatePre(r.terminal, true); check(tw.payment === w.payment); if (r.terminalReceipt !== undefined) validateReceipt(r.terminalReceipt, tw, r.caller, r.terminal.signature); }
+    check(r.terminalReceipt === undefined || r.terminal);
     if (r.handlerResult !== undefined) { object(r.handlerResult, ["ok"], ["detail", "amount", "releaseRemainder"]); check(typeof r.handlerResult.ok === "boolean"); if (r.handlerResult.detail !== undefined) text(r.handlerResult.detail, 4096); if (r.handlerResult.amount !== undefined) decimal(r.handlerResult.amount); if (r.handlerResult.releaseRemainder !== undefined) check(typeof r.handlerResult.releaseRemainder === "boolean"); }
     if (r.note !== undefined) text(r.note, 4096);
     if (r.status === "completed") check(r.authorizeReceipt?.success === true && r.terminalReceipt?.success === true && r.handlerResult);
@@ -209,11 +240,16 @@ export async function project(input: unknown) {
         expectedRefundable: w.op.op === "authorize" || w.op.op === "reclaim" ? "0" : w.op.expectedRefundable.toString() }, program);
       if (e.action === "authorize") check(Buffer.from(w.tx.messageBytes).equals(Buffer.from(unsigned.tx.messageBytes)) && e.amount === terms.amount);
       if (e.receipt) check(e.receipt.success === (e.status === "finalized") && (e.status !== "pending" || e.receipt.errorReason === "settlement_pending"));
-      if (e.status === "finalized") {
-        const j = journals.get(e.transaction); check(e.receipt && j && j.entry.messageHash === hash(w.tx.messageBytes) && j.entry.payer === r.payer && j.entry.payment === r.payment && j.entry.attempts.at(-1).outcome?.result === "finalized-succeeded");
+      if (["finalized", "rejected"].includes(e.status)) {
+        check(e.receipt && hash(w.tx.messageBytes) !== original.messageHash);
+        if (e.transaction !== "") {
+          const j = journals.get(e.transaction); check(j && j.entry.messageHash === hash(w.tx.messageBytes) && j.entry.payer === r.payer && j.entry.payment === r.payment && (e.status === "finalized" ? j.entry.attempts.at(-1).outcome?.result === "finalized-succeeded" : ["not-submitted", "finalized-failed"].includes(j.entry.attempts.at(-1).outcome?.result)));
+        } else check(e.status === "rejected" && e.receipt.success === false);
       }
       if (e.lifetimeObservation !== undefined) observation(e.lifetimeObservation, w, network);
-      if (e.receipt !== undefined) { receipt(e.receipt, network); check(e.receipt.transaction === e.transaction); }
+      if (e.receipt !== undefined) validateReceipt(e.receipt, w, r.payer, e.transaction);
+      if (w.op.op !== "reclaim") check(e.amount === amount(w));
+      else { const j = journals.get(e.transaction); check(j && e.amount === j.entry.expectedHeld); }
       if (["pending", "prepared"].includes(e.status)) {
         check(hash(w.tx.messageBytes) === original.messageHash && (e.transaction === original.signature || e.status === "prepared" && e.transaction === "") && r.payer === original.payer && r.payment === original.payment && r.status === "pending");
         check(association === null || association === r.id); association = r.id;
@@ -228,7 +264,11 @@ export async function project(input: unknown) {
       events.push({ action: e.action, amount: e.amount, at: e.at, status: e.status, signature: e.transaction });
     }
     check(r.status !== "pending" || association === r.id); check(r.status !== "draft" || r.events.length === 0);
+    if (r.status === "active" || r.status === "closed") check(r.events.some((e: any) => e.action === "authorize" && e.status === "finalized"));
+    if (r.status === "closed") check(r.events.some((e: any) => ["finish", "void", "reclaim"].includes(e.action) && e.status === "finalized"));
+    if (r.status === "rejected") check(r.events.length === 1 && r.events[0].action === "authorize" && r.events[0].status === "rejected");
     const busy = stores.orders!.get(`${r.id}.json.busy`);
+    check(association !== r.id || busy);
     if (busy) { check(association === r.id && r.events.some((e: any) => e.action === busy.value && ["prepared", "pending"].includes(e.status))); usedLocks.add(`${r.id}.json.busy`); }
     if (r.reclaimUnsigned !== undefined) { const w = await wire(r.reclaimUnsigned, program, false); check(w.op.op === "reclaim" && w.payment === r.payment && w.payer === r.payer); }
     if (r.reclaimLifetime !== undefined) { const l = r.reclaimLifetime; object(l, ["blockhash", "lastValidBlockHeight"], ["blockhashSlot"]); base58(l.blockhash); decimal(l.lastValidBlockHeight); if (l.blockhashSlot !== undefined) decimal(l.blockhashSlot); check(r.reclaimUnsigned !== undefined && (await wire(r.reclaimUnsigned, program, false)).message.lifetimeToken === l.blockhash); }
