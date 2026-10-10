@@ -22,6 +22,8 @@ import time
 import urllib.request
 import uuid
 
+import quarantine
+
 import deploy_demo as source
 import deploy_vps as host
 import release_policy as policy
@@ -61,9 +63,9 @@ ATTEMPT_RE = re.compile(r'[0-9]{20}-[a-f0-9]{32}')
 PHASES = {'allocated', 'launch', 'lock', 'recovery', 'current', 'units', 'health',
           'production', 'payment', 'private', 'rpc', 'release', 'staging', 'assets',
           'acceptance', 'gate', 'freeze', 'stop', 'switch', 'start',
-          'rollback', 'complete'}
+          'rollback', 'complete', 'quarantine'}
 OUTCOMES = {'INCOMPLETE', 'FAILED', 'DEPLOYED', 'ALREADY_CURRENT', 'ROLLED_BACK',
-            'ROLLBACK_UNVERIFIED', 'RECOVERED', 'INTERRUPTED_UNKNOWN'}
+            'ROLLBACK_UNVERIFIED', 'RECOVERED', 'INTERRUPTED_UNKNOWN', 'QUARANTINED'}
 GATES = {phase: phase.upper() for phase in PHASES}
 GATES['payment'] = 'PAYMENT_JOURNALS'
 GATE_LABELS = {'PAYMENT_JOURNALS': 'Payment journals'}
@@ -375,6 +377,7 @@ def freeze():
 
 
 def thaw():
+    quarantine.ordinary_allowed()
     for name in SERVICES:
         source.run('systemctl', 'thaw', name)
 
@@ -658,6 +661,7 @@ def stage(sha, acceptance, api):
 
 
 def install_gate():
+    quarantine.ordinary_allowed()
     for name in SERVICES:
         directory = UNITS / (name + '.service.d')
         if not directory.exists():
@@ -674,6 +678,7 @@ def install_gate():
 
 
 def gate():
+    quarantine.ordinary_allowed()
     if not PENDING.exists():
         return
     trusted(PERMIT)
@@ -681,6 +686,7 @@ def gate():
 
 
 def start(sha):
+    quarantine.ordinary_allowed()
     host.atomic_bytes(PERMIT, sha.encode(), 0o600)
     try:
         for name in SERVICES:
@@ -710,6 +716,7 @@ def locked():
 
 
 def rollback(record):
+    quarantine.ordinary_allowed()
     # A newly running candidate may have accepted a payment. Never interrupt it
     # on a blind rollback; retain the transaction and require original reconciliation.
     running = [name for name in SERVICES if source.run('systemctl', 'show', '-p', 'MainPID', '--value', name) != '0']
@@ -732,6 +739,7 @@ def rollback(record):
 
 
 def _recover():
+    quarantine.ordinary_allowed()
     if not PENDING.exists():
         return False
     trusted(PENDING)
@@ -776,6 +784,7 @@ def recover():
 
 
 def deploy(sha, api, attempt=None):
+    quarantine.ordinary_allowed()
     attempt = attempt or Attempt.create(sha)
     try:
         application = safe_current()
@@ -1024,6 +1033,7 @@ def _validate_original_wire(entry, signature):
 
 
 def reconcile_original(signature, record=False):
+    quarantine.ordinary_allowed()
     # Reconciliation can only make a sidecar if the original *signed bytes*
     # are bound to an actually finalized transaction on the pinned network.
     # Missing history, an invalid blockhash and an absent PDA do NOT qualify.
@@ -1092,6 +1102,7 @@ def reconcile_original(signature, record=False):
 
 
 def doctor():
+    quarantine.ordinary_allowed()
     print('DEV DEPLOY DIAGNOSTICS (read-only)')
     try:
         print('Current:', current())
@@ -1201,6 +1212,7 @@ def retain_diagnostic(report):
 
 
 def inspect_tx(signature):
+    quarantine.ordinary_allowed()
     source.require(bool(re.fullmatch(r'[1-9A-HJ-NP-Za-km-z]{80,90}', signature)), 'invalid signature format')
     journal = state_paths()[0]
     source.require(journal.is_dir() and not journal.is_symlink(), 'invalid journal directory')
@@ -1305,6 +1317,8 @@ class OperationBlocked(RuntimeError):
 
 
 def dispatch(argv):
+    if not (argv and argv[0] == 'quarantine') and argv != ['status']:
+        quarantine.ordinary_allowed()
     source.require(os.geteuid() == 0, 'dev deployment requires authorized local sudo')
     if len(argv) == 2 and argv[0] == 'deploy' and source.SHA_RE.fullmatch(argv[1]):
         attempt = None
@@ -1356,6 +1370,10 @@ def dispatch(argv):
 
 def main(argv):
     source.require(os.geteuid() == 0, 'dev deployment requires authorized local sudo')
+    if argv and argv[0] == 'quarantine':
+        import quarantine_prepare
+        print(json.dumps(quarantine_prepare.control(argv[1:])))
+        return
     if argv == ['gate']:
         gate()
         return

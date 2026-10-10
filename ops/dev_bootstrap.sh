@@ -5,6 +5,10 @@ set -euo pipefail
 umask 077
 test "$(id -u)" = 0 || { printf 'Run as the authorized VPS operator.\n' >&2; exit 2; }
 test "$#" = 2 || { printf 'Usage: dev_bootstrap.sh <app-sha> <tools-sha>\n' >&2; exit 2; }
+# Independent enrollment cannot be erased by bootstrap/controller downgrade.
+if test -e /etc/capture402-dev-admission || test -L /etc/capture402-dev-admission || test -e /usr/local/libexec/capture402-dev-admission.py; then
+  /usr/bin/python3 -I -B /usr/local/libexec/capture402-dev-admission.py economic
+fi
 app_sha=$1
 tools_sha=$2
 [[ $app_sha =~ ^[a-f0-9]{40}$ && $tools_sha =~ ^[a-f0-9]{40}$ ]] || exit 2
