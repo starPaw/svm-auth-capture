@@ -310,6 +310,10 @@ if __name__ == '__main__':
         q.require(not Path('/etc/sac006').exists() and not Path('/var/lib/sac006').exists())
         if (q.CGROUP / 'cgroup.kill').exists():
             (q.CGROUP / 'cgroup.kill').write_text('1')
+            # Explicit teardown of this marked disposable fixture only. A prior
+            # campaign leaves the economic slice frozen; a fresh fixture must not
+            # mistake blocked root pre-exec children for running key holders.
+            (q.CGROUP / 'cgroup.freeze').write_text('0')
         for n in q.SERVICES:
             subprocess.run(['systemctl', 'stop', n], capture_output=True)
             subprocess.run(['systemctl', 'disable', n], capture_output=True)
