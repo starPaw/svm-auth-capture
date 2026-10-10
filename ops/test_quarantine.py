@@ -3,6 +3,7 @@
 Ownership is deliberately real; non-root skips are NOT acceptance evidence.
 """
 import json
+import copy
 import os
 from pathlib import Path
 import tempfile
@@ -36,6 +37,54 @@ class FakeHost:
 
     def prepare_projection(self, raw):
         q.exclusive(Path(self.e['viewerRoot']) / 'projection.json', raw, 0o400)
+
+
+class ProjectionAdmissionTests(unittest.TestCase):
+    """Portable controller ordering tests; real schema/crypto cases live in integration."""
+    def test_projection_refusal_before_intent_has_no_writes_or_host_effects(self):
+        inv, stores = {'original': {'sha256': 'a' * 64}}, {'facilitator': ['retained-bytes']}
+        before = copy.deepcopy((inv, stores))
+        host = FakeHost({})
+        with patch.object(q, 'inventory', return_value=(inv, stores)), \
+                patch.object(q, 'exclusive') as write, \
+                patch.object(q, 'journal_phase', return_value=[]) as phases:
+            def refuse(actual_stores, actual_inv):
+                self.assertEqual((actual_inv, actual_stores), before)
+                write.assert_not_called()
+                raise RuntimeError('PROJECTION_REFUSED')
+            with self.assertRaisesRegex(RuntimeError, 'PROJECTION_REFUSED'):
+                q.Transition(Path('/unused-admission'), host, {}, refuse).enter()
+            write.assert_not_called()
+            phases.assert_not_called()
+        self.assertEqual(host.calls, [('verify', False)])
+        self.assertEqual((inv, stores), before)
+
+    def test_fenced_inventory_is_reauthenticated_before_projection_or_code_write(self):
+        initial = ({'original': {'sha256': 'a' * 64}}, {'facilitator': ['initial-bytes']})
+        fenced = ({'original': {'sha256': 'b' * 64}}, {'facilitator': ['fenced-bytes']})
+        before = copy.deepcopy((initial, fenced))
+        root = Path('/unused-admission')
+        e = {'guardSha256': 'e' * 64, 'tuple': {'candidate': 'c' * 40}}
+        host, projections = FakeHost(e), []
+        with patch.object(q, 'inventory', side_effect=[initial, fenced, fenced, fenced]), \
+                patch.object(q, 'exclusive') as write, \
+                patch.object(q, 'journal_phase', return_value=[]), \
+                patch.object(q, 'exists', return_value=False):
+            def project(stores, inv):
+                projections.append(copy.deepcopy((inv, stores)))
+                if len(projections) == 1:
+                    write.assert_not_called()
+                    return b'authenticated initial projection'
+                self.assertIn(('verify', True), host.calls)
+                self.assertEqual((inv, stores), fenced)
+                raise RuntimeError('PROJECTION_REFUSED')
+            with self.assertRaisesRegex(RuntimeError, 'PROJECTION_REFUSED'):
+                q.Transition(root, host, e, project).enter()
+            self.assertEqual([c.args[0].name for c in write.call_args_list],
+                             ['ECONOMICS_DENIED', '0-DENY_INTENT.json', '1-FENCED.json', '2-STOPPED.json'])
+        self.assertEqual(projections, [initial, fenced])
+        self.assertEqual(host.calls, [('verify', False), ('close',), ('fence',), ('stop',), ('verify', True)])
+        self.assertEqual((initial, fenced), before)
 
 
 @unittest.skipUnless(os.geteuid() == 0 and __import__('sys').platform == 'linux', 'NOT RUN: disposable Linux root required')

@@ -144,7 +144,8 @@ export async function project(input: unknown) {
       if (a.outcome !== undefined) { object(a.outcome, ["result", "recordedAt"], ["detail"]); check([...terminal, "unresolved", "submit-threw"].includes(a.outcome.result)); timestamp(a.outcome.recordedAt); if (a.outcome.detail !== undefined) text(a.outcome.detail, 4096); }
     }
     if (e.signature !== input.selected.signature) check(e.attempts.every((a: any) => terminal.has(a.outcome?.result)));
-    else check(role === "facilitator" && !terminal.has(e.attempts.at(-1).outcome?.result) && !e.attempts.some((a: any) => a.outcome?.result === "finalized-succeeded"));
+    // #57 permits only the selected historical UNKNOWN AUTHORIZE, not other operations.
+    else check(role === "facilitator" && e.operation === "authorize" && !terminal.has(e.attempts.at(-1).outcome?.result) && !e.attempts.some((a: any) => a.outcome?.result === "finalized-succeeded"));
     if (e.lifetimeProvenance !== undefined) provenance(e.lifetimeProvenance, w, network, genesis);
     for (const k of ["blockhashSlot", "lastValidBlockHeight"]) if (e[k] !== undefined) decimal(e[k]);
     if (e.retryAfter !== undefined) base58(e.retryAfter, true);

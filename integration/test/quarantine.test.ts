@@ -1,13 +1,19 @@
 // Synthetic original + real accepted codecs. All post-projection effects are trapped.
 import { afterEach, expect, test, vi } from "vitest";
 import { readFileSync, writeFileSync } from "node:fs";
+import * as fs from "node:fs";
+import * as fsPromises from "node:fs/promises";
+import * as kit from "@solana/kit";
 import { getSignatureFromTransaction, partiallySignTransaction, getCompiledTransactionMessageDecoder, type Blockhash } from "@solana/kit";
 import { encodeTransaction, buildTransaction, reclaimInstruction } from "../src/transactions.js";
 import { hash, createQuarantineView, ASSETS, strictJson } from "../src/quarantine-view.js";
 import { project } from "../src/quarantine-projector.js";
 import { createHarness, type Harness } from "./fixture.js";
+vi.mock("@solana/kit", { spy: true });
+vi.mock("node:fs", { spy: true });
+vi.mock("node:fs/promises", { spy: true });
 let h: Harness | undefined;
-afterEach(async () => { await h?.close(); vi.restoreAllMocks(); });
+afterEach(async () => { await h?.close(); vi.resetAllMocks(); vi.restoreAllMocks(); });
 const sha = process.env.B2_SOURCE_SHA ?? "c".repeat(40), id = "a".repeat(32), cookie = `${id}.${"b".repeat(64)}`;
 const merchant = "synthetic-merchant-credential-00000001", operator = "synthetic-operator-credential-00000001";
 const at = "2026-10-10T09:00:00.000Z";
@@ -29,6 +35,53 @@ async function fixture(associated = true, provenance = false) {
   const j = member(`${signature}.json`, journal);
   return { input: { stores: { facilitator: [j], operations: [], reclaim: [], orders: associated ? [member(`${id}.json`, order), member(`${id}.json.authorize.lock`, { ...event, status: "prepared", transaction: "" }), member(`${id}.json.busy`, "authorize")] : [] }, selected: { signature, messageHash: journal.messageHash, wireSha256: hash(Buffer.from(wire, "base64")), journalSha256: hash(Buffer.from(j.rawBase64, "base64")) }, network: h.ledger.network, genesisHash: h.payer.address, programId: h.facilitator.programId, viewerSha: sha, inventorySha256: "d".repeat(64), tupleSha256: "e".repeat(64), snapshotAt: at }, journal, order };
 }
+async function operationJournal(operation: "authorize" | "capture" | "void" | "refund" | "reclaim") {
+  const salt = h!.newSalt(), payment = await h!.paymentFor(salt);
+  const tx = operation === "authorize" ? await h!.signedAuthorize({ salt })
+    : operation === "capture" ? await h!.signedCapture(payment, 25n, false, 100n, 0n)
+    : operation === "void" ? await h!.signedVoid(payment, 100n, 0n)
+    : operation === "refund" ? await h!.signedRefund(payment, 25n, 0n, 100n)
+    : await buildTransaction({ feePayer: h!.payer.address, instructions: [await reclaimInstruction({ programId: h!.facilitator.programId, payer: h!.payer.address, server: h!.server.address, mint: h!.mint, payment })], signers: [h!.payer], lifetime: { blockhash: "1".repeat(32) as Blockhash, lastValidBlockHeight: 1000n } });
+  const full = operation === "reclaim" ? tx : await partiallySignTransaction([h!.facilitatorKey.keyPair], tx);
+  const signature = getSignatureFromTransaction(full), wire = encodeTransaction(full);
+  const j = { signature, messageHash: hash(full.messageBytes), transactionBase64: wire, blockhash: getCompiledTransactionMessageDecoder().decode(full.messageBytes).lifetimeToken, operation, payment, payer: h!.payer.address, expectedHeld: operation === "authorize" || operation === "refund" ? "0" : "100", expectedRefundable: operation === "refund" ? "100" : "0", attempts: [{ preparedAt: at }] as any[] };
+  return { journal: j, member: member(`${signature}.json`, j), role: operation === "reclaim" ? "reclaim" as const : "facilitator" as const };
+}
+test.each(["authorize", "capture", "void", "refund", "reclaim"] as const)("selected UNKNOWN %s is restricted to AUTHORIZE without mutation or effects", async operation => {
+  const { input } = await fixture(false), record = await operationJournal(operation);
+  input.stores.facilitator = record.role === "facilitator" ? [record.member] : [];
+  input.stores.reclaim = record.role === "reclaim" ? [record.member, member(`reclaim-${record.journal.payment}.lock`, record.journal.signature)] as never : [];
+  input.selected = { signature: record.journal.signature, messageHash: record.journal.messageHash, wireSha256: hash(Buffer.from(record.journal.transactionBase64, "base64")), journalSha256: hash(Buffer.from(record.member.rawBase64, "base64")) };
+  const before = JSON.stringify(input);
+  const traps = [vi.spyOn(kit, "partiallySignTransaction"), vi.spyOn(kit, "signTransaction"), vi.spyOn(kit, "signTransactionWithSigners"), vi.spyOn(h!.ledger, "submit"), vi.spyOn(h!.facilitator, "settle"), vi.spyOn(globalThis, "fetch"), vi.spyOn(fs, "writeFileSync"), vi.spyOn(fsPromises, "writeFile")];
+  for (const trap of traps) trap.mockClear().mockImplementation(() => { throw new Error("economic/write trap"); });
+  if (operation === "authorize") expect((await project(input)).original).toMatchObject({ operation: "authorize", status: "UNKNOWN", signature: input.selected.signature });
+  else await expect(project(input)).rejects.toThrow();
+  expect(JSON.stringify(input)).toBe(before);
+  for (const trap of traps) expect(trap).not.toHaveBeenCalled();
+  expect(h!.ledger.submissions).toHaveLength(0);
+});
+test.each((["capture", "void", "refund", "reclaim"] as const).flatMap(operation => ["not-submitted", "finalized-succeeded", "finalized-failed"].map(result => ({ operation, result }))))("non-selected terminal $operation ($result) history stays eligible and UNKNOWN refuses", async ({ operation, result }) => {
+  const { input } = await fixture(false), record = await operationJournal(operation);
+  record.journal.attempts[0].outcome = { result, recordedAt: at };
+  input.stores[record.role].push(member(record.member.name, record.journal) as never);
+  if (record.role === "reclaim") input.stores.reclaim.push(member(`reclaim-${record.journal.payment}.lock`, record.journal.signature) as never);
+  const before = JSON.stringify(input);
+  expect((await project(input)).original.operation).toBe("authorize");
+  expect(JSON.stringify(input)).toBe(before);
+  delete record.journal.attempts[0].outcome;
+  input.stores[record.role][input.stores[record.role].findIndex(m => m.name === record.member.name)] = member(record.member.name, record.journal) as never;
+  const unknown = JSON.stringify(input);
+  await expect(project(input)).rejects.toThrow();
+  expect(JSON.stringify(input)).toBe(unknown); expect(h!.ledger.submissions).toHaveLength(0);
+});
+test.each(["signature", "messageHash", "wireSha256", "journalSha256"] as const)("selected AUTHORIZE still requires exact %s", async field => {
+  const { input } = await fixture(false);
+  input.selected[field] = field === "signature" ? "1".repeat(88) : "f".repeat(64);
+  const before = JSON.stringify(input);
+  await expect(project(input)).rejects.toThrow();
+  expect(JSON.stringify(input)).toBe(before); expect(h!.ledger.submissions).toHaveLength(0);
+});
 function view(p: unknown) {
   const assets = Object.fromEntries(ASSETS.map(path => [path, readFileSync(new URL(`../web/quarantine/${path.split('/').at(-1)}`, import.meta.url), "utf8")])) as Record<typeof ASSETS[number], string>;
   return createQuarantineView(p, { merchantHash: hash(merchant), operatorHash: hash(operator) }, assets);
