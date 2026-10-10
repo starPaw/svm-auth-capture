@@ -44,7 +44,7 @@ class DelayedRemote:
         with conn:
             q.require(conn.recv(1024).startswith(b'GET /synthetic-late '))
             self.requests += 1
-            self.release.wait(60)
+            self.release.wait()
             try: conn.sendall(b'HTTP/1.0 200 OK\r\n\r\nLATE_SYNTHETIC_RESULT')
             except OSError: pass  # Cessation does not cancel the remote result.
             self.replies += 1
@@ -121,6 +121,7 @@ def setup(f):
         for member in f['input']['stores'][role]:
             q.exclusive(directory / member['name'], base64.b64decode(member['rawBase64']))
     (q.PRIVATE / 'keys').mkdir(mode=0o750)
+    os.chown(q.PRIVATE / 'keys', 0, pwd.getpwnam(q.SERVICES[0]).pw_gid)
     for name, key_file in zip(q.SERVICES, ('sponsor.json', 'merchant.json')):
         p = q.PRIVATE / ('keys/' + key_file)
         q.exclusive(p, b'SYNTHETIC_NO_ECONOMIC_AUTHORITY', 0o600)
