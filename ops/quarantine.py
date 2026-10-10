@@ -581,6 +581,7 @@ def activation_inventory(e=None):
                             for token in shlex.split(value):
                                 source = token.split(':', 1)[-1].lstrip('-+')
                                 if source.startswith('/'):
+                                    source = source.replace('%p', p.name.removesuffix('.service').split('@', 1)[0]).replace('%n', p.name)
                                     require('%' not in source)
                                     target = Path(source).resolve()
                                     require(not any(target == root or target.is_relative_to(root) for root in (PRIVATE, STATE, BASE)))
