@@ -291,6 +291,34 @@ if(blocked!==8)process.exit(3);
     q.run(*cmd)
 
 
+def crash_cut(f, phase, after):
+    """SIGKILL a real controller process at each durable attestation boundary."""
+    e = setup(f); REMOTE.wait_for('requests')
+    before = q.inventory()[0]
+    child = os.fork()
+    if child == 0:
+        real = q.exclusive
+        def cut(path, data, mode=0o600):
+            if path.name.endswith('-' + phase + '.json'):
+                if after: real(path, data, mode)
+                os.kill(os.getpid(), __import__('signal').SIGKILL)
+            return real(path, data, mode)
+        q.exclusive = cut
+        q.Transition(q.ROOT, q.LinuxHost(e), e, prep.offline_projector(e)).enter()
+        os._exit(3)  # Missing requested cut must fail.
+    _, status = os.waitpid(child, 0)
+    q.require(os.WIFSIGNALED(status) and os.WTERMSIG(status) == 9)
+    q.require(q.exists(q.ROOT / 'ECONOMICS_DENIED'))
+    transition = q.Transition(q.ROOT, q.LinuxHost(e), e, prep.offline_projector(e))
+    result = transition.recover()
+    REMOTE.release.set(); REMOTE.wait_for('replies'); REMOTE.listener.close()
+    q.require(result['viewer'] == 'STOPPED' and q.events()['populated'] == 0 and not q.uid_processes(e['uids']))
+    q.require(q.inventory()[0] == before and not (q.STATE / 'post-fence-effect').exists())
+    failed(q.ordinary_allowed)
+    record('REAL-SIGKILL-' + phase + ('-after' if after else '-before') + '-recovery-denies-preserves-and-never-resumes', lambda: None)
+    print('CRASH_CUT_PASS', flush=True)
+
+
 def after_boot():
     old = LOG.with_name('boot-id-before').read_text()
     q.require(old != Path('/proc/sys/kernel/random/boot_id').read_text())
@@ -330,5 +358,8 @@ if __name__ == '__main__':
         subprocess.run(['groupdel', 'capture402-dev-runtime'], capture_output=True)
     elif sys.argv[1:] == ['after-boot']:
         after_boot()
+    elif len(sys.argv) == 4 and sys.argv[1] == 'crash-cut':
+        q.require(sys.argv[2] in q.PHASES and sys.argv[3] in ('before', 'after'))
+        crash_cut(q.strict_json(FIXTURE.read_bytes()), sys.argv[2], sys.argv[3] == 'after')
     else:
         campaign(q.strict_json(FIXTURE.read_bytes()))
