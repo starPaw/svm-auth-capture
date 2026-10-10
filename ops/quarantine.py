@@ -495,7 +495,7 @@ def effective_activation(e, names):
     # trusting literal template text (User=%i) or enabled symlink filenames.
     names.update(line.split()[0] for line in run('systemctl', 'list-units', '--all', '--no-legend', '--no-pager', '--plain', '--type=service').splitlines() if line.strip())
     names = sorted(n for n in names if n.endswith('.service') and '@.' not in n)
-    props = ('Id', 'Names', 'User', 'Group', 'LoadCredential', 'LoadCredentialEncrypted', 'ImportCredential', 'OpenFile', 'EnvironmentFiles')
+    props = ('Id', 'Names', 'User', 'Group', 'LoadCredential', 'LoadCredentialEncrypted', 'ImportCredential', 'OpenFile', 'EnvironmentFiles', 'BindPaths', 'BindReadOnlyPaths')
     raw = run('systemctl', 'show', '--property=' + ','.join(props), *names)
     enrolled_names = {pwd.getpwuid(uid).pw_name for uid in e['uids']}
     enrolled_ids = set(map(str, e['uids']))
@@ -513,7 +513,7 @@ def effective_activation(e, names):
         require('%' not in values.get('User', '') and '%' not in values.get('Group', ''))
         for prop in props[4:]:
             for token in shlex.split(values.get(prop, '')):
-                source = token.split(':', 1)[-1].lstrip('-')
+                source = (token.split(':', 1)[-1] if prop in ('LoadCredential', 'LoadCredentialEncrypted') else token.split(':', 1)[0]).lstrip('-+')
                 if source.startswith('/'):
                     require('%' not in source)
                     path = Path(source).resolve()
@@ -577,9 +577,9 @@ def activation_inventory(e=None):
                         # systemd 255 renders structured LoadCredential properties
                         # as [unprintable]. Resolve source paths from every pinned
                         # fragment too; an innocent spelling may alias a dev key.
-                        for value in re.findall(r'^\s*(?:LoadCredential(?:Encrypted)?|OpenFile|EnvironmentFile|Bind(?:ReadOnly)?Paths)\s*=(.*)$', source_text, re.M):
+                        for directive, value in re.findall(r'^\s*(LoadCredential(?:Encrypted)?|OpenFile|EnvironmentFile|Bind(?:ReadOnly)?Paths)\s*=(.*)$', source_text, re.M):
                             for token in shlex.split(value):
-                                source = token.split(':', 1)[-1].lstrip('-+')
+                                source = (token.split(':', 1)[-1] if directive.startswith('LoadCredential') else token.split(':', 1)[0]).lstrip('-+')
                                 if source.startswith('/'):
                                     source = source.replace('%p', p.name.removesuffix('.service').split('@', 1)[0]).replace('%n', p.name)
                                     require('%' not in source)
