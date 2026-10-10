@@ -571,6 +571,16 @@ def activation_inventory(e=None):
                         # including numeric enrolled UIDs and root launch wrappers.
                         require(not re.search(r'capture402-dev-|capture402-deploy|/etc/capture402-dev(?:/|\s)|/var/lib/capture402-dev(?:/|\s)|/opt/capture402-dev(?:/|\s)|capture402\s+dev', source_text))
                         if e: require(not re.search(r'^\s*User\s*=\s*(?:' + '|'.join(map(str, e['uids'])) + r')\s*$', source_text, re.M))
+                        # systemd 255 renders structured LoadCredential properties
+                        # as [unprintable]. Resolve source paths from every pinned
+                        # fragment too; an innocent spelling may alias a dev key.
+                        for value in re.findall(r'^\s*(?:LoadCredential(?:Encrypted)?|OpenFile|EnvironmentFile|Bind(?:ReadOnly)?Paths)\s*=(.*)$', source_text, re.M):
+                            for token in shlex.split(value):
+                                source = token.split(':', 1)[-1].lstrip('-+')
+                                if source.startswith('/'):
+                                    require('%' not in source)
+                                    target = Path(source).resolve()
+                                    require(not any(target == root or target.is_relative_to(root) for root in (PRIVATE, STATE, BASE)))
                     if e and p.parent == Path('/run/systemd/transient') and re.fullmatch(r'session-[0-9]+\.scope', p.name):
                         # Logind scopes have volatile IDs on every SSH login/boot.
                         # They cannot be economic launch sources: no enrolled UID
