@@ -10,7 +10,7 @@ import { createRestaurantApp, DEMO_BUDGET, DEMO_UNIT, RestaurantOrders, type Res
 import { createPresentationApp } from "../src/restaurant-server.js";
 import { OperationStore } from "../src/operation-store.js";
 import { FileSubmissionJournal } from "../src/submission-journal.js";
-import { encodeTransaction, reclaimInstruction } from "../src/transactions.js";
+import { encodeTransaction, reclaimInstruction, refundInstruction } from "../src/transactions.js";
 import { decodeHeader, encodeHeader, type PaymentRequired } from "../src/http-transport.js";
 import { createHarness, type Harness, NOW, inspect } from "./fixture.js";
 import type { Hono } from "hono";
@@ -513,7 +513,7 @@ describe("#52 exact-offer provenance through restaurant persistence and relay", 
     expect(c.orders.read(s.id).events[0]!.lifetimeObservation).toBeUndefined(); expect(c.getLatestBlockhash).not.toHaveBeenCalled();
   });
   test.each(["beer", "finish", "void", "refund"])("%s persists builder observation before relay", async a => {
-    const s = await offer(); expect((await authorize(s)).status).toBe(200);
+    const s = await offer(a === "refund" ? "refund" : "normal"); expect((await authorize(s)).status).toBe(200);
     if (a === "refund" || a === "finish") await expectAction(s, "beer");
     if (a === "finish") await expectAction(s, "salmon");
     const { attestObservation } = await import("../src/lifetime-provenance.ts");
@@ -540,47 +540,109 @@ describe("application partial refund", () => {
     await expectAction(s, "beer"); await expectAction(s, "salmon"); await expectAction(s, "finish");
     const before = await view(s);
     expect(before).toMatchObject({ captured: 65, released: 35, remaining: 0, refundableBaseUnits: "65000000" });
-    expect((await refund(s, { amount: "10000000" })).status).toBe(200);
+    expect((await refund(s)).status).toBe(200);
     const after = await view(s);
     expect(after).toMatchObject({ captured: 65, refunded: 10, released: 35, remaining: 0, refundableBaseUnits: "55000000" });
     expect(after.balances.payer.amount).toBe(before.balances.payer.amount + 10);
     expect(after.balances.merchant.amount).toBe(before.balances.merchant.amount - 10);
     const submitted = h.ledger.submissions.length;
     app = createRestaurantApp({ ...c, orders: new RestaurantOrders(c.orders.dir) });
-    for (const body of [undefined, { amount: "10000000" }]) expect((await refund(s, body)).status).toBe(409);
+    expect((await refund(s)).status).toBe(409);
     expect(h.ledger.submissions).toHaveLength(submitted);
   });
-  test.each([{ amount: "0" }, { amount: "-1" }, { amount: "1.5" }, { amount: 10 }, { amount: "010" }, { amount: "18446744073709551616" }, { amount: "10000000", extra: true }, {}, null])("invalid or excessive amount refuses without an attempt: %j", async body => {
+  test.each([{ amount: "1" }, { amount: "10000000" }, { amount: "0" }, { amount: "-1" }, { amount: "1.5" }, { amount: 10 }, { amount: "010" }, { amount: "18446744073709551616" }, { amount: "10000000", extra: true }, {}, null])("caller-supplied amount refuses without an attempt: %j", async body => {
     const s = await offer("refund"); await authorize(s); await expectAction(s, "beer");
     const count = h.ledger.submissions.length, simulated = h.ledger.simulated.length;
-    expect([400,409]).toContain((await refund(s, body)).status);
+    expect((await refund(s, body)).status).toBe(400);
     expect(c.orders.attempted(s.id, "refund")).toBe(false);
     expect(c.orders.busy(s.id)).toBe(false);
     expect(h.ledger.submissions).toHaveLength(count); expect(h.ledger.simulated).toHaveLength(simulated);
   });
   test("lost partial-refund response retains the original attempt without retry", async () => {
-    const s = await offer("refund"); await authorize(s); await expectAction(s, "beer");
+    const s = await offer(); await authorize(s); await expectAction(s, "beer"); await expectAction(s, "salmon"); await expectAction(s, "finish");
     h.ledger.failSubmit = "after-landing";
-    expect((await refund(s, { amount: "10000000" })).status).toBe(409);
+    expect((await refund(s)).status).toBe(409);
     const order = c.orders.read(s.id), original = order.events.at(-1)!;
     expect(original).toMatchObject({ action: "refund", amount: "10000000", status: "pending" });
     expect(original.transaction).not.toBe("");
     const bytes = readFileSync(c.orders.path(s.id), "utf8"), count = h.ledger.submissions.length;
     app = createRestaurantApp({ ...c, orders: new RestaurantOrders(c.orders.dir) });
-    expect((await refund(s, { amount: "10000000" })).status).toBe(409);
+    expect((await refund(s)).status).toBe(409);
     expect(readFileSync(c.orders.path(s.id), "utf8")).toBe(bytes); expect(h.ledger.submissions).toHaveLength(count);
   });
 });
 
 
-test("concurrent full and partial refunds share one durable reservation", async () => {
-  const s = await offer("refund"); await authorize(s); await expectAction(s, "beer");
+test("concurrent fixed normal refunds share one durable reservation", async () => {
+  const s = await offer(); await authorize(s); await expectAction(s, "beer"); await expectAction(s, "salmon"); await expectAction(s, "finish");
   const before = h.ledger.submissions.length;
-  const responses = await Promise.all([
-    action(s, "refund"),
-    app.request(`${origin}/api/orders/${s.id}/actions/refund`, { method: "POST", headers: { origin, authorization: `Bearer ${merchantToken}`, "content-type": "application/json" }, body: JSON.stringify({ amount: "10000000" }) }),
-  ]);
+  const responses = await Promise.all([action(s, "refund"), action(s, "refund")]);
   expect(responses.map(r => r.status).sort()).toEqual([200,409]);
   expect(h.ledger.submissions).toHaveLength(before + 1);
   expect(c.orders.read(s.id).events.filter(e => e.action === "refund")).toHaveLength(1);
+});
+
+// Exact b5002d3c review regressions: scenario-selected amount, not caller-selected API.
+describe("Gate 1 refund scope review", () => {
+  async function normalFinished() {
+    const s = await offer(); await authorize(s);
+    await expectAction(s, "beer"); await expectAction(s, "salmon"); await expectAction(s, "finish");
+    return s;
+  }
+  test("bodyless normal refund selects exactly 10", async () => {
+    const s = await normalFinished();
+    await expectAction(s, "refund");
+    expect(await view(s)).toMatchObject({ refunded: 10, refundableBaseUnits: "55000000" });
+  });
+  test("normal refund eligibility needs 10 liquidity even when F is 65", async () => {
+    const s = await normalFinished();
+    h.ok(await h.direct([getTransferInstruction({ source: await h.serverAta(), destination: await h.payerAta(), authority: h.server, amount: 55n * DEMO_UNIT })], [h.server]));
+    expect(await view(s)).toMatchObject({ refundableBaseUnits: "65000000", balances: { merchant: { amount: 10 } }, actions: { refund: true } });
+    await expectAction(s, "refund");
+    expect(await view(s)).toMatchObject({ refunded: 10, refundableBaseUnits: "55000000", balances: { merchant: { amount: 0 } } });
+  });
+  test("normal refund rejects less than 10 liquidity before signing", async () => {
+    const s = await normalFinished();
+    h.ok(await h.direct([getTransferInstruction({ source: await h.serverAta(), destination: await h.payerAta(), authority: h.server, amount: 55n * DEMO_UNIT + 1n })], [h.server]));
+    const sign = vi.fn(c.server.signTransactions), simulate = vi.spyOn(c.ledger, "simulate"), before = h.ledger.submissions.length;
+    app = createRestaurantApp({ ...c, server: { ...c.server, signTransactions: sign } });
+    expect(await view(s)).toMatchObject({ actions: { refund: false } });
+    expect((await action(s, "refund")).status).toBe(409);
+    expect(sign).not.toHaveBeenCalled(); expect(simulate).not.toHaveBeenCalled(); expect(h.ledger.submissions).toHaveLength(before);
+    expect(c.orders.attempted(s.id, "refund")).toBe(false);
+  });
+  test("normal refund rejects finalized F below 10 before signing", async () => {
+    const s = await normalFinished(); const payment = (await view(s)).payment as Address;
+    h.ok(await h.direct([await refundInstruction({ programId: c.programId, payment, payer: h.payer.address, server: h.server.address, mint: h.mint }, 60n * DEMO_UNIT, 0n, 65n * DEMO_UNIT)], [h.server]));
+    const sign = vi.fn(c.server.signTransactions), simulate = vi.spyOn(c.ledger, "simulate");
+    app = createRestaurantApp({ ...c, server: { ...c.server, signTransactions: sign } });
+    expect(await view(s)).toMatchObject({ refundableBaseUnits: "5000000", actions: { refund: false } });
+    expect((await action(s, "refund")).status).toBe(409);
+    expect(sign).not.toHaveBeenCalled(); expect(simulate).not.toHaveBeenCalled(); expect(c.orders.attempted(s.id, "refund")).toBe(false);
+  });
+  test("normal refund requires the normal capture and void sequence", async () => {
+    const s = await offer(); await authorize(s); await expectAction(s, "beer");
+    expect(await view(s)).toMatchObject({ actions: { refund: false } });
+    expect((await action(s, "refund")).status).toBe(409);
+    await expectAction(s, "salmon");
+    expect((await action(s, "refund")).status).toBe(409);
+    expect(c.orders.attempted(s.id, "refund")).toBe(false);
+    await expectAction(s, "finish"); await expectAction(s, "refund");
+  });
+  test("dedicated refund still needs liquidity for full F", async () => {
+    const s = await offer("refund"); await authorize(s); await expectAction(s, "beer");
+    h.ok(await h.direct([getTransferInstruction({ source: await h.serverAta(), destination: await h.payerAta(), authority: h.server, amount: 30n * DEMO_UNIT })], [h.server]));
+    expect(await view(s)).toMatchObject({ actions: { refund: false }, balances: { merchant: { amount: 10 } } });
+    expect((await action(s, "refund")).status).toBe(409);
+    expect(c.orders.attempted(s.id, "refund")).toBe(false);
+  });
+  test("dedicated refund scenario rejects arbitrary amount bodies before signing", async () => {
+    const s = await offer("refund"); await authorize(s); await expectAction(s, "beer");
+    const count = h.ledger.submissions.length;
+    const r = await app.request(`${origin}/api/orders/${s.id}/actions/refund`, {
+      method: "POST", headers: { origin, authorization: `Bearer ${merchantToken}`, "content-type": "application/json" }, body: '{"amount":"1"}',
+    });
+    expect(r.status).toBe(400); expect(h.ledger.submissions).toHaveLength(count);
+    expect(c.orders.attempted(s.id, "refund")).toBe(false);
+  });
 });

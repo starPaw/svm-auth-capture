@@ -66,6 +66,7 @@ const money = (n: bigint) => Number(n) / Number(DEMO_UNIT);
 const labels: Record<Action, string> = { authorize: "Budget authorized", beer: "Beer + Ribs", salmon: "Salmon", finish: "Order finished · remainder released", void: "Order cancelled · hold released", refund: "Consumed budget refunded", reclaim: "Payer reclaimed unused budget" };
 const merchantActions = ["beer", "salmon", "finish", "void", "refund"] as const;
 class RestaurantRefusal extends Error {}
+const refundAmount = (order: Order, p: Payment) => order.scenario === "normal" ? 10n * DEMO_UNIT : p.refundable;
 
 // One policy for read-only eligibility and signing preflight. Onchain Clock and (H,F)
 // remain authoritative at execution, including races after this finalized snapshot.
@@ -85,6 +86,11 @@ function actionReasons(c: RestaurantConfig, order: Order, p: Payment | null, now
     if (order.scenario === "unavailable") return "Merchant unavailable scenario permits payer reclaim only.";
     if (a === "refund") {
       if (now >= p.refundDeadline) return "Onchain refund deadline expired.";
+      if (order.scenario === "normal") {
+        if (!completed("finish") || p.held !== 0n) return "Finalize captures 40 and 25 and void 35 before refund 10.";
+        return p.refundable < refundAmount(order, p) ? "Refundable balance is below 10 test tokens." : "";
+      }
+      if (order.scenario !== "refund") return "Refund requires the normal or refund scenario.";
       return p.refundable <= 0n ? "No refundable captured balance." : "";
     }
     if (now >= p.captureDeadline) return "Onchain capture deadline expired; payer reclaim may be eligible.";
@@ -179,7 +185,7 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
     const refunded = order.events.filter(e => e.status === "finalized" && e.action === "refund").reduce((s,e) => s + BigInt(e.amount), 0n);
     const reasons = actionReasons(c, order, p, now, blocked);
     const balances = { payer: await tokenBalance(c, order.payer), merchant: await tokenBalance(c, c.server.address) };
-    if (!reasons.refund && (balances.merchant.amount === null || balances.merchant.amount < money(p!.refundable))) reasons.refund = balances.merchant.reason || "Merchant test-token balance cannot fund this refund.";
+    if (!reasons.refund && (balances.merchant.amount === null || balances.merchant.amount < money(refundAmount(order, p!)))) reasons.refund = balances.merchant.reason || "Merchant test-token balance cannot fund this refund.";
     return { id: order.id, payer: order.payer, payment: order.payment, scenario: order.scenario,
       status: blocked ? "pending" : p ? p.held === 0n ? "closed" : "active" : order.status,
       authorized: p ? money(p.maximum) : 0, captured: money(captured), remaining: p ? money(p.held) : 0, refunded: money(refunded), released: p ? money(p.maximum - p.held - captured) : 0,
@@ -267,19 +273,8 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
   app.post("/api/orders/:id/actions/:action", async ctx => {
     let order = c.orders.read(ctx.req.param("id")); const action = ctx.req.param("action") as Action;
     if (!(merchantActions as readonly string[]).includes(action)) return ctx.json({ error: "unsupported menu action" }, 400);
-    // Optional refund amount is integer base units; no body retains full-refund behavior.
-    let requestedRefund: bigint | undefined;
-    const actionBody = action === "refund" ? await ctx.req.text() : "";
-    if (actionBody) {
-      let body: unknown;
-      try { body = JSON.parse(actionBody); } catch { return ctx.json({ error: "invalid action JSON" }, 400); }
-      if (ctx.req.header("content-type")?.split(";")[0]?.trim() !== "application/json" ||
-          !body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).length !== 1 ||
-          !("amount" in body) || typeof body.amount !== "string" || !/^[1-9][0-9]{0,19}$/.test(body.amount)) {
-        return ctx.json({ error: "refund amount must be a positive integer base-unit string" }, 400);
-      }
-      requestedRefund = BigInt(body.amount);
-    }
+    // Refund amount belongs to the scenario, never to caller-supplied JSON.
+    if (action === "refund" && await ctx.req.text()) return ctx.json({ error: "Refund amount is fixed by the scenario; omit the request body." }, 400);
     c.orders.reserve(order.id, action);
     order = c.orders.read(order.id);
     let prepared = false;
@@ -290,9 +285,8 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
       const reason = actionReasons(c, order, p, now, order.status === "pending")[action];
       if (reason) throw new RestaurantRefusal(reason);
       if (!p) throw new RestaurantRefusal("Original finalized payment unavailable.");
-      const amount = action === "beer" ? 40n * DEMO_UNIT : action === "salmon" ? 25n * DEMO_UNIT : action === "refund" ? requestedRefund ?? p.refundable : p.held;
+      const amount = action === "beer" ? 40n * DEMO_UNIT : action === "salmon" ? 25n * DEMO_UNIT : action === "refund" ? refundAmount(order, p) : p.held;
       if (action === "refund") {
-        if (amount > p.refundable) throw new RestaurantRefusal("Refund amount exceeds the original refundable balance.");
         const balance = await tokenBalance(c, p.server);
         if (balance.amount === null || balance.amount < money(amount)) throw new RestaurantRefusal(balance.reason || "Merchant test-token balance cannot fund this refund.");
       }
