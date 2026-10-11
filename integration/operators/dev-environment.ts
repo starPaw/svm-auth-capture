@@ -14,9 +14,9 @@ import { buildTransaction, encodeTransaction } from "../src/transactions.ts";
 import { loadKeypair } from "./lib.ts";
 
 const ROLES = ["sponsor", "merchant", "payer", "mint"] as const;
-const PRIVATE = "/etc/capture402-dev";
-const SETUP = "/var/lib/capture402-dev/setup";
-const RECORD = "/opt/capture402-dev/current/docs/evidence/sac-007/deployment-identity.v1.json";
+let PRIVATE = "/etc/capture402-dev";
+let SETUP = "/var/lib/capture402-dev/setup";
+let RECORD = "/opt/capture402-dev/current/docs/evidence/sac-007/deployment-identity.v1.json";
 const RPC_URL = "https://api.devnet.solana.com";
 const TOKEN_AMOUNT = 10_000_000_000n;
 
@@ -121,8 +121,21 @@ async function observe(): Promise<void> {
     originalSignatures: signatures, statuses }, (_key, value) => typeof value === "bigint" ? value.toString() : value));
 }
 
+export function preparationArguments(args: string[]) {
+  const [action, ...options] = args;
+  if (!["keys", "fund", "asset", "observe"].includes(action ?? "") ||
+      !(options.length === 0 || options.length === 2 && options[0] === "--profile" && ["dev", "e2e"].includes(options[1]!))) {
+    throw new Error("expected keys|fund|asset|observe [--profile dev|e2e]");
+  }
+  const base = options[1] === "e2e" ? "capture402-e2e" : "capture402-dev";
+  return { action, private: `/etc/${base}`, setup: `/var/lib/${base}/setup`,
+    record: `/opt/${base}/current/docs/evidence/sac-007/deployment-identity.v1.json` };
+}
+
 async function main(): Promise<void> {
-  const action = process.argv[2];
+  const args = preparationArguments(process.argv.slice(2));
+  const action = args.action;
+  PRIVATE = args.private; SETUP = args.setup; RECORD = args.record;
   if (action === "keys") { prepareKeys(PRIVATE); console.log("Fresh private dev identities prepared; no transaction submitted."); }
   else if (action === "fund") await fund();
   else if (action === "asset") await prepareAsset();

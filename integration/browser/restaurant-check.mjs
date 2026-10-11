@@ -22,6 +22,7 @@ await once(server, 'listening');
 const origin = `https://127.0.0.1:${server.address().port}`;
 let browser;
 const report = { scope:'Local HTTPS DOM fixtures; no Devnet, wallet signing or economic E2E claim.', browser:'', checks:[], viewports:[], requests:[] };
+let lastActionBody, nextActionPreflight;
 let state, rpcFailure = false, posts = 0, gets = 0, loseResponse = false, delayPreflight = false, missingAuthority = false;
 const secret = 'local-browser-fixture-credential-' + 'x'.repeat(32);
 const id = 'a'.repeat(32);
@@ -46,19 +47,20 @@ try {
     if (path.includes('/actions/')) {
       if (req.method() === 'GET') {
         gets++;
+        if (nextActionPreflight) { state = nextActionPreflight; nextActionPreflight = undefined; }
         if (delayPreflight) await new Promise(resolve => setTimeout(resolve, 250));
         if (missingAuthority || req.headers().authorization !== `Bearer ${secret}`) return route.fulfill({status:401,contentType:'application/json',body:JSON.stringify({error:'fixture-refused'})});
         if (rpcFailure) return route.fulfill({status:409,contentType:'application/json',body:JSON.stringify({error:'fixture-RPC-unavailable'})});
         return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({...state,operatorAccess:true})});
       }
-      posts++;
+      posts++; lastActionBody = req.postData();
       if (loseResponse) return route.abort('failed');
       return route.fulfill({status:409,contentType:'application/json',body:JSON.stringify({receipt:{success:false,errorReason:'settlement_pending',transaction:''}})});
     }
     return route.fulfill({status:rpcFailure?409:200,contentType:'application/json',body:JSON.stringify(rpcFailure?{error:'Finalized RPC state unavailable.'}:state)});
   });
   async function load(next, wallet = false) {
-    state = next; rpcFailure = false; posts = 0; gets = 0; loseResponse = false; missingAuthority = false;
+    nextActionPreflight = undefined; state = next; rpcFailure = false; posts = 0; gets = 0; loseResponse = false; missingAuthority = false;
     await page.goto(origin + '/customer');
     await page.evaluate(({state,id,wallet}) => {
       localStorage.clear(); if(state) localStorage.setItem('capture402-order',state.id);
@@ -136,6 +138,42 @@ try {
   assert.equal(posts,1); assert(await page.locator('[data-action=beer]').isDisabled());
   await page.reload(); await page.waitForFunction(()=>document.getElementById('payment-state').textContent.includes('Unknown'));
   assert(await page.locator('[data-action=beer]').isDisabled()); assert(await page.locator('#new-budget').isHidden()); await noSecretLeak(); check('Lost economic response persists non-secret lock through reload and blocks replacement');
+  const refundable = {...held(),status:'closed',remaining:0,heldBaseUnits:'0',refundableBaseUnits:'65000000',captured:65,released:35,
+    actions:{...held().actions,beer:false,void:false,refund:true},actionReasons:{...held().actionReasons,refund:''},
+    balances:{payer:{amount:935,reason:''},merchant:{amount:10,reason:''}}};
+  await load(refundable); await unlock();
+  assert.equal(await page.locator('[data-action=refund]').count(),1);
+  assert.equal(await page.locator('[data-action=refund]').textContent(),'Refund 10');
+  assert(!(await page.locator('[data-action=refund]').isDisabled()));
+  await page.locator('[data-action=refund]').click();
+  await page.waitForFunction(()=>document.getElementById('payment-state').textContent.includes('Unknown'));
+  assert.equal(posts,1); assert(!lastActionBody);
+  await noSecretLeak(); check('Normal refund 10 needs only 10 liquidity at F=65; one bodyless POST locks on pending response');
+  await load({...refundable,balances:{...refundable.balances,merchant:{amount:9.999999,reason:''}}}); await unlock();
+  assert(await page.locator('[data-action=refund]').isDisabled());
+  assert((await page.locator('[data-reason=refund]').textContent()).includes('cannot fund'));
+  assert.equal(posts,0); check('Normal refund UI rejects liquidity below selected 10 before POST');
+  await load({...refundable,refundableBaseUnits:'5000000'}); await unlock();
+  assert(await page.locator('[data-action=refund]').isDisabled());
+  assert.equal(posts,0); check('Normal refund UI rejects F below selected 10 before POST');
+  await load({...refundable,refundableBaseUnits:undefined}); await unlock();
+  assert(await page.locator('[data-action=refund]').isDisabled());
+  assert.equal(posts,0); check('Unavailable finalized F blocks normal refund UI');
+  await load(refundable); await unlock();
+  nextActionPreflight = {...refundable,balances:{...refundable.balances,merchant:{amount:9.999999,reason:''}}};
+  await page.locator('[data-action=refund]').click();
+  await page.waitForFunction(()=>document.getElementById('action-status').textContent.includes('cannot fund'));
+  assert.equal(posts,0); check('Fresh operator preflight rechecks selected refund liquidity before POST');
+  const fullRefund = {...refundable,scenario:'refund',remaining:60,heldBaseUnits:'60000000',refundableBaseUnits:'40000000',captured:40,released:0,
+    balances:{payer:{amount:900,reason:''},merchant:{amount:40,reason:''}}};
+  await load(fullRefund); await unlock();
+  assert.equal(await page.locator('[data-action=refund]').textContent(),'Merchant-funded refund');
+  await page.locator('[data-action=refund]').click();
+  await page.waitForFunction(()=>document.getElementById('payment-state').textContent.includes('Unknown'));
+  assert.equal(posts,1); assert(!lastActionBody); check('Dedicated full refund remains bodyless with its original control and pending lock');
+  await load({...fullRefund,balances:{...fullRefund.balances,merchant:{amount:10,reason:''}}}); await unlock();
+  assert(await page.locator('[data-action=refund]').isDisabled());
+  assert.equal(posts,0); check('Dedicated refund UI still requires full F liquidity');
   assert.equal(errors.length,0,errors.join('\n'));
   check('No browser page errors or external runtime requests');
   writeFileSync(join(output,'restaurant-browser-report.json'),JSON.stringify(report,null,2));

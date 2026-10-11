@@ -1,6 +1,7 @@
-"""CI-only real systemd/nginx crash-boundary tests; no production units or payment code.
+"""Disposable real systemd/nginx crash-boundary tests; no production units or payment code.
 
 Run explicitly as root with CAPTURE402_SYSTEMD_TEST=1 on the disposable CI runner.
+The boot fixture also permits the explicitly marked synthetic E2E VM.
 Only randomized capture402-test-* units and temporary loopback listeners are used.
 """
 import json
@@ -199,7 +200,12 @@ class BootBoundaryTests(unittest.TestCase):
 
     def setUp(self):
         self.assertEqual(os.geteuid(), 0)
-        self.assertEqual(os.environ.get('GITHUB_ACTIONS'), 'true', 'never run root fixtures on the VPS')
+        marker = Path('/etc/capture402-e2e-disposable')
+        disposable_e2e = (os.environ.get('CAPTURE402_E2E_DISPOSABLE') == '1' and
+                          marker.is_file() and marker.stat().st_uid == 0 and
+                          marker.read_text().strip() == 'DISPOSABLE_SYNTHETIC_E2E_TEST_ONLY')
+        self.assertTrue(os.environ.get('GITHUB_ACTIONS') == 'true' or disposable_e2e,
+                        'explicit disposable CI runner or marked E2E VM required')
         self.assertTrue(shutil.which('systemctl') and shutil.which('nginx'))
         self.tmp = tempfile.TemporaryDirectory(prefix='capture402-boot-')
         self.root = Path(self.tmp.name)

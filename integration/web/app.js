@@ -49,9 +49,17 @@ function authorizeReason() {
   return busy ? 'One operation is already in flight.' : stale ? 'Fresh finalized RPC state unavailable; refresh the original order.' : !config?.configured ? 'Devnet backend provisioning required.' : uncertain() ? 'Original response unknown; inspect its signatures. No new signature or offer.' : !connection?.account ? 'Connect the payer wallet first.' : order && order.payer !== connection.account.address ? 'Connect the original payer wallet.' :
     order && order.status !== 'draft' ? 'Authorization submitted; original receipt below.' : expiredDraft() ? 'Unsigned offer expired. Explicitly prepare a new offer before signing.' : order?.balances?.payer && (order.balances.payer.amount === null || order.balances.payer.amount < 100) ? order.balances.payer.reason || 'Payer needs 100 test-mint tokens; operator funding required.' : '';
 }
+function refundReason() {
+  const refundable = Number(order.refundableBaseUnits) / 1_000_000;
+  const amount = order.scenario === 'normal' ? 10 : refundable;
+  if (!Number.isFinite(refundable) || !Number.isFinite(amount) || amount <= 0 || refundable < amount) return 'Finalized refundable balance cannot cover the selected refund.';
+  if (order.balances?.merchant?.amount === null || !Number.isFinite(order.balances?.merchant?.amount) || order.balances.merchant.amount < amount) return 'Merchant test-token balance cannot fund this refund.';
+  return '';
+}
 function merchantReason(action) {
-  return diagnosticOnly ? 'Signing-only diagnostic disables merchant operations.' : !safeOperatorTransport() ? 'Merchant access requires HTTPS and configured Devnet.' : !order ? 'Original payer order required.' : busy ? 'One operation is already in flight.' : uncertain() ? 'Original response unknown; all new operations are locked.' : stale ? 'Fresh finalized RPC state unavailable; refresh the original order.' : accessId !== order.id || !merchantSecret ? 'Merchant operator access required.' :
+  const reason = diagnosticOnly ? 'Signing-only diagnostic disables merchant operations.' : !safeOperatorTransport() ? 'Merchant access requires HTTPS and configured Devnet.' : !order ? 'Original payer order required.' : busy ? 'One operation is already in flight.' : uncertain() ? 'Original response unknown; all new operations are locked.' : stale ? 'Fresh finalized RPC state unavailable; refresh the original order.' : accessId !== order.id || !merchantSecret ? 'Merchant operator access required.' :
     clockNow() >= (action === 'refund' ? order.refundDeadline : order.captureDeadline) ? 'Deadline reached on the informational timer; refresh Solana Clock eligibility.' : !order.actions?.[action] ? order.actionReasons?.[action] || 'Original finalized payment is not eligible for this action.' : '';
+  return reason || (action === 'refund' ? refundReason() : '');
 }
 function render() {
   $('setup-notice').hidden = !!config?.configured; document.body.classList.toggle('has-order', !!order); document.body.classList.toggle('operator-locked', accessId !== order?.id || !merchantSecret);
@@ -64,6 +72,7 @@ function render() {
   const reason = authorizeReason(); $('authorize').disabled = !!reason; $('authorize-reason').textContent = reason || 'Ready: sign the exact 100 test-token offer. Settlement must finalize.';
   $('authorize').textContent = diagnosticOnly ? 'Sign only · compare wallet response' : busy ? 'Waiting for original result…' : 'Authorize 100 test tokens';
   document.querySelectorAll('[data-action]').forEach(b => { const reason = merchantReason(b.dataset.action); b.disabled = !!reason; b.title = reason; document.querySelector(`[data-reason="${b.dataset.action}"]`).textContent = reason || 'Ready.'; });
+  document.querySelector('[data-action=refund]').textContent = (order?.scenario ?? scenario) === 'normal' ? 'Refund 10' : 'Merchant-funded refund';
   $('finish').textContent = `4 · Void ${scenario === 'refund' ? 60 : 35}`;
   $('unlock-merchant').disabled = busy || !safeOperatorTransport() || !order || uncertain() || stale;
   $('lock-merchant').hidden = !merchantSecret; $('merchant-secret').disabled = busy || !!merchantSecret;
@@ -169,7 +178,7 @@ for (const button of document.querySelectorAll('[data-action]')) button.onclick 
   if (merchantReason(action)) return;
   return run(async () => {
     await operatorPreflight(action);
-    const reason = order.actionReasons?.[action];
+    const reason = order.actionReasons?.[action] || (action === 'refund' ? refundReason() : '');
     if (!order.actions?.[action] || reason || clockNow() >= (action === 'refund' ? order.refundDeadline : order.captureDeadline)) throw new Error(reason || 'Original action eligibility changed; no operation sent.');
     const { data } = await submitOriginal(`/api/orders/${order.id}/actions/${action}`, { method:'POST', headers:{ Authorization:`Bearer ${merchantSecret}` } }, [409]);
     if (!data.receipt?.success) throw new Error('Merchant operation refused or pending. Inspect original signatures and finalized state.');

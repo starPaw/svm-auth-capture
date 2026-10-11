@@ -87,4 +87,45 @@ class DevEnvironmentTests(unittest.TestCase):
             with self.assertRaises(FileExistsError): dev.write_assets(output, files)
 
 
+class E2EEnvironmentTests(unittest.TestCase):
+    def test_disjoint_profile_and_default_closed_ingress(self):
+        files = dev.render('e2e.capture402.xyz', profile='e2e')
+        dev.verify_layout(files, profile='e2e')
+        for role in ['facilitator', 'restaurant']:
+            unit = files[f'capture402-e2e-{role}.service']
+            self.assertIn(f'User=capture402-e2e-{role}\n', unit)
+            self.assertIn('/opt/capture402-e2e/current/integration', unit)
+            self.assertIn('/etc/capture402-dev /var/lib/capture402-dev /opt/capture402-dev', unit)
+            self.assertNotIn('[Install]', unit)
+            self.assertNotIn('--inspect', unit)
+        self.assertIn('SAC006_PORT=28887\n', files['facilitator.env.example'])
+        self.assertIn('SAC006_RESOURCE_PORT=28888\n', files['restaurant.env.example'])
+        self.assertIn('SAC006_PUBLIC_ORIGIN=https://e2e.capture402.xyz\n', files['restaurant.env.example'])
+        self.assertNotIn('debug-facilitator.conf', files)
+        self.assertEqual(files['nginx-access.conf'], dev.access_config([]))
+
+    def test_wrong_host_and_profile_fail_closed(self):
+        for host in ['dev.capture402.xyz', 'other.capture402.xyz', 'capture402.xyz']:
+            with self.subTest(host=host), self.assertRaises(ValueError):
+                dev.render(host, profile='e2e')
+        with self.assertRaises(ValueError): dev.render('e2e.capture402.xyz', profile='wrong')
+
+    def test_stale_or_cross_environment_assets_refused(self):
+        expected = dev.render('e2e.capture402.xyz', profile='e2e')
+        for name, content in expected.items():
+            if name == 'nginx-access.conf': continue
+            files = dict(expected)
+            files[name] = content.replace('capture402-e2e', 'capture402-dev') if 'capture402-e2e' in content else content + '# stale\n'
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                dev.verify_layout(files, profile='e2e')
+        for allowlist in ['allow all;\ndeny all;\n', 'allow 0.0.0.0/0;\ndeny all;\n', 'allow 127.0.0.1;\n']:
+            files = dict(expected); files['nginx-access.conf'] = allowlist
+            with self.assertRaises(ValueError): dev.verify_layout(files, profile='e2e')
+
+    def test_explicit_bounded_admission(self):
+        files = dev.render('e2e.capture402.xyz', ['192.0.2.4'], profile='e2e')
+        dev.verify_layout(files, profile='e2e')
+        self.assertIn('allow 192.0.2.4/32;', files['nginx-access.conf'])
+
+
 if __name__ == '__main__': unittest.main()
