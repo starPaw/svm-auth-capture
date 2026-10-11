@@ -138,6 +138,11 @@ export class RecoveryDomain {
     }
   }
 }
+/** Recovery capabilities cannot substitute a fabricated token for an active kernel fence. */
+export function assertExclusiveRecoveryToken(token: CoordinationToken): void {
+  if (context.getStore() !== token || token.mode !== "exclusive") fail();
+  token.assert();
+}
 /** Offline maintenance primitive only. Never invoked by application startup or recovery. */
 export function enrollRecoveryDomain(paths: DomainPaths) {
   const domain = randomBytes(16).toString("hex");

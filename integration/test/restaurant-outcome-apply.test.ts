@@ -102,3 +102,13 @@ test.each([false,true])("salmon CAPTURE also applies finalized success/failure o
 test("a compatible finalized zero hold derives closed menu status",async()=>{
   const f=await fixture();new DataView(f.account.data.buffer).setBigUint64(160,0n,true);await f.apply();expect(JSON.parse(readFileSync(f.path,"utf8")).status).toBe("closed");
 });
+
+test("fabricated exclusive token cannot replace the actual kernel/async-context fence",async()=>{
+  const f=await fixture(),{ CoordinationToken }=await import("../src/coordination.ts"),pre=readFileSync(f.path);
+  f.domain.run=async(_mode,action)=>action(new CoordinationToken(f.domain,"exclusive"));
+  await expect(f.apply()).rejects.toThrow();expect(readFileSync(f.path)).toEqual(pre);expect(existsSync(f.busyPath)).toBe(true);
+});
+test("fixture admission pins complete metadata instead of accepting changed enrollment assertions",async()=>{
+  const f=await fixture(),pre=readFileSync(f.path);f.domain.metadata.writers.reverse();
+  await expect(f.apply()).rejects.toThrow();expect(readFileSync(f.path)).toEqual(pre);expect(existsSync(f.busyPath)).toBe(true);
+});
