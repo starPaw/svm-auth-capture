@@ -175,8 +175,41 @@ def enrollment():
     return e
 
 
+COORDINATION_FILE = '.coordination.lock'
+COORDINATION_ROLES = ('facilitator', 'operations', 'orders', 'reclaim')
+
+def coordination_records(paths):
+    """Exact inert four-store schema; never grants writer enrollment or recovery authority."""
+    records = []
+    for role in COORDINATION_ROLES:
+        directory = Path(paths[role]); p = directory / COORDINATION_FILE
+        if not p.exists() and not p.is_symlink(): continue
+        ds, fs = directory.lstat(), p.lstat()
+        require(stat.S_ISREG(fs.st_mode) and fs.st_nlink == 1 and fs.st_uid == ds.st_uid and stat.S_IMODE(fs.st_mode) == 0o600 and fs.st_size <= 16384)
+        raw = p.read_bytes(); v = strict_json(raw)
+        require(set(v) == {'version', 'protocol', 'domain', 'role', 'members', 'writers'})
+        require(v['version'] == 1 and v['protocol'] == 'flock-v1' and isinstance(v['domain'], str) and re.fullmatch('[a-f0-9]{32}', v['domain']) and v['role'] == role)
+        require(v['writers'] == ['facilitator', 'payer', 'resource', 'restaurant'])
+        require(isinstance(v['members'], list) and len(v['members']) == 4)
+        ids, names = set(), set()
+        for r, m in zip(COORDINATION_ROLES, v['members']):
+            require(isinstance(m, dict) and set(m) == {'role', 'path', 'device', 'inode'} and m['role'] == r)
+            require(isinstance(m['path'], str) and m['path'] == str(paths[r]) and Path(m['path']).is_absolute() and str(Path(m['path']).resolve()) == m['path'])
+            require(all(isinstance(m[k], str) and re.fullmatch('0|[1-9][0-9]*', m[k]) for k in ('device', 'inode')) and int(m['inode']) > 0)
+            st = Path(paths[r]).lstat()
+            require(m['device'] == str(st.st_dev) and m['inode'] == str(st.st_ino))
+            key = (m['device'], m['inode']); require(key not in ids and m['path'] not in names); ids.add(key); names.add(m['path'])
+        require(raw == json.dumps(v, separators=(',', ':'), ensure_ascii=False).encode())
+        records.append(v)
+    require(not records or len(records) == 4)
+    if records:
+        require(all(v['domain'] == records[0]['domain'] and v['members'] == records[0]['members'] for v in records))
+    return records
+
+
 def inventory(paths=None):
     paths = STORE_PATHS if paths is None else paths
+    coordination_records(dict(zip(ROLES, paths)))
     result, stores, inodes = {}, {}, set()
     for role, directory in zip(ROLES, paths):
         parents(directory / 'unused')

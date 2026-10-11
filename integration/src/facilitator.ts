@@ -1,3 +1,4 @@
+import { withShared } from "./coordination.ts";
 // SAC-004 facilitator: x402 v2 `/verify` and `/settle` for scheme="auth-capture",
 // extra.paymentFlow="escrow" against the accepted SVM program. Contract: docs/ARCHITECTURE.md,
 // "Relay, recovery, and separation from application state". Preflight only: the program's
@@ -215,6 +216,11 @@ export class Facilitator {
    * signature; otherwise it reports `duplicate_settlement` without another success receipt.
    */
   async settle(body: unknown): Promise<SettleResponse> {
+    try { return await withShared(this.journal?.coordination, async () => { this.journal?.assertAccess?.(); return this.settleCoordinated(body); }); }
+    catch (e) { return this.rejectionResponse(e); }
+  }
+
+  private async settleCoordinated(body: unknown): Promise<SettleResponse> {
     let profile: RequestProfile;
     try {
       profile = this.checkRequest(body);

@@ -1,3 +1,4 @@
+import { withShared } from "./coordination.ts";
 // Demo protected resource server (SAC-006 gap #2): the actual x402 v2 HTTP escrow flow
 // (`http-transport.ts`): `402 + PAYMENT-REQUIRED → PAYMENT-SIGNATURE (PaymentPayload) →
 // settle(authorize) → handler → settle(capture|capture+void|void) → PAYMENT-RESPONSE`, calling a
@@ -310,6 +311,7 @@ export async function settle(config: ResourceServerConfig, body: ReturnType<type
 
 export function createResourceApp(config: ResourceServerConfig): Hono {
   const app = new Hono();
+  app.use("*", async (_ctx, next) => withShared(config.store.coordination, async () => { config.store.assertAccess(); await next(); }));
 
   app.get(RESOURCE_PATH, async (c) => {
     const resourceUrl = `${new URL(c.req.url).origin}${RESOURCE_PATH}`;

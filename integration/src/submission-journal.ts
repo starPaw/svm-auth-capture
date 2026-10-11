@@ -1,3 +1,4 @@
+import { assertStoreAccess, domainFromEnvironment, type RecoveryDomain } from "./coordination.ts";
 // Facilitator-side durable submission journal (SAC-006 gap #3; ARCHITECTURE, "Relay, recovery,
 // and separation from application state"). The facilitator is the only party that ever holds
 // the fully co-signed bytes: the economic party signs first, and the sponsor signature that
@@ -65,6 +66,8 @@ export type PreparedSubmission = {
 export type SubmissionEntry = PreparedSubmission & { attempts: SubmissionAttempt[] };
 
 export interface SubmissionJournal {
+  readonly coordination?: RecoveryDomain;
+  assertAccess?(): void;
   findByMessageHash(hash: string): SubmissionEntry[];
   read(signature: string): SubmissionEntry | undefined;
   /** Must exclusively reserve `entry` durably before returning; a throw prevents broadcast. */
@@ -80,19 +83,26 @@ export function messageHash(messageBytes: ArrayLike<number>): string {
 }
 
 export class FileSubmissionJournal implements SubmissionJournal {
-  private readonly dir: string;
+  readonly dir: string;
+  readonly coordination?: RecoveryDomain;
+  private readonly readOnly: boolean;
 
   // Plain-field assignment, not a TS constructor parameter property: this file must stay runnable
   // under Node's `--experimental-strip-types`, which does not support parameter properties.
   /** `create: false` opens an existing journal read-only (a mistyped path is an error, not an empty journal). */
-  constructor(dir: string, options: { create?: boolean } = {}) {
+  constructor(dir: string, options: { create?: boolean; coordination?: RecoveryDomain } = {}) {
     this.dir = dir;
+    this.readOnly = options.create === false;
+    this.coordination = options.coordination ?? (this.readOnly ? undefined : domainFromEnvironment());
+    this.coordination?.assertMember(dir);
     if (options.create === false) {
       if (!existsSync(dir)) throw new Error(`submission journal ${dir} does not exist`);
     } else {
       ensureDurableDirectory(dir);
     }
   }
+
+  assertAccess(): void { if (this.readOnly) throw new Error("read-only journal cannot be a writer"); assertStoreAccess(this.dir, this.coordination); }
 
   private path(signature: string): string {
     return join(this.dir, `${signature}.json`);
@@ -103,6 +113,8 @@ export class FileSubmissionJournal implements SubmissionJournal {
   }
 
   prepare(entry: PreparedSubmission): void {
+    if (this.readOnly) throw new Error("read-only submission journal");
+    assertStoreAccess(this.dir, this.coordination);
     // Refuse reused signatures before creating a successor: an identical or older reclaim
     // must not add a cycle that would block a later continuation with fresh signed bytes.
     if (existsSync(this.path(entry.signature))) throw new SubmissionAlreadyReserved("original submission requires reconciliation; never rebroadcast");
@@ -162,6 +174,8 @@ export class FileSubmissionJournal implements SubmissionJournal {
   }
 
   resolve(signature: string, outcome: NonNullable<SubmissionAttempt["outcome"]>): void {
+    if (this.readOnly) throw new Error("read-only submission journal");
+    assertStoreAccess(this.dir, this.coordination);
     const existing = this.read(signature);
     const last = existing?.attempts.at(-1);
     if (!existing || !last) throw new Error(`no prepared submission for ${signature}`);
@@ -169,6 +183,7 @@ export class FileSubmissionJournal implements SubmissionJournal {
   }
 
   read(signature: string): SubmissionEntry | undefined {
+    if (!this.readOnly) assertStoreAccess(this.dir, this.coordination);
     try {
       return JSON.parse(readFileSync(this.path(signature), "utf8")) as SubmissionEntry;
     } catch (e) {
@@ -178,6 +193,7 @@ export class FileSubmissionJournal implements SubmissionJournal {
   }
 
   list(): SubmissionEntry[] {
+    if (!this.readOnly) assertStoreAccess(this.dir, this.coordination);
     return readdirSync(this.dir)
       .filter((f) => f.endsWith(".json") && !f.includes(".tmp-"))
       .map((f) => JSON.parse(readFileSync(join(this.dir, f), "utf8")) as SubmissionEntry);

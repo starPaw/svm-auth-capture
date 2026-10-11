@@ -1,3 +1,4 @@
+import { withShared } from "./coordination.ts";
 // Payer-direct reclaim (SAC-006 gap #2). Reclaim is never relayed through `/settle`
 // (`Reason.reclaimNotRelayed`): the payer signs this directly and pays their own transaction
 // fee, so it stays usable while the facilitator and resource server are both stopped. Reads the
@@ -14,7 +15,11 @@ import type { BlockhashCheck, ChainReader } from "./reconciliation.ts";
 import { buildTransaction, type Lifetime, reclaimInstruction } from "./transactions.ts";
 
 /** Submits the payer's reclaim; returns the transaction's signature with the adapter's outcome. */
-export async function submitReclaim(a: {
+export async function submitReclaim(a: Parameters<typeof submitReclaimCoordinated>[0]): Promise<{ signature: string; result: SubmitResult }> {
+  return withShared(a.journal.coordination, async () => { a.journal.assertAccess?.(); return submitReclaimCoordinated(a); });
+}
+
+async function submitReclaimCoordinated(a: {
   ledger: Ledger;
   programId: Address;
   payer: KeyPairSigner;

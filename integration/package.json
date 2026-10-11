@@ -23,11 +23,13 @@
     "@solana-program/system": "0.14.1",
     "@solana-program/token": "0.16.1",
     "@solana/kit": "8.4.0",
+    "fs-ext": "2.1.1",
     "hono": "4.13.13"
   },
   "devDependencies": {
     "@solana/web3.js": "1.98.4",
     "@solflare-wallet/sdk": "1.4.2",
+    "@types/fs-ext": "2.0.3",
     "@types/node": "26.6.4",
     "esbuild": "0.27.4",
     "litesvm": "1.5.0",

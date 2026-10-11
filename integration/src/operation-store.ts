@@ -1,3 +1,4 @@
+import { assertStoreAccess, domainFromEnvironment, type RecoveryDomain } from "./coordination.ts";
 // Durable local operation journal for the demo resource server (SAC-006 gap #3; ARCHITECTURE,
 // "Relay, recovery, and separation from application state"). The facilitator's in-process
 // `inFlight` duplicate guard (`facilitator.ts`) only protects one economic event across a
@@ -105,13 +106,17 @@ export function fingerprint(caller: string, resource: string, salt: Uint8Array):
 
 export class OperationStore {
   private readonly dir: string;
+  readonly coordination?: RecoveryDomain;
 
   // Plain-field assignment, not a TS constructor parameter property: this file must stay runnable
   // under Node's `--experimental-strip-types`, which does not support parameter properties.
-  constructor(dir: string) {
+  constructor(dir: string, coordination = domainFromEnvironment()) {
+    this.coordination = coordination; coordination?.assertMember(dir);
     this.dir = dir;
     ensureDurableDirectory(dir);
   }
+
+  assertAccess(): void { assertStoreAccess(this.dir, this.coordination); }
 
   private path(fp: string): string {
     return join(this.dir, `${fp}.json`);
@@ -119,6 +124,7 @@ export class OperationStore {
 
   /** Atomically claims a fresh fingerprint. Throws `ReservationConflict` if already reserved. */
   reserve(fp: string, caller: string, resource: string): OperationRecord {
+    assertStoreAccess(this.dir, this.coordination);
     const now = new Date().toISOString();
     const record: OperationRecord = { fingerprint: fp, caller, resource, createdAt: now, updatedAt: now, status: "reserved" };
     try {
@@ -131,6 +137,7 @@ export class OperationStore {
   }
 
   read(fp: string): OperationRecord | undefined {
+    assertStoreAccess(this.dir, this.coordination);
     try {
       return JSON.parse(readFileSync(this.path(fp), "utf8")) as OperationRecord;
     } catch (e) {
@@ -140,6 +147,7 @@ export class OperationStore {
   }
 
   update(fp: string, patch: Partial<Omit<OperationRecord, "fingerprint" | "createdAt">>): OperationRecord {
+    assertStoreAccess(this.dir, this.coordination);
     const existing = this.read(fp);
     if (!existing) throw new Error(`no reservation for fingerprint ${fp}`);
     const next: OperationRecord = { ...existing, ...patch, updatedAt: new Date().toISOString() };
@@ -148,6 +156,7 @@ export class OperationStore {
   }
 
   list(): OperationRecord[] {
+    assertStoreAccess(this.dir, this.coordination);
     return readdirSync(this.dir)
       .filter((f) => f.endsWith(".json") && !f.includes(".tmp-"))
       .map((f) => JSON.parse(readFileSync(join(this.dir, f), "utf8")) as OperationRecord);

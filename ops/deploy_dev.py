@@ -397,12 +397,15 @@ def state_paths():
 def clean_operations():
     # Fail closed on absent directories, partial writes, unknown schemas or outcomes.
     journal, operations, reclaim, orders = state_paths()
+    quarantine.coordination_records(dict(facilitator=journal, operations=operations, reclaim=reclaim, orders=orders))
     for directory in (journal, operations, reclaim, orders):
         source.require(directory.is_dir() and not directory.is_symlink(), 'dev journal directory missing or unsafe')
         for path in directory.iterdir():
             source.require(path.is_file() and not path.is_symlink(), 'unsafe dev journal member')
             source.require(path.stat().st_size < 4 * 1024 * 1024, 'dev journal member too large')
             source.require('.tmp-' not in path.name and not path.name.endswith('.busy'), 'unfinished dev operation')
+            if path.name == quarantine.COORDINATION_FILE:
+                continue  # Validated as the exact complete metadata set above, never a wildcard.
             if path.suffix == '.json':
                 original = path.read_bytes()
                 record = json.loads(original)
