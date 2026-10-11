@@ -8,6 +8,7 @@ export type CoordinationMetadata = { version: 1; protocol: "flock-v1"; domain: s
 function requireValid(ok: unknown): asserts ok { if (!ok) throw new Error("invalid coordination metadata"); }
 function keys(v: any, names: string[]) { requireValid(v && typeof v === "object" && !Array.isArray(v) && Object.keys(v).sort().join() === [...names].sort().join()); }
 export function coordinationMetadata(raw: string): CoordinationMetadata {
+  requireValid(new TextEncoder().encode(raw).length <= 16384);
   const v = JSON.parse(raw); keys(v, ["version", "protocol", "domain", "role", "members", "writers"]);
   requireValid(v.version === 1 && v.protocol === "flock-v1" && /^[a-f0-9]{32}$/.test(v.domain) && DOMAIN_ROLES.includes(v.role));
   requireValid(Array.isArray(v.writers) && JSON.stringify(v.writers) === JSON.stringify(DOMAIN_WRITERS));
@@ -16,8 +17,8 @@ export function coordinationMetadata(raw: string): CoordinationMetadata {
   v.members.forEach((m: any, i: number) => {
     keys(m, ["role", "path", "device", "inode", "lockDevice", "lockInode"]);
     requireValid(m.role === DOMAIN_ROLES[i] && typeof m.path === "string" && m.path.startsWith("/") && !m.path.includes("\0") && m.path.length < 4096 && m.path.split("/").slice(1).every((p: string) => p && p !== "." && p !== ".."));
-    requireValid(/^(0|[1-9][0-9]*)$/.test(m.device) && /^[1-9][0-9]*$/.test(m.inode));
-    requireValid(m.lockDevice === m.device && /^[1-9][0-9]*$/.test(m.lockInode) && m.lockInode !== m.inode);
+    requireValid(typeof m.device === "string" && typeof m.inode === "string" && /^(0|[1-9][0-9]*)$/.test(m.device) && /^[1-9][0-9]*$/.test(m.inode));
+    requireValid(typeof m.lockInode === "string" && m.lockDevice === m.device && /^[1-9][0-9]*$/.test(m.lockInode) && m.lockInode !== m.inode);
     requireValid(!paths.has(m.path) && !identities.has(`${m.device}:${m.inode}`)); paths.add(m.path); identities.add(`${m.device}:${m.inode}`);
   });
   // Canonical bytes also reject duplicate keys/BOM/extra whitespace without a permissive parser.

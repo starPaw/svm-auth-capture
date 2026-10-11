@@ -4,7 +4,7 @@ import { chmodSync, linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { enrollRecoveryDomain, RecoveryDomain, withShared, type DomainPaths } from "../src/coordination.ts";
-import { COORDINATION_FILE, DOMAIN_ROLES } from "../src/coordination-schema.ts";
+import { COORDINATION_FILE, DOMAIN_ROLES, coordinationMetadata } from "../src/coordination-schema.ts";
 import { FileSubmissionJournal } from "../src/submission-journal.ts";
 import { RestaurantOrders } from "../src/restaurant.ts";
 const roots: string[] = [], children: ChildProcess[] = [];
@@ -116,4 +116,15 @@ test("exclusive recovery scope cannot enter even an unconfigured ordinary writer
   const { domain } = fixture(); let effects = 0;
   await domain.run("exclusive",async () => { await expect(withShared(undefined,async () => { effects++; })).rejects.toThrow(); });
   expect(effects).toBe(0);
+});
+
+test.each(["device", "inode", "lockInode"])("strict metadata rejects numeric %s just like the host quarantine reader", field => {
+  const { domain } = fixture(), m = structuredClone(domain.metadata); (m.members[0] as any)[field] = Number((m.members[0] as any)[field]);
+  if (field === "device") (m.members[0] as any).lockDevice = Number(m.members[0]!.device);
+  expect(() => coordinationMetadata(JSON.stringify(m))).toThrow();
+});
+test("pure quarantine schema uses the same raw-byte bound as native writer and host readers", () => {
+  const { domain } = fixture(), m = structuredClone(domain.metadata);
+  m.members.forEach((v,i) => { v.path = "/" + String(i).repeat(4090); });
+  expect(() => coordinationMetadata(JSON.stringify(m))).toThrow();
 });
