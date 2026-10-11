@@ -271,7 +271,7 @@ export class RpcLedger implements Ledger, ChainReader {
   recoveryReader(deadline: number) {
     if (!Number.isFinite(deadline)) throw new RpcDeadlineExceeded();
     return {
-      getSignatureStatus: (signature: string) => this.getSignatureStatus(signature, deadline),
+      getSignatureStatus: (signature: string) => this.getSignatureStatus(signature, deadline, true),
       findSignaturesByMessage: (address: Address, bytes: Uint8Array) => this.findSignaturesByMessage(address, bytes, deadline),
       getAccountAtLeast: (address: Address, slot: bigint) => this.getAccountAtLeast(address, slot, deadline),
       getClockAtLeast: (slot: bigint) => this.getClockAtLeast(slot, deadline),
@@ -409,12 +409,15 @@ export class RpcLedger implements Ledger, ChainReader {
   // --- ChainReader: read-only evidence for manual reconciliation (`reconciliation.ts`). Every
   // RPC failure is reported as `unavailable`, never as absence.
 
-  async getSignatureStatus(signature: string, deadline = Date.now() + this.requestTimeoutMs): Promise<SignatureLookup> {
+  async getSignatureStatus(signature: string, deadline = Date.now() + this.requestTimeoutMs, requireObservation = false): Promise<SignatureLookup> {
     try {
       const response = await byDeadline(Math.min(deadline, Date.now() + this.requestTimeoutMs), (abortSignal) =>
         this.rpc.getSignatureStatuses([asSignature(signature)], { searchTransactionHistory: true }).send({ abortSignal }),
       );
-      return signatureLookup(response);
+      const status = signatureLookup(response);
+      if (!requireObservation || status.kind !== "found") return status;
+      if (!validSlot(response.context?.slot) || response.context.slot < status.slot) return { kind:"unavailable",detail:"signature observation context unavailable or stale" };
+      return { ...status,observedSlot:response.context.slot };
     } catch (error) {
       return { kind: "unavailable", detail: describe(error) };
     }

@@ -1,7 +1,7 @@
 // Explicit local CAPTURE result application. No economic or fulfillment capability is imported.
 import { constants, closeSync, fsyncSync, lstatSync, openSync, unlinkSync } from "node:fs";
+import { performance } from "node:perf_hooks";
 import { join } from "node:path";
-import type { Address } from "@solana/kit";
 import type { ChainReader, SignatureLookup, SlotAccount } from "./reconciliation.ts";
 import { reconcileRestaurantOrder, type RestaurantReconcileReport } from "./restaurant-reconciliation.ts";
 import { createDurableFile } from "./durable-file.ts";
@@ -13,9 +13,9 @@ import { recoveryHash, recoverySnapshot, sameRecoveryPins, readRecoveryRecord, t
 export type OutcomeReader = ChainReader & { verifyIdentity(deadline: number): Promise<RecoveryIdentity> };
 export type OutcomeApplyOptions = { domain: RecoveryDomain; enrollment?: RecoveryEnrollment; identity: RecoveryIdentity;
   orderId: string; action: "beer" | "salmon"; signature: string; evidenceDigest: string; reader: OutcomeReader; timeoutMs?: number };
-type RecordV1 = { stageIdentity: string; recordIdentity?: string; version: 1; identity: RecoveryIdentity; orderId: string; action: string; signature: string; messageHash: string;
+type RecordV1 = { applicationId: string; stageIdentity: string; recordIdentity?: string; version: 1; identity: RecoveryIdentity; orderId: string; action: string; signature: string; messageHash: string;
   evidenceDigest: string; pins: FilePin[]; preimage: string; originalEvent: unknown; originals: { name: string; base64: string }[];
-  report: RestaurantReconcileReport; statuses: { signature: string; slot: string; err: string | null }[];
+  report: RestaurantReconcileReport; statuses: { signature: string; slot: string; observedSlot: string; err: string | null }[];
   payment: { slot: string; owner: string; executable: boolean; dataBase64: string }; intendedOrder: string };
 function refuse(): never { throw new Error("outcome application refused: missing, conflicting, stale or changed proof"); }
 const memberPath = (domain: RecoveryDomain, role: string) => domain.metadata.members.find(m => m.role === role)!.path;
@@ -80,11 +80,11 @@ export async function restaurantOutcomeEvidence(options: Omit<OutcomeApplyOption
 export async function applyRestaurantOutcome(o: OutcomeApplyOptions): Promise<{ result: "applied" | "completed" | "already-applied"; recordSha256: string }> {
   if (!/^[a-f0-9]{32}$/.test(o.orderId) || !["beer","salmon"].includes(o.action) || !/^[1-9A-HJ-NP-Za-km-z]{64,88}$/.test(o.signature) || !/^[a-f0-9]{64}$/.test(o.evidenceDigest)) refuse();
   const timeout = o.timeoutMs ?? 10_000; if (!Number.isFinite(timeout) || timeout <= 0 || timeout > 60_000) refuse();
-  const deadline = Date.now() + timeout;
-  const checkDeadline = () => { if (Date.now() >= deadline) refuse(); };
+  const deadline = Date.now() + timeout, monotonicDeadline = performance.now() + timeout;
+  const checkDeadline = () => { if (Date.now() >= deadline || performance.now() >= monotonicDeadline) refuse(); };
   async function bounded<T>(action: () => Promise<T>): Promise<T> {
     checkDeadline(); let timer: ReturnType<typeof setTimeout> | undefined;
-    try { return await Promise.race([action(),new Promise<never>((_,reject) => { timer = setTimeout(() => reject(new Error("outcome application deadline exceeded")),Math.max(1,deadline-Date.now())); })]); }
+    try { return await Promise.race([action(),new Promise<never>((_,reject) => { timer = setTimeout(() => reject(new Error("outcome application deadline exceeded")),Math.max(1,Math.min(deadline-Date.now(),monotonicDeadline-performance.now()))); })]); }
     finally { if (timer) clearTimeout(timer); }
   }
   return o.domain.run("exclusive",async token => {
@@ -95,7 +95,9 @@ export async function applyRestaurantOutcome(o: OutcomeApplyOptions): Promise<{ 
     const path = join(memberPath(o.domain,"orders"),`${o.orderId}.json`), name = recordName(o), recordPath = join(memberPath(o.domain,"orders"),name);
     const stagePath = recordPath.replace(/\.record$/, ".order");
     let snapshot = recoverySnapshot(o.domain,name), record: RecordV1 | undefined, recordRaw: string | undefined;
-    try { lstatSync(recordPath); recordRaw = readRecoveryRecord(recordPath); record = canonicalJson(recordRaw); }
+    try { lstatSync(recordPath); recordRaw = readRecoveryRecord(recordPath); record = canonicalJson(recordRaw);
+      if (Object.keys(record!).sort().join() !== ["version","identity","orderId","action","signature","messageHash","evidenceDigest","pins","preimage","originalEvent","originals","report","statuses","payment","intendedOrder","recordIdentity","stageIdentity","applicationId"].sort().join()) refuse();
+    }
     catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; }
     if (!record) { try { lstatSync(stagePath); refuse(); } catch(e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; } }
     if (snapshot.pins.some(p => p.role === "orders" && p.name.startsWith(`${o.orderId}.outcome-`))) refuse();
@@ -114,10 +116,12 @@ export async function applyRestaurantOutcome(o: OutcomeApplyOptions): Promise<{ 
     }
     const statuses = new Map<string,SignatureLookup>(); let paymentRead: SlotAccount | undefined;
     const reader: ChainReader = {
-      getSignatureStatus: async signature => { const s = await bounded(() => o.reader.getSignatureStatus(signature)); statuses.set(signature,s); return s; },
+      getSignatureStatus: async signature => { const s = await bounded(() => o.reader.getSignatureStatus(signature)); if (s.kind !== "found" || typeof s.observedSlot !== "bigint" || s.observedSlot < s.slot || s.observedSlot < 0n || s.observedSlot > 0xffffffffffffffffn) refuse(); statuses.set(signature,s); return s; },
       findSignaturesByMessage: (address,bytes) => bounded(() => o.reader.findSignaturesByMessage(address,bytes)),
       isBlockhashValid: hash => bounded(() => o.reader.isBlockhashValid(hash)),
-      getAccountAtLeast: async (address,slot) => { paymentRead = await bounded(() => o.reader.getAccountAtLeast(address,slot)); return paymentRead; },
+      getAccountAtLeast: async (address,slot) => { const observationFence = [...statuses.values()].reduce((maximum,s) => s.kind === "found" && s.observedSlot! > maximum ? s.observedSlot! : maximum,slot);
+        paymentRead = await bounded(() => o.reader.getAccountAtLeast(address,observationFence));
+        if (paymentRead.kind !== "ok" || paymentRead.slot < observationFence) refuse(); return paymentRead; },
     };
     const report = await bounded(() => reconcileRestaurantOrder({ ordersDir: memberPath(o.domain,"orders"), orderId:o.orderId,
       ...o.identity, reader, journalDirs:[memberPath(o.domain,"facilitator"),memberPath(o.domain,"reclaim")], recoveryPreimage:Buffer.from(preimage),allowLockOnly:true }));
@@ -125,24 +129,26 @@ export async function applyRestaurantOutcome(o: OutcomeApplyOptions): Promise<{ 
     if (report.conclusion !== "definitive" || report.actions.some(a => a.journals.length !== 1) || !report.actions.some(a => a.action === "authorize" && a.verdict === "finalized-succeeded") ||
         report.actions.find(a => a.action === o.action)?.signature !== o.signature || !paymentRead || paymentRead.kind !== "ok" || !paymentRead.account) refuse();
     const target = report.actions.find(a => a.action === o.action)!;
-    const freshStatuses = [...statuses].map(([signature,s]) => { if (s.kind !== "found" || s.commitment !== "finalized" || s.slot < 0n) refuse(); return { signature,slot:s.slot.toString(),err:s.err }; });
+    const applicationId = recoveryHash(JSON.stringify([o.identity.network,o.identity.genesisHash,o.identity.programId,order.payment,o.orderId,o.action,o.signature,target.messageHash]));
+    const freshStatuses = [...statuses].map(([signature,s]) => { if (s.kind !== "found" || s.commitment !== "finalized" || s.slot < 0n) refuse(); return { signature,slot:s.slot.toString(),observedSlot:s.observedSlot!.toString(),err:s.err }; });
     const account = paymentRead.account;
     const freshPayment = { slot:paymentRead.slot.toString(),owner:account.owner,executable:account.executable,dataBase64:Buffer.from(account.data).toString("base64") };
     const lock = snapshot.bytes.get(`orders/${o.orderId}.json.${o.action}.lock`); if (!lock) refuse();
     const intendedOrder = intended(preimage,report,o.action,o.signature,lock);
     if (record) {
-      if (record.messageHash !== target.messageHash || record.intendedOrder !== intendedOrder || JSON.stringify(record.originalEvent) !== JSON.stringify(order.events.find((e:any)=>e.action===o.action) ?? canonicalJson(lock.toString("utf8"))) ||
-          JSON.stringify(record.statuses) !== JSON.stringify(freshStatuses) || BigInt(freshPayment.slot) < BigInt(record.payment.slot)) refuse();
+      if (record.applicationId !== applicationId || record.messageHash !== target.messageHash || record.intendedOrder !== intendedOrder || JSON.stringify(record.originalEvent) !== JSON.stringify(order.events.find((e:any)=>e.action===o.action) ?? canonicalJson(lock.toString("utf8"))) ||
+          record.statuses.length !== freshStatuses.length || record.statuses.some((s,i) => { const fresh = freshStatuses[i]!; return s.signature !== fresh.signature || s.slot !== fresh.slot || s.err !== fresh.err || BigInt(s.observedSlot) > BigInt(fresh.observedSlot); }) || BigInt(freshPayment.slot) < BigInt(record.payment.slot)) refuse();
       for (const original of record.originals) if (snapshot.bytes.get(original.name)?.toString("base64") !== original.base64 && original.name !== `orders/${o.orderId}.json` && original.name !== `orders/${o.orderId}.json.busy`) refuse();
     } else {
       guard(); sameRecoveryPins(snapshot.pins,recoverySnapshot(o.domain,name).pins);
       createDurableFile(stagePath,"");
-      record = { stageIdentity:inode(stagePath),version:1,identity:o.identity,orderId:o.orderId,action:o.action,signature:o.signature,messageHash:target.messageHash!,evidenceDigest:o.evidenceDigest,pins:snapshot.pins,preimage,
+      record = { applicationId,stageIdentity:inode(stagePath),version:1,identity:o.identity,orderId:o.orderId,action:o.action,signature:o.signature,messageHash:target.messageHash!,evidenceDigest:o.evidenceDigest,pins:snapshot.pins,preimage,
         originalEvent:order.events.find((e:any)=>e.action===o.action) ?? canonicalJson(lock.toString("utf8")),
         originals:[...snapshot.bytes].filter(([name]) => name.startsWith(`orders/${o.orderId}.json`) || report.actions.some(a => a.journals.some(j => name.endsWith(`/${j.signature}.json`))) || name.includes(`reclaim-${order.payment}`)).map(([name,raw]) => ({ name,base64:raw.toString("base64") })),
         report,statuses:freshStatuses,payment:freshPayment,intendedOrder };
       recordRaw = JSON.stringify(record);
     }
+    if (Buffer.byteLength(recordRaw!) > 8 * 1048576 || Buffer.byteLength(postimage(record,recoveryHash(recordRaw!))) > 1048576) refuse();
     let digest = recoveryHash(recordRaw!);
     const unchanged = () => { guard(); sameRecoveryPins(snapshot.pins,recoverySnapshot(o.domain,name).pins); if (readRecoveryRecord(recordPath) !== recordRaw) refuse(); };
     // Create exclusively and flush before replacement; an incomplete record blocks repetition.
@@ -167,5 +173,5 @@ export async function applyRestaurantOutcome(o: OutcomeApplyOptions): Promise<{ 
     guard(); const finalSnapshot = recoverySnapshot(o.domain,name);
     if (state(finalSnapshot,record,digest) !== "post" || finalSnapshot.bytes.has(busyName) || readRecoveryRecord(recordPath) !== recordRaw) refuse();
     return { result:!existed ? "applied" : previousState === "pre" || busy ? "completed" : "already-applied",recordSha256:digest };
-  },Math.min(60_000,Math.max(1,deadline-Date.now())));
+  },Math.min(60_000,Math.max(1,Math.min(deadline-Date.now(),monotonicDeadline-performance.now()))));
 }

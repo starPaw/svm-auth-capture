@@ -21,7 +21,7 @@ import { messageHash } from "./submission-journal.ts";
 export type SignatureLookup =
   | { kind: "unavailable"; detail: string }
   | { kind: "not-found" }
-  | { kind: "found"; slot: bigint; commitment: "processed" | "confirmed" | "finalized"; err: string | null };
+  | { kind: "found"; slot: bigint; commitment: "processed" | "confirmed" | "finalized"; err: string | null; observedSlot?: bigint };
 
 export type MessageSearch = { kind: "unavailable"; detail: string } | { kind: "ok"; signatures: string[]; truncated: boolean };
 
