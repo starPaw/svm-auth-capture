@@ -41,6 +41,10 @@ export type RestaurantReconcileReport = {
 export type RestaurantReconcileOptions = {
   ordersDir: string; orderId: string; programId: Address; network: string;
   reader: ChainReader; journalDirs?: readonly string[];
+  /** Fenced recovery authenticates its retained preimage and permits ONLY lock-only reconstruction.
+   * The ordinary diagnosis command never supplies these options or gains write authority. */
+  recoveryPreimage?: Buffer;
+  allowLockOnly?: boolean;
 };
 const sha256 = (bytes: string | Uint8Array) => createHash("sha256").update(bytes).digest("hex");
 const decimal = (v: unknown): v is string => typeof v === "string" && /^(0|[1-9][0-9]*)$/.test(v);
@@ -179,7 +183,7 @@ export async function reconcileRestaurantOrder(options: RestaurantReconcileOptio
   let local: Map<string, Buffer>, order: Order, identity: Identity;
   try {
     local = orderFiles(ordersDir, orderId);
-    order = parseJson(local.get(`${orderId}.json`)!) as Order;
+    order = parseJson(options.recoveryPreimage ?? local.get(`${orderId}.json`)!) as Order;
     const accepted = order.required.accepts[0]!;
     if (order.id !== orderId || !isAddress(order.payer) || !isAddress(order.payment) || !isAddress(accepted.payTo) ||
         !isAddress(accepted.asset) || accepted.network !== network || accepted.amount !== "100000000" ||
@@ -266,7 +270,7 @@ export async function reconcileRestaurantOrder(options: RestaurantReconcileOptio
     if (originals.length > 1) report.issues.push("duplicate order action");
     const original = originals[0];
     if (original) report.orderStatus = original.status;
-    if (!original && lock) report.issues.push("prepared action missing from order");
+    if (!original && lock && !options.allowLockOnly) report.issues.push("prepared action missing from order");
     const copies = [...originals, ...(lock ? [lock] : [])], wires: Wire[] = [];
     for (const copy of copies) {
       try {
@@ -384,7 +388,7 @@ export async function reconcileRestaurantOrder(options: RestaurantReconcileOptio
         dirs.some(dir => !journalSnapshots.has(dir) || !sameFiles(files(dir), journalSnapshots.get(dir)!))) issues.push("local evidence changed during reconciliation");
   } catch { issues.push("local evidence changed or became unavailable during reconciliation"); }
   const definitive = actions.length > 0 && !issues.length && actions.every(a => a.verdict === "finalized-succeeded" || a.verdict === "finalized-failed");
-  return { version: 1, readOnly: true, order: { id: orderId, sha256: sha256(local.get(`${orderId}.json`)!), status: order.status, payer: order.payer, payment: order.payment },
+  return { version: 1, readOnly: true, order: { id: orderId, sha256: sha256(options.recoveryPreimage ?? local.get(`${orderId}.json`)!), status: order.status, payer: order.payer, payment: order.payment },
     busy, reclaimReservations, actions, payment, issues, conclusion: definitive ? "definitive" : "unknown",
     ...(definitive ? {} : { nextEvidence: "Obtain authenticated original signed-wire/signature and finalized history; preserve all reservations. Balances or missing history cannot prove non-execution." }) };
 }

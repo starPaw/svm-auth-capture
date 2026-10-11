@@ -16,7 +16,8 @@
     "devnet:client": "node --experimental-strip-types src/client.ts",
     "devnet:reclaim": "node --experimental-strip-types src/reclaim.ts",
     "devnet:reconcile": "node --experimental-strip-types src/reconcile.ts",
-    "build:wallet": "node browser/build.mjs"
+    "build:wallet": "node browser/build.mjs",
+    "restaurant:outcome": "node --experimental-strip-types src/restaurant-outcome.ts"
   },
   "dependencies": {
     "@hono/node-server": "2.1.3",

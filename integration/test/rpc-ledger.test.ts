@@ -1202,3 +1202,16 @@ describe("recovery finalized Clock with caller's common deadline", () => {
     expect(await reader.getClockAtLeast(0n)).toMatchObject({ kind: "unavailable" }); expect(clock).not.toHaveBeenCalled();
   });
 });
+
+// Recovery retains the observation bank, in addition to the transaction execution slot.
+describe("recovery original status observation fence", () => {
+  const make = (context: unknown) => new RpcLedger({ network: NETWORK,genesisHash: GENESIS,rpcUrl:"https://synthetic.invalid",
+    rpc:fakeRpc({ getSignatureStatuses:()=>sendable({ context,value:[{ confirmationStatus:"finalized",err:null,slot:40n }] }) }) });
+  test("caller-deadline recovery retains validated response context",async()=>{
+    const sig = "1".repeat(64);
+    expect(await make({ slot:41n }).recoveryReader(Date.now()+500).getSignatureStatus(sig)).toMatchObject({ kind:"found",slot:40n,observedSlot:41n,commitment:"finalized" });
+  });
+  test.each([undefined,{ slot:"41" },{ slot:39n },{ slot:-1n }])("missing/malformed/stale context %s refuses recovery evidence",async context=>{
+    expect((await make(context).recoveryReader(Date.now()+500).getSignatureStatus("1".repeat(64))).kind).toBe("unavailable");
+  });
+});
