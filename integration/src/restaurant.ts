@@ -1,3 +1,4 @@
+import { assertStoreAccess, domainFromEnvironment, withShared, type RecoveryDomain } from "./coordination.ts";
 // Restaurant orchestration only. All economic movements use the unchanged SAC-006 builders,
 // receipt validation, facilitator and SBF. A durable order binds one signed budget to its menu
 // actions. HttpOnly per-order capabilities are application session control, not onchain authority.
@@ -33,27 +34,29 @@ export type RestaurantConfig = ResourceServerConfig & { ledger: Ledger & Pick<Ch
 
 export class RestaurantOrders {
   readonly dir: string;
-  constructor(dir: string) { this.dir = dir; ensureDurableDirectory(dir); }
+  readonly coordination?: RecoveryDomain;
+  constructor(dir: string, coordination = domainFromEnvironment()) { this.dir = dir; this.coordination = coordination; coordination?.assertMember(dir); ensureDurableDirectory(dir); }
+  assertAccess(): void { assertStoreAccess(this.dir, this.coordination); }
   path(id: string): string { if (!/^[a-f0-9]{32}$/.test(id)) throw new Error("invalid order ID"); return join(this.dir, `${id}.json`); }
-  read(id: string): Order { return JSON.parse(readFileSync(this.path(id), "utf8")) as Order; }
-  create(order: Order): void { createDurableFile(this.path(order.id), JSON.stringify(order)); }
-  write(order: Order): void { replaceDurableFile(this.path(order.id), JSON.stringify(order)); }
-  reserve(id: string, action: Action): void {
+  read(id: string): Order { assertStoreAccess(this.dir, this.coordination); return JSON.parse(readFileSync(this.path(id), "utf8")) as Order; }
+  create(order: Order): void { assertStoreAccess(this.dir, this.coordination); createDurableFile(this.path(order.id), JSON.stringify(order)); }
+  write(order: Order): void { assertStoreAccess(this.dir, this.coordination); replaceDurableFile(this.path(order.id), JSON.stringify(order)); }
+  reserve(id: string, action: Action): void { assertStoreAccess(this.dir, this.coordination);
     const busy = `${this.path(id)}.busy`;
     createDurableFile(busy, action); // Cross-process exclusive reservation before any network await.
     try { if (this.attempted(id, action)) throw new Error("action already reserved; inspect its original outcome"); }
     catch (e) { this.unlock(id); throw e; }
   }
-  prepare(order: Order, event: Event): void {
+  prepare(order: Order, event: Event): void { assertStoreAccess(this.dir, this.coordination);
     createDurableFile(`${this.path(order.id)}.${event.action}.lock`, JSON.stringify(event));
     order.events.push(event); order.status = "pending"; this.write(order);
   }
-  unlock(id: string): void {
+  unlock(id: string): void { assertStoreAccess(this.dir, this.coordination);
     unlinkSync(`${this.path(id)}.busy`);
     const fd = openSync(this.dir, "r"); try { fsyncSync(fd); } finally { closeSync(fd); }
   }
-  attempted(id: string, action: Action): boolean { return existsSync(`${this.path(id)}.${action}.lock`); }
-  busy(id: string): boolean { return existsSync(`${this.path(id)}.busy`); }
+  attempted(id: string, action: Action): boolean { assertStoreAccess(this.dir, this.coordination); return existsSync(`${this.path(id)}.${action}.lock`); }
+  busy(id: string): boolean { assertStoreAccess(this.dir, this.coordination); return existsSync(`${this.path(id)}.busy`); }
 }
 const decoder = getTransactionDecoder();
 const decode = (wire: string): Transaction => decoder.decode(getBase64Encoder().encode(wire));
@@ -141,6 +144,9 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
   }
   const merchantAuth = merchantToken ? requireBearerToken(merchantToken) : undefined;
   const app = new Hono();
+  // Acquire before any order/draft read; all callbacks and durable results stay in this scope.
+  if (c.orders.coordination !== c.reclaimJournal.coordination && c.orders.coordination?.metadata.domain !== c.reclaimJournal.coordination?.metadata.domain) throw new Error("restaurant journals require one complete domain");
+  app.use("*", async (_ctx, next) => withShared(c.orders.coordination, async () => { c.orders.assertAccess(); c.reclaimJournal.assertAccess?.(); await next(); }));
   const cookieName = "capture402-order";
   const secured = c.origin.startsWith("https:");
   function owned(id: string, cookie: string | undefined): Order {

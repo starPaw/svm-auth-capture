@@ -1,3 +1,4 @@
+import { withShared } from "./coordination.ts";
 // Payer-direct reclaim (SAC-006 gap #2). Reclaim is never relayed through `/settle`
 // (`Reason.reclaimNotRelayed`): the payer signs this directly and pays their own transaction
 // fee, so it stays usable while the facilitator and resource server are both stopped. Reads the
@@ -14,7 +15,11 @@ import type { BlockhashCheck, ChainReader } from "./reconciliation.ts";
 import { buildTransaction, type Lifetime, reclaimInstruction } from "./transactions.ts";
 
 /** Submits the payer's reclaim; returns the transaction's signature with the adapter's outcome. */
-export async function submitReclaim(a: {
+export async function submitReclaim(a: Parameters<typeof submitReclaimCoordinated>[0]): Promise<{ signature: string; result: SubmitResult }> {
+  return withShared(a.journal.coordination, async () => { a.journal.assertAccess?.(); return submitReclaimCoordinated(a); });
+}
+
+async function submitReclaimCoordinated(a: {
   ledger: Ledger;
   programId: Address;
   payer: KeyPairSigner;
@@ -128,7 +133,10 @@ async function main(): Promise<void> {
   const ledger = new RpcLedger({ deployment: record, network: record.network.caip2, genesisHash: record.network.genesisHash, rpcUrl });
   await ledger.verifyGenesis();
   const journal = new FileSubmissionJournal(process.env.SAC006_RECLAIM_JOURNAL_DIR ?? requireEnv("SAC006_FACILITATOR_JOURNAL_DIR"));
-  const { signature, result } = await submitReclaim({ ledger, programId: record.programId, payer, payment, lifetime: await ledger.latestBlockhash(), journal, retryAfter, retryBlockhashSlot: slotArg === undefined ? undefined : BigInt(slotArg), reader: ledger });
+  const { signature, result } = await withShared(journal.coordination, async () => {
+    journal.assertAccess();
+    return submitReclaim({ ledger, programId: record.programId, payer, payment, lifetime: await ledger.latestBlockhash(), journal, retryAfter, retryBlockhashSlot: slotArg === undefined ? undefined : BigInt(slotArg), reader: ledger });
+  });
   const status = await ledger.getSignatureStatus(signature);
   console.log(JSON.stringify({ payment, signature, result, status }, (_k, v) => (typeof v === "bigint" ? v.toString() : v), 2));
 }

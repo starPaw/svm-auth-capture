@@ -1,3 +1,4 @@
+import { COORDINATION_FILE, coordinationSet } from "./coordination-schema.ts";
 // Offline validator: pure data input, verification and projection. No store constructors,
 // RPC readers, signers, transport, application or environment imports.
 import * as kit from "@solana/kit";
@@ -119,6 +120,7 @@ export async function project(input: unknown) {
   object(input.selected, ["signature", "messageHash", "wireSha256", "journalSha256"]); base58(input.selected.signature, true);
   [input.selected.messageHash, input.selected.wireSha256, input.selected.journalSha256].forEach(v => hex(v));
   object(input.stores, ["facilitator", "operations", "reclaim", "orders"]);
+  const coordination: { role: string; raw: string }[] = [];
   const stores: Record<string, Map<string, { raw: Buffer; value: any }>> = {};
   for (const [role, members] of Object.entries(input.stores)) {
     list(members); const map = new Map(); stores[role] = map;
@@ -126,10 +128,12 @@ export async function project(input: unknown) {
       object(v, ["name", "rawBase64"]); text(v.name); check(/^[a-zA-Z0-9.-]+$/.test(v.name) && !v.name.includes(".tmp-") && !map.has(v.name));
       const raw = canonical(v.rawBase64, 4 * 1024 * 1024 - 1); check(raw.length > 0);
       const str = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(raw); check(!str.startsWith("\ufeff"));
+      if (v.name === COORDINATION_FILE) { coordination.push({ role, raw: str }); continue; }
       const value = v.name.endsWith(".json") || v.name.endsWith(".lock") && role === "orders" ? strictJson(str) : str;
       map.set(v.name, { raw, value });
     }
   }
+  coordinationSet(coordination); // All four exact metadata records; inventory still includes their raw bytes.
   const journals = new Map<string, { entry: any; w: Wire; raw: Buffer; role: string }>();
   for (const role of ["facilitator", "reclaim"]) for (const [name, { raw, value: e }] of stores[role]!) {
     if (!name.endsWith(".json")) { check(role === "reclaim" && /^reclaim-[1-9A-HJ-NP-Za-km-z]{32,44}(?:-after-[1-9A-HJ-NP-Za-km-z]{80,90})?\.lock$/.test(name)); continue; }
