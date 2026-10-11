@@ -171,7 +171,7 @@ for (const button of document.querySelectorAll('[data-action]')) button.onclick 
     await operatorPreflight(action);
     const reason = order.actionReasons?.[action];
     if (!order.actions?.[action] || reason || clockNow() >= (action === 'refund' ? order.refundDeadline : order.captureDeadline)) throw new Error(reason || 'Original action eligibility changed; no operation sent.');
-    const { data } = await submitOriginal(`/api/orders/${order.id}/actions/${action}`, { method:'POST', headers:{ Authorization:`Bearer ${merchantSecret}` } }, [409]);
+    const { data } = await submitOriginal(`/api/orders/${order.id}/actions/${action}`, { method:'POST', headers:{ Authorization:`Bearer ${merchantSecret}`, ...(button.dataset.amount ? { 'Content-Type':'application/json' } : {}) }, ...(button.dataset.amount ? { body:JSON.stringify({ amount:button.dataset.amount }) } : {}) }, [400,409]);
     if (!data.receipt?.success) throw new Error('Merchant operation refused or pending. Inspect original signatures and finalized state.');
   });
 };

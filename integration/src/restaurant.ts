@@ -267,6 +267,19 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
   app.post("/api/orders/:id/actions/:action", async ctx => {
     let order = c.orders.read(ctx.req.param("id")); const action = ctx.req.param("action") as Action;
     if (!(merchantActions as readonly string[]).includes(action)) return ctx.json({ error: "unsupported menu action" }, 400);
+    // Optional refund amount is integer base units; no body retains full-refund behavior.
+    let requestedRefund: bigint | undefined;
+    const actionBody = action === "refund" ? await ctx.req.text() : "";
+    if (actionBody) {
+      let body: unknown;
+      try { body = JSON.parse(actionBody); } catch { return ctx.json({ error: "invalid action JSON" }, 400); }
+      if (ctx.req.header("content-type")?.split(";")[0]?.trim() !== "application/json" ||
+          !body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).length !== 1 ||
+          !("amount" in body) || typeof body.amount !== "string" || !/^[1-9][0-9]{0,19}$/.test(body.amount)) {
+        return ctx.json({ error: "refund amount must be a positive integer base-unit string" }, 400);
+      }
+      requestedRefund = BigInt(body.amount);
+    }
     c.orders.reserve(order.id, action);
     order = c.orders.read(order.id);
     let prepared = false;
@@ -277,10 +290,11 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
       const reason = actionReasons(c, order, p, now, order.status === "pending")[action];
       if (reason) throw new RestaurantRefusal(reason);
       if (!p) throw new RestaurantRefusal("Original finalized payment unavailable.");
-      const amount = action === "beer" ? 40n * DEMO_UNIT : action === "salmon" ? 25n * DEMO_UNIT : action === "refund" ? p.refundable : p.held;
+      const amount = action === "beer" ? 40n * DEMO_UNIT : action === "salmon" ? 25n * DEMO_UNIT : action === "refund" ? requestedRefund ?? p.refundable : p.held;
       if (action === "refund") {
+        if (amount > p.refundable) throw new RestaurantRefusal("Refund amount exceeds the original refundable balance.");
         const balance = await tokenBalance(c, p.server);
-        if (balance.amount === null || balance.amount < money(p.refundable)) throw new RestaurantRefusal(balance.reason || "Merchant test-token balance cannot fund this refund.");
+        if (balance.amount === null || balance.amount < money(amount)) throw new RestaurantRefusal(balance.reason || "Merchant test-token balance cannot fund this refund.");
       }
       const stored = { programId: c.programId, payment: order.payment, payer: p.payer, server: p.server, mint: p.mint };
       const ix = action === "beer" || action === "salmon" ? await captureInstruction(stored, amount, false, p.held, p.refundable) : action === "refund" ? await refundInstruction(stored, amount, p.held, p.refundable) : await voidInstruction(stored, p.held, p.refundable);

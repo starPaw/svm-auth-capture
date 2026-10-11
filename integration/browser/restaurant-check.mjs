@@ -22,6 +22,7 @@ await once(server, 'listening');
 const origin = `https://127.0.0.1:${server.address().port}`;
 let browser;
 const report = { scope:'Local HTTPS DOM fixtures; no Devnet, wallet signing or economic E2E claim.', browser:'', checks:[], viewports:[], requests:[] };
+let lastActionBody;
 let state, rpcFailure = false, posts = 0, gets = 0, loseResponse = false, delayPreflight = false, missingAuthority = false;
 const secret = 'local-browser-fixture-credential-' + 'x'.repeat(32);
 const id = 'a'.repeat(32);
@@ -51,7 +52,7 @@ try {
         if (rpcFailure) return route.fulfill({status:409,contentType:'application/json',body:JSON.stringify({error:'fixture-RPC-unavailable'})});
         return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({...state,operatorAccess:true})});
       }
-      posts++;
+      posts++; lastActionBody = req.postData();
       if (loseResponse) return route.abort('failed');
       return route.fulfill({status:409,contentType:'application/json',body:JSON.stringify({receipt:{success:false,errorReason:'settlement_pending',transaction:''}})});
     }
@@ -136,6 +137,18 @@ try {
   assert.equal(posts,1); assert(await page.locator('[data-action=beer]').isDisabled());
   await page.reload(); await page.waitForFunction(()=>document.getElementById('payment-state').textContent.includes('Unknown'));
   assert(await page.locator('[data-action=beer]').isDisabled()); assert(await page.locator('#new-budget').isHidden()); await noSecretLeak(); check('Lost economic response persists non-secret lock through reload and blocks replacement');
+  const refundable = {...held(),remaining:0,heldBaseUnits:'0',refundableBaseUnits:'65000000',captured:65,released:35,
+    actions:{...held().actions,beer:false,void:false,refund:true},actionReasons:{...held().actionReasons,refund:''},
+    balances:{payer:{amount:935,reason:''},merchant:{amount:65,reason:''}}};
+  await load(refundable); await unlock();
+  await page.locator('[data-action=refund][data-amount="10000000"]').click();
+  await page.waitForFunction(()=>document.getElementById('payment-state').textContent.includes('Unknown'));
+  assert.equal(posts,1); assert.deepEqual(JSON.parse(lastActionBody),{amount:'10000000'});
+  await noSecretLeak(); check('Refund 10 sends one authenticated base-unit request and locks on a pending response');
+  await load(refundable); await unlock();
+  await page.locator('[data-action=refund]:not([data-amount])').click();
+  await page.waitForFunction(()=>document.getElementById('payment-state').textContent.includes('Unknown'));
+  assert.equal(posts,1); assert(!lastActionBody); check('Existing full refund remains bodyless and shares the pending UI lock');
   assert.equal(errors.length,0,errors.join('\n'));
   check('No browser page errors or external runtime requests');
   writeFileSync(join(output,'restaurant-browser-report.json'),JSON.stringify(report,null,2));

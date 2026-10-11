@@ -29,9 +29,31 @@ def access_config(addresses):
     return ''.join(f'allow {network};\n' for network in dict.fromkeys(networks)) + 'deny all;\n'
 
 
-def render(host, addresses=()):
+def render(host, addresses=(), *, profile="dev"):
     host = hostname(host)
     files = {p.name: p.read_text().replace('@DEV_HOST@', host) for p in ASSETS.iterdir() if p.is_file()}
+    if profile not in {'dev', 'e2e'}:
+        raise ValueError('unknown environment profile')
+    if profile == 'dev' and host == 'e2e.capture402.xyz':
+        raise ValueError('E2E hostname requires the E2E profile')
+    if profile == 'e2e':
+        if host != 'e2e.capture402.xyz':
+            raise ValueError('E2E profile requires e2e.capture402.xyz')
+        files = {name.replace('capture402-dev', 'capture402-e2e'): content
+                 .replace('capture402-dev', 'capture402-e2e')
+                 .replace('18887', '28887').replace('18888', '28888')
+                 .replace('19227', '29227').replace('19228', '29228')
+                 .replace('X-Capture402-Environment development', 'X-Capture402-Environment e2e')
+                 for name, content in files.items()}
+        # Deny both legacy environments, including their release and private roots.
+        for name in ['capture402-e2e-facilitator.service', 'capture402-e2e-restaurant.service']:
+            files[name] = files[name].replace('InaccessiblePaths=/etc/sac006 ',
+                'InaccessiblePaths=/etc/capture402-dev /var/lib/capture402-dev /opt/capture402-dev /home/capture402-dev /etc/sac006 ')
+        # E2E has no debugger or unattended startup surface.
+        files.pop('debug-facilitator.conf')
+        files.pop('debug-restaurant.conf')
+        for name in ['capture402-e2e-facilitator.service', 'capture402-e2e-restaurant.service']:
+            files[name] = files[name].replace('[Install]\nWantedBy=multi-user.target\n', '')
     files['nginx-access.conf'] = access_config(addresses)
     return files
 
@@ -51,7 +73,22 @@ def validate_private_output(output):
         raise ValueError('private generated environment must be outside the Git checkout')
 
 
-def verify_layout(files):
+def verify_layout(files, *, profile="dev"):
+    if profile == 'e2e':
+        expected = render('e2e.capture402.xyz', profile='e2e')
+        if set(files) != set(expected):
+            raise ValueError('E2E asset inventory differs from the fixed profile')
+        for name in expected:
+            if name != 'nginx-access.conf' and files[name] != expected[name]:
+                raise ValueError('E2E asset differs from the isolated profile: ' + name)
+        lines = files['nginx-access.conf'].splitlines()
+        if not lines or lines[-1] != 'deny all;' or any(not line.startswith('allow ') or not line.endswith(';') for line in lines[:-1]):
+            raise ValueError('E2E ingress must fail closed')
+        if access_config([line[6:-1] for line in lines[2:-1]]) != files['nginx-access.conf']:
+            raise ValueError('E2E allowlist must be canonical and bounded')
+        return
+    if profile != 'dev':
+        raise ValueError('unknown environment profile')
     for name in ['capture402-dev-facilitator.service', 'capture402-dev-restaurant.service']:
         unit = files[name]
         if 'WorkingDirectory=/opt/capture402-dev/current/integration\n' not in unit:
@@ -70,7 +107,7 @@ def verify_layout(files):
         raise ValueError('the dev ingress allowlist must fail closed')
 
 
-def private_environments(host, identities, bearer, merchant):
+def private_environments(host, identities, bearer, merchant, *, profile="dev"):
     """Separate credentials and role identities; never prints the private result."""
     required = ['sponsor', 'merchant', 'payer', 'mint']
     for role in required:
@@ -81,7 +118,7 @@ def private_environments(host, identities, bearer, merchant):
         raise ValueError('dev signer roles and mint must be distinct')
     if bearer == merchant or any(not re.fullmatch(r'[A-Za-z0-9_-]{43,128}', value) for value in [bearer, merchant]):
         raise ValueError('independent strong private credentials are required')
-    files = render(host)
+    files = render(host, profile=profile)
     common = {'SAC006_BEARER_TOKEN': bearer}
     values = {
         'facilitator': {**common, 'SAC006_ALLOWLIST_MERCHANT': identities['merchant'], 'SAC006_ALLOWLIST_MINT': identities['mint']},
@@ -103,20 +140,22 @@ def private_environments(host, identities, bearer, merchant):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--hostname', required=True)
+    parser.add_argument('--profile', choices=['dev', 'e2e'], default='dev')
     parser.add_argument('--tester-network', action='append', default=[])
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--private-identities', type=Path,
                         help='Generate private env files from fresh dev public identities; output stays operator-only.')
     args = parser.parse_args()
-    files = render(args.hostname, args.tester_network)
-    verify_layout(files)
+    files = render(args.hostname, args.tester_network, profile=args.profile)
+    verify_layout(files, profile=args.profile)
     if args.private_identities:
         validate_private_output(args.output)
         identities = json.loads(args.private_identities.read_text())
-        files.update(private_environments(args.hostname, identities, secrets.token_urlsafe(48), secrets.token_urlsafe(48)))
+        files.update(private_environments(args.hostname, identities, secrets.token_urlsafe(48), secrets.token_urlsafe(48), profile=args.profile))
     write_assets(args.output, files)
     print(json.dumps({'hostname': args.hostname, 'files': sorted(files),
-                      'ports': {'facilitator': 18887, 'restaurant': 18888},
+                      'profile': args.profile,
+                      'ports': {'facilitator': 28887 if args.profile == 'e2e' else 18887, 'restaurant': 28888 if args.profile == 'e2e' else 18888},
                       'servicesActivated': False, 'transactionsSubmitted': False}))
 
 

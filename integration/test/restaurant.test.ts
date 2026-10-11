@@ -528,3 +528,59 @@ describe("#52 exact-offer provenance through restaurant persistence and relay", 
     await expectAction(s, a);
   });
 });
+
+
+describe("application partial refund", () => {
+  const refund = (s: Session, body?: unknown) => app.request(`${origin}/api/orders/${s.id}/actions/refund`, {
+    method: "POST", headers: { origin, authorization: `Bearer ${merchantToken}`, "content-type": "application/json" },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+  test("100 → capture 40 → capture 25 → void 35 → refund 10; one attempt survives restart", async () => {
+    const s = await offer(); expect((await authorize(s)).status).toBe(200);
+    await expectAction(s, "beer"); await expectAction(s, "salmon"); await expectAction(s, "finish");
+    const before = await view(s);
+    expect(before).toMatchObject({ captured: 65, released: 35, remaining: 0, refundableBaseUnits: "65000000" });
+    expect((await refund(s, { amount: "10000000" })).status).toBe(200);
+    const after = await view(s);
+    expect(after).toMatchObject({ captured: 65, refunded: 10, released: 35, remaining: 0, refundableBaseUnits: "55000000" });
+    expect(after.balances.payer.amount).toBe(before.balances.payer.amount + 10);
+    expect(after.balances.merchant.amount).toBe(before.balances.merchant.amount - 10);
+    const submitted = h.ledger.submissions.length;
+    app = createRestaurantApp({ ...c, orders: new RestaurantOrders(c.orders.dir) });
+    for (const body of [undefined, { amount: "10000000" }]) expect((await refund(s, body)).status).toBe(409);
+    expect(h.ledger.submissions).toHaveLength(submitted);
+  });
+  test.each([{ amount: "0" }, { amount: "-1" }, { amount: "1.5" }, { amount: 10 }, { amount: "010" }, { amount: "18446744073709551616" }, { amount: "10000000", extra: true }, {}, null])("invalid or excessive amount refuses without an attempt: %j", async body => {
+    const s = await offer("refund"); await authorize(s); await expectAction(s, "beer");
+    const count = h.ledger.submissions.length, simulated = h.ledger.simulated.length;
+    expect([400,409]).toContain((await refund(s, body)).status);
+    expect(c.orders.attempted(s.id, "refund")).toBe(false);
+    expect(c.orders.busy(s.id)).toBe(false);
+    expect(h.ledger.submissions).toHaveLength(count); expect(h.ledger.simulated).toHaveLength(simulated);
+  });
+  test("lost partial-refund response retains the original attempt without retry", async () => {
+    const s = await offer("refund"); await authorize(s); await expectAction(s, "beer");
+    h.ledger.failSubmit = "after-landing";
+    expect((await refund(s, { amount: "10000000" })).status).toBe(409);
+    const order = c.orders.read(s.id), original = order.events.at(-1)!;
+    expect(original).toMatchObject({ action: "refund", amount: "10000000", status: "pending" });
+    expect(original.transaction).not.toBe("");
+    const bytes = readFileSync(c.orders.path(s.id), "utf8"), count = h.ledger.submissions.length;
+    app = createRestaurantApp({ ...c, orders: new RestaurantOrders(c.orders.dir) });
+    expect((await refund(s, { amount: "10000000" })).status).toBe(409);
+    expect(readFileSync(c.orders.path(s.id), "utf8")).toBe(bytes); expect(h.ledger.submissions).toHaveLength(count);
+  });
+});
+
+
+test("concurrent full and partial refunds share one durable reservation", async () => {
+  const s = await offer("refund"); await authorize(s); await expectAction(s, "beer");
+  const before = h.ledger.submissions.length;
+  const responses = await Promise.all([
+    action(s, "refund"),
+    app.request(`${origin}/api/orders/${s.id}/actions/refund`, { method: "POST", headers: { origin, authorization: `Bearer ${merchantToken}`, "content-type": "application/json" }, body: JSON.stringify({ amount: "10000000" }) }),
+  ]);
+  expect(responses.map(r => r.status).sort()).toEqual([200,409]);
+  expect(h.ledger.submissions).toHaveLength(before + 1);
+  expect(c.orders.read(s.id).events.filter(e => e.action === "refund")).toHaveLength(1);
+});
