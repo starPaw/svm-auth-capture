@@ -236,3 +236,25 @@ test("export only synthetic Linux fixture when requested", async () => {
   const { input } = await fixture(); const p = await project(input);
   if (process.env.B2_SYNTHETIC_FIXTURE) writeFileSync(process.env.B2_SYNTHETIC_FIXTURE, JSON.stringify({ input, projection: p, auth: { merchantHash: hash(merchant), operatorHash: hash(operator) }, cookie, merchant, operator }));
 });
+
+test("quarantine consumes exact complete coordination metadata but never exposes private paths", async () => {
+  const { input } = await fixture();
+  const roles = ["facilitator", "operations", "orders", "reclaim"] as const;
+  const members = roles.map((role,i) => ({ role, path: `/private/synthetic/${role}`, device: "1", inode: String(i+1), lockDevice: "1", lockInode: String(i+11) }));
+  for (const role of roles) (input.stores[role] as any[]).push(member(".coordination.lock", JSON.stringify({ version: 1, protocol: "flock-v1", domain: "a".repeat(32), role, members, writers: ["facilitator", "payer", "resource", "restaurant"] })));
+  const before = JSON.stringify(input), p = await project(input);
+  expect(JSON.stringify(input)).toBe(before); expect(JSON.stringify(p)).not.toContain("/private/synthetic");
+  input.stores.facilitator.pop(); await expect(project(input)).rejects.toThrow();
+});
+test.each(["unknown-file", "unknown-field", "writer", "corrupt", "alias"])("quarantine rejects %s coordination instead of ignoring unknown files", async kind => {
+  const { input } = await fixture(false); const roles = ["facilitator", "operations", "orders", "reclaim"] as const;
+  const members = roles.map((role,i) => ({ role, path: `/private/synthetic/${role}`, device: "1", inode: String(i+1), lockDevice: "1", lockInode: String(i+11) }));
+  for (const role of roles) {
+    const v: any = { version: 1, protocol: "flock-v1", domain: "b".repeat(32), role, members, writers: ["facilitator", "payer", "resource", "restaurant"] };
+    if (kind === "unknown-field" && role === "orders") v.extra = true;
+    if (kind === "writer" && role === "orders") v.writers.pop();
+    if (kind === "alias") v.members[1] = { ...members[1], path: members[0]!.path };
+    (input.stores[role] as any[]).push(member(kind === "unknown-file" ? ".coordination-new.lock" : ".coordination.lock", kind === "corrupt" ? "broken" : JSON.stringify(v)));
+  }
+  await expect(project(input)).rejects.toThrow();
+});

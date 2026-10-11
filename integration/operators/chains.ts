@@ -1,3 +1,4 @@
+import { withShared } from "../src/coordination.ts";
 // SAC-006 criteria 2 and 4 on Devnet, through `Facilitator.settle`/`verify` on the real
 // `RpcLedger` (the code path `devnet-server.ts` runs, minus HTTP, so one driver can chain several
 // operations on one payment and wait on the cluster Clock). Every rejection is bracketed by
@@ -30,6 +31,10 @@ type Terms = { maximum: bigint; dc: bigint; dr: bigint };
 
 /** A one-shot, journaled test-liquidity transfer; unresolved outcomes stop the campaign. */
 export async function transferSetupTokens(c: Context, journal: FileSubmissionJournal, from: KeyPairSigner, to: Address, amount: bigint): Promise<bigint> {
+  return withShared(journal.coordination, async () => { journal.assertAccess(); return transferSetupTokensCoordinated(c, journal, from, to, amount); });
+}
+
+async function transferSetupTokensCoordinated(c: Context, journal: FileSubmissionJournal, from: KeyPairSigner, to: Address, amount: bigint): Promise<bigint> {
   const { ledger, sponsor, mint } = c;
     const data = new Uint8Array(9);
     data[0] = 3;

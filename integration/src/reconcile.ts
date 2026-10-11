@@ -1,3 +1,4 @@
+import { withShared } from "./coordination.ts";
 // Manual reconciliation command (SAC-006 gap #3). Lists every unresolved `OperationStore` record,
 // or reports for one record what happened to its original transactions (`reconciliation.ts`).
 // Never resubmits, re-signs, or marks anything resolved on its own: an operator decides, from
@@ -18,6 +19,11 @@ const replacer = (_k: string, v: unknown) => (typeof v === "bigint" ? v.toString
 
 async function main(): Promise<void> {
   const store = new OperationStore(requireEnv("SAC006_STORE_DIR"));
+  await withShared(store.coordination, async () => inspectStore(store));
+}
+
+async function inspectStore(store: OperationStore): Promise<void> {
+  store.assertAccess();
   const fp = process.argv[2];
 
   if (!fp) {

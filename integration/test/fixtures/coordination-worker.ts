@@ -8,7 +8,11 @@ process.on("message", m => { if (m === "release") release(); });
 process.send!("ready");
 try {
   await domain.run(mode as "shared" | "exclusive", async () => {
-    if (mode === "shared") new RestaurantOrders(domain.metadata.members.find(m => m.role === "orders")!.path, domain).reserve(id ?? "a".repeat(32), "beer");
+    if (mode === "shared") {
+      const orders = new RestaurantOrders(domain.metadata.members.find(m => m.role === "orders")!.path, domain), orderId = id ?? "a".repeat(32);
+      orders.reserve(orderId, "beer");
+      orders.prepare({ id: orderId, events: [], status: "active" } as never, { action: "beer", status: "prepared", transactionBase64: "synthetic" } as never);
+    }
     process.send!("entered");
     await gate;
   }, Number(wait));

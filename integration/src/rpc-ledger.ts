@@ -154,7 +154,7 @@ export class RpcDeadlineExceeded extends Error {
  */
 async function byDeadline<T>(deadline: number, request: (abortSignal: AbortSignal) => Promise<T>): Promise<T> {
   const remaining = deadline - Date.now();
-  if (remaining <= 0) throw new RpcDeadlineExceeded();
+  if (!Number.isFinite(deadline) || remaining <= 0) throw new RpcDeadlineExceeded();
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   const expired = new Promise<never>((_, reject) => {
@@ -265,6 +265,19 @@ export class RpcLedger implements Ledger, ChainReader {
     const { value } = await this.request((abortSignal) => this.rpc.getAccountInfo(CLOCK_SYSVAR, { encoding: "base64" }).send({ abortSignal }));
     if (!value) throw new Error("RpcLedger.now: Clock sysvar account not found");
     return decodeClockUnixTimestamp(decodeBase64(value.data[0]));
+  }
+
+  /** One non-renewing deadline for every recovery evidence phase; ordinary interfaces remain unchanged. */
+  recoveryReader(deadline: number) {
+    if (!Number.isFinite(deadline)) throw new RpcDeadlineExceeded();
+    return {
+      getSignatureStatus: (signature: string) => this.getSignatureStatus(signature, deadline),
+      findSignaturesByMessage: (address: Address, bytes: Uint8Array) => this.findSignaturesByMessage(address, bytes, deadline),
+      getAccountAtLeast: (address: Address, slot: bigint) => this.getAccountAtLeast(address, slot, deadline),
+      getClockAtLeast: (slot: bigint) => this.getClockAtLeast(slot, deadline),
+      verifyBlockhashOrigin: (blockhash: string, slot: bigint, genesis: string, network: string) => this.verifyBlockhashOrigin(blockhash, slot, genesis, network, deadline),
+      getFinalizedBlockhashStatus: (blockhash: string, slot: bigint) => this.getFinalizedBlockhashStatus(blockhash, slot, deadline),
+    };
   }
 
   /** Recovery-only Clock evidence. Caller supplies the deadline shared with all other phases. */

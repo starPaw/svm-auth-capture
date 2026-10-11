@@ -3,7 +3,7 @@ export const COORDINATION_FILE = ".coordination.lock";
 export const DOMAIN_ROLES = ["facilitator", "operations", "orders", "reclaim"] as const;
 export const DOMAIN_WRITERS = ["facilitator", "payer", "resource", "restaurant"] as const;
 export type DomainRole = typeof DOMAIN_ROLES[number];
-export type Member = { role: DomainRole; path: string; device: string; inode: string };
+export type Member = { role: DomainRole; path: string; device: string; inode: string; lockDevice: string; lockInode: string };
 export type CoordinationMetadata = { version: 1; protocol: "flock-v1"; domain: string; role: DomainRole; members: Member[]; writers: typeof DOMAIN_WRITERS[number][] };
 function requireValid(ok: unknown): asserts ok { if (!ok) throw new Error("invalid coordination metadata"); }
 function keys(v: any, names: string[]) { requireValid(v && typeof v === "object" && !Array.isArray(v) && Object.keys(v).sort().join() === [...names].sort().join()); }
@@ -14,9 +14,10 @@ export function coordinationMetadata(raw: string): CoordinationMetadata {
   requireValid(Array.isArray(v.members) && v.members.length === DOMAIN_ROLES.length);
   const paths = new Set(), identities = new Set();
   v.members.forEach((m: any, i: number) => {
-    keys(m, ["role", "path", "device", "inode"]);
+    keys(m, ["role", "path", "device", "inode", "lockDevice", "lockInode"]);
     requireValid(m.role === DOMAIN_ROLES[i] && typeof m.path === "string" && m.path.startsWith("/") && !m.path.includes("\0") && m.path.length < 4096 && m.path.split("/").slice(1).every((p: string) => p && p !== "." && p !== ".."));
     requireValid(/^(0|[1-9][0-9]*)$/.test(m.device) && /^[1-9][0-9]*$/.test(m.inode));
+    requireValid(m.lockDevice === m.device && /^[1-9][0-9]*$/.test(m.lockInode) && m.lockInode !== m.inode);
     requireValid(!paths.has(m.path) && !identities.has(`${m.device}:${m.inode}`)); paths.add(m.path); identities.add(`${m.device}:${m.inode}`);
   });
   // Canonical bytes also reject duplicate keys/BOM/extra whitespace without a permissive parser.

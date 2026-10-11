@@ -1158,3 +1158,47 @@ describe("relay lifetime observation and canonical origin", () => {
     } finally { vi.useRealTimers(); }
   });
 });
+
+describe("recovery finalized Clock with caller's common deadline", () => {
+  function account(slot = 70n) {
+    const bytes = Buffer.from(clockBase64(1_234n), "base64"); bytes.writeBigUInt64LE(slot, 0);
+    return { owner: "Sysvar1111111111111111111111111111111111111", executable: false, data: [bytes.toString("base64"), "base64"] };
+  }
+  const create = (rpc: Rpc<SolanaRpcApi>) => new RpcLedger({ network: NETWORK, genesisHash: GENESIS, rpcUrl: "https://synthetic.invalid", rpc, requestTimeoutMs: 1000 });
+  test("finalized Clock binds time to context/minContextSlot without changing now()", async () => {
+    const read = vi.fn(() => sendable({ context: { slot: 70n }, value: account() }));
+    const l = create(fakeRpc({ getAccountInfo: read }));
+    expect(await l.getClockAtLeast(60n, Date.now() + 500)).toEqual({ kind: "ok", commitment: "finalized", slot: 70n, unixTimestamp: 1_234n });
+    expect(read).toHaveBeenCalledWith("SysvarC1ock11111111111111111111111111111111", { encoding: "base64", commitment: "finalized", minContextSlot: 60n });
+    expect(await l.now()).toBe(1_234n);
+  });
+  test.each(["context-stale", "clock-stale", "absent", "owner", "executable", "layout", "weak-slot", "encoding"])("%s cannot provide Clock proof", async kind => {
+    const v: any = account(); let slot: any = 70n;
+    if (kind === "context-stale") slot = 59n;
+    if (kind === "clock-stale") v.data = account(69n).data;
+    if (kind === "owner") v.owner = PROGRAM_ID;
+    if (kind === "executable") v.executable = true;
+    if (kind === "layout") v.data[0] = Buffer.alloc(39).toString("base64");
+    if (kind === "weak-slot") slot = undefined;
+    if (kind === "encoding") v.data[1] = "jsonParsed";
+    const l = create(fakeRpc({ getAccountInfo: () => sendable({ context: { slot }, value: kind === "absent" ? null : v }) }));
+    expect(await l.getClockAtLeast(60n, Date.now() + 200)).toMatchObject({ kind: "unavailable" });
+  });
+  test("timeout aborts the transport and never resets the common deadline", async () => {
+    let signal: AbortSignal | undefined;
+    const read = vi.fn(() => ({ send: (options: { abortSignal: AbortSignal }) => { signal = options.abortSignal; return new Promise(() => {}); } }));
+    const l = create(fakeRpc({ getAccountInfo: read })), deadline = Date.now() + 25;
+    expect(await l.getClockAtLeast(0n, deadline)).toMatchObject({ kind: "unavailable" });
+    expect(signal?.aborted).toBe(true);
+    expect(await l.getClockAtLeast(0n, deadline)).toMatchObject({ kind: "unavailable" });
+    expect(read).toHaveBeenCalledTimes(1);
+  });
+  test("Clock uses deadline consumed by status; no second RPC or proof", async () => {
+    const clock = vi.fn();
+    const l = create(fakeRpc({ getSignatureStatuses: () => ({ send: () => new Promise(() => {}) }), getAccountInfo: clock }));
+    const deadline = Date.now() + 20;
+    const reader = l.recoveryReader(deadline);
+    expect(await reader.getSignatureStatus("1".repeat(64))).toMatchObject({ kind: "unavailable" });
+    expect(await reader.getClockAtLeast(0n)).toMatchObject({ kind: "unavailable" }); expect(clock).not.toHaveBeenCalled();
+  });
+});

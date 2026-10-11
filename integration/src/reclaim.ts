@@ -133,7 +133,10 @@ async function main(): Promise<void> {
   const ledger = new RpcLedger({ deployment: record, network: record.network.caip2, genesisHash: record.network.genesisHash, rpcUrl });
   await ledger.verifyGenesis();
   const journal = new FileSubmissionJournal(process.env.SAC006_RECLAIM_JOURNAL_DIR ?? requireEnv("SAC006_FACILITATOR_JOURNAL_DIR"));
-  const { signature, result } = await submitReclaim({ ledger, programId: record.programId, payer, payment, lifetime: await ledger.latestBlockhash(), journal, retryAfter, retryBlockhashSlot: slotArg === undefined ? undefined : BigInt(slotArg), reader: ledger });
+  const { signature, result } = await withShared(journal.coordination, async () => {
+    journal.assertAccess();
+    return submitReclaim({ ledger, programId: record.programId, payer, payment, lifetime: await ledger.latestBlockhash(), journal, retryAfter, retryBlockhashSlot: slotArg === undefined ? undefined : BigInt(slotArg), reader: ledger });
+  });
   const status = await ledger.getSignatureStatus(signature);
   console.log(JSON.stringify({ payment, signature, result, status }, (_k, v) => (typeof v === "bigint" ? v.toString() : v), 2));
 }

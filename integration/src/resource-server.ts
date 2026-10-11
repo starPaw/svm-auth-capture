@@ -260,6 +260,13 @@ function isSettleResponse(v: unknown): v is SettleResponse {
  * a lost, malformed, pending, or unrecognized answer stays unresolved.
  */
 export async function settle(config: ResourceServerConfig, body: ReturnType<typeof facilitatorBody>, transaction: Transaction, payer: Address, firstPartyObservation = transactionObservation(transaction)): Promise<SettleOutcome> {
+  return withShared(config.store.coordination, async () => {
+    config.store.assertAccess();
+    return settleCoordinated(config, body, transaction, payer, firstPartyObservation);
+  });
+}
+
+async function settleCoordinated(config: ResourceServerConfig, body: ReturnType<typeof facilitatorBody>, transaction: Transaction, payer: Address, firstPartyObservation: ReturnType<typeof transactionObservation>): Promise<SettleOutcome> {
   const pending = (detail: string): SettleOutcome => ({
     kind: "unresolved",
     receipt: { success: false, errorReason: Reason.settlementPending, transaction: "", network: config.network },

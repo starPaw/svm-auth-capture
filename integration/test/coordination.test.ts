@@ -3,7 +3,7 @@ import { fork, type ChildProcess } from "node:child_process";
 import { chmodSync, linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { enrollRecoveryDomain, RecoveryDomain, type DomainPaths } from "../src/coordination.ts";
+import { enrollRecoveryDomain, RecoveryDomain, withShared, type DomainPaths } from "../src/coordination.ts";
 import { COORDINATION_FILE, DOMAIN_ROLES } from "../src/coordination-schema.ts";
 import { FileSubmissionJournal } from "../src/submission-journal.ts";
 import { RestaurantOrders } from "../src/restaurant.ts";
@@ -39,7 +39,10 @@ describe("real kernel multiprocess coordination", () => {
   test("SIGKILL releases only process locks; busy and action reservations remain", async () => {
     const { paths, domain } = fixture(); const a = worker(paths); await a.receive("entered");
     const exit = new Promise(r => a.c.once("exit", r)); a.c.kill("SIGKILL"); await exit;
-    await domain.run("exclusive", async () => { expect(readFileSync(join(paths.orders, `${"a".repeat(32)}.json.busy`), "utf8")).toBe("beer"); });
+    await domain.run("exclusive", async () => { expect(readFileSync(join(paths.orders, `${"a".repeat(32)}.json.busy`), "utf8")).toBe("beer");
+      expect(JSON.parse(readFileSync(join(paths.orders, `${"a".repeat(32)}.json.beer.lock`), "utf8"))).toMatchObject({ action:"beer",status:"prepared" });
+      expect(JSON.parse(readFileSync(join(paths.orders, `${"a".repeat(32)}.json`), "utf8"))).toMatchObject({ status:"pending" });
+    });
   });
   test("same-process nesting reuses token; upgrade and second domain refuse", async () => {
     const { domain } = fixture(), other = fixture();
@@ -64,6 +67,7 @@ test.each(["inode", "symlink", "hardlink", "corrupt", "missing", "weak-mode"])("
   if (kind === "corrupt") writeFileSync(p,"{}");
   if (kind === "missing") unlinkSync(p);
   if (kind === "weak-mode") chmodSync(p,0o644);
+  expect(() => new RecoveryDomain(paths)).toThrow();
   let effects = 0; await expect(domain.run("exclusive",async () => { effects++; })).rejects.toThrow(); expect(effects).toBe(0);
 });
 test("aliases and incomplete enrollment refuse; unconfigured new writers stop at enrollment metadata", () => {
@@ -71,4 +75,45 @@ test("aliases and incomplete enrollment refuse; unconfigured new writers stop at
   expect(() => new RecoveryDomain({ ...paths, orders: join(root,"alias") })).toThrow();
   expect(() => new RestaurantOrders(paths.orders).read("a".repeat(32))).toThrow();
   unlinkSync(join(paths.reclaim,COORDINATION_FILE)); expect(() => new RecoveryDomain(paths)).toThrow();
+});
+test("recovery admission refuses absent, incomplete or legacy-writer deployment proof", async () => {
+  const { domain } = fixture(); let effects = 0;
+  await expect(domain.recoveryFence(undefined, async () => { effects++; })).rejects.toThrow();
+  await expect(domain.recoveryFence(async () => false, async () => { effects++; })).rejects.toThrow();
+  expect(effects).toBe(0);
+});
+
+test("real unsupported devfs refuses before enrollment or recovery", () => {
+  const { paths } = fixture();
+  expect(() => enrollRecoveryDomain({ ...paths, facilitator:realpathSync("/dev") })).toThrow(/unsupported filesystem/);
+});
+test("directory replacement and writable ancestry refuse both existing and restarted processes", async () => {
+  const { paths, domain, root } = fixture();
+  renameSync(paths.orders,join(root,"original-orders")); mkdirSync(paths.orders,{ mode:0o700 });
+  writeFileSync(join(paths.orders,COORDINATION_FILE),readFileSync(join(root,"original-orders",COORDINATION_FILE)),{ mode:0o600 });
+  expect(() => new RecoveryDomain(paths)).toThrow(); await expect(domain.run("exclusive",async () => {})).rejects.toThrow();
+  chmodSync(root,0o777); expect(() => new RecoveryDomain(paths)).toThrow();
+});
+test("dangling symlink metadata never becomes an unenrolled legacy writer", () => {
+  const { paths,root } = fixture(), p = join(paths.reclaim,COORDINATION_FILE); unlinkSync(p); symlinkSync(join(root,"absent"),p);
+  expect(() => new FileSubmissionJournal(paths.reclaim).assertAccess()).toThrow(); expect(() => new RecoveryDomain(paths)).toThrow();
+});
+test("oversized and non-regular lock bytes refuse before parsing or effects", () => {
+  const { paths } = fixture(), p = join(paths.reclaim,COORDINATION_FILE); writeFileSync(p,"x".repeat(16385));
+  expect(() => new RecoveryDomain(paths)).toThrow(); unlinkSync(p); mkdirSync(p,{ mode:0o700 }); expect(() => new RecoveryDomain(paths)).toThrow();
+});
+
+test("identity substitution while token is held refuses the next durable mutation", async () => {
+  const { paths,root,domain } = fixture(), p = join(paths.orders,COORDINATION_FILE);
+  await domain.run("shared",async () => {
+    const raw = readFileSync(p); renameSync(p,join(root,"old-lock")); writeFileSync(p,raw,{ mode:0o600 });
+    expect(() => new RestaurantOrders(paths.orders,domain).reserve("b".repeat(32),"beer")).toThrow();
+    expect(() => readFileSync(join(paths.orders,`${"b".repeat(32)}.json.busy`))).toThrow();
+  });
+});
+
+test("exclusive recovery scope cannot enter even an unconfigured ordinary writer", async () => {
+  const { domain } = fixture(); let effects = 0;
+  await domain.run("exclusive",async () => { await expect(withShared(undefined,async () => { effects++; })).rejects.toThrow(); });
+  expect(effects).toBe(0);
 });
