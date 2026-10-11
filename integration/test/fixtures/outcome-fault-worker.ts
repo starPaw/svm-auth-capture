@@ -14,6 +14,9 @@ function hit(name:string) {
   if (!active || fired || name !== boundary) return;
   fired = true;
   if (kind === "kill") process.kill(process.pid,"SIGKILL");
+  // Linux strace calibration identifies the next real fsync syscall. The injected
+  // EIO comes from syscall tracing, not this JavaScript hook.
+  if (kind === "native-fault") { fs.writeSync(2,"NATIVE_FAULT_TARGET:"+name+"\n");return; }
   throw new Error("injected fault: "+name);
 }
 const originalOpen = fs.openSync, originalClose = fs.closeSync, originalFsync = fs.fsyncSync, originalWrite = fs.writeFileSync, originalRename = fs.renameSync, originalUnlink = fs.unlinkSync;
@@ -35,10 +38,10 @@ fs.renameSync = (a,b) => { hit("order-rename-before");originalRename(a,b);rename
 fs.unlinkSync = path => { hit("busy-unlink-before");originalUnlink(path);unlinked=true;hit("busy-unlink-after"); };
 syncBuiltinESMExports();
 try { await f.apply(); fs.writeSync(1,JSON.stringify({ unexpectedSuccess:true })+"\n"); }
-catch {
+catch (error) {
   active=false;syncBuiltinESMExports();
   const beforeRetry = { pending:JSON.parse(fs.readFileSync(f.path,"utf8")).status === "pending",busy:fs.existsSync(f.busyPath),originals:original.every(p=>hash(fs.readFileSync(p.path))===p.sha256) };
   let repeat:string;
   try { repeat=(await f.apply()).result; } catch { repeat="refused"; }
-  fs.writeSync(1,JSON.stringify({ fired,beforeRetry,repeat,after:{ status:JSON.parse(fs.readFileSync(f.path,"utf8")).status,busy:fs.existsSync(f.busyPath),originals:original.every(p=>hash(fs.readFileSync(p.path))===p.sha256) } })+"\n");
+  fs.writeSync(1,JSON.stringify({ fired,errorCode:(error as NodeJS.ErrnoException).code,beforeRetry,repeat,after:{ status:JSON.parse(fs.readFileSync(f.path,"utf8")).status,busy:fs.existsSync(f.busyPath),originals:original.every(p=>hash(fs.readFileSync(p.path))===p.sha256) } })+"\n");
 }
