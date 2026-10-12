@@ -2,6 +2,7 @@
 import { mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createHash } from 'node:crypto';
 import { getBase64Encoder, getTransactionDecoder, partiallySignTransaction, type Address } from "@solana/kit";
 import { getMintToInstruction, getTransferInstruction } from "@solana-program/token";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
@@ -10,6 +11,7 @@ import { createRestaurantApp, DEMO_BUDGET, DEMO_UNIT, RestaurantOrders, type Res
 import { createPresentationApp } from "../src/restaurant-server.js";
 import { OperationStore } from "../src/operation-store.js";
 import { FileSubmissionJournal } from "../src/submission-journal.js";
+import { createDurableFile } from "../src/durable-file.js";
 import { encodeTransaction, reclaimInstruction, refundInstruction } from "../src/transactions.js";
 import { decodeHeader, encodeHeader, type PaymentRequired } from "../src/http-transport.js";
 import { createHarness, type Harness, NOW, inspect } from "./fixture.js";
@@ -232,6 +234,84 @@ describe("merchant application authority", () => {
   });
 });
 describe("restaurant budget lifecycle", () => {
+  test('runtime Clock requires finalized context at least the original transaction slot before merchant dispatch',async()=>{
+    const s=await offer();await authorize(s);
+    const clock=vi.fn(async(min:bigint)=>({kind:'ok' as const,commitment:'finalized' as const,slot:min,unixTimestamp:NOW}));
+    c.ledger.getClockAtLeast=clock;expect((await view(s)).actions.beer).toBe(true);expect(clock.mock.calls[0]![0]).toBe(1n);
+    c.ledger.getClockAtLeast=async()=>({kind:'ok',commitment:'finalized',slot:0n,unixTimestamp:NOW+300n});
+    const response=await action(s,'beer');expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({receipt:{success:false,errorReason:'settlement_not_submitted',transaction:''}});
+    expect(h.ledger.submissions).toHaveLength(1);expect(c.orders.attempted(s.id,'beer')).toBe(false);
+  });
+  test('atomic browser action executes existing capture release flag once and independent token deltas agree',async()=>{
+    const before=h.tokens(await h.payerAta()),s=await offer('atomic');expect((await authorize(s)).status).toBe(200);
+    expect((await view(s)).actions).toMatchObject({atomic:true,beer:false,salmon:false,void:false});
+    await expectAction(s,'atomic');const v=await view(s);
+    expect(h.state(v.payment)).toMatchObject({held:0n,refundable:40n*DEMO_UNIT});
+    expect(v).toMatchObject({captured:40,released:60,remaining:0});
+    expect(h.tokens(await h.payerAta())).toBe(before-40n*DEMO_UNIT);expect(h.tokens(await h.serverAta())).toBe(40n*DEMO_UNIT);
+    expect(h.ledger.submissions).toHaveLength(2);
+    expect(inspect(h.ledger.submissions[1]!.transaction).data[9]).toBe(1);
+    expect((await action(s,'atomic')).status).toBe(409);expect(h.ledger.submissions).toHaveLength(2);
+  });
+  test('partial capture followed by actual deadline payer reclaim preserves F40 and returns only H60',async()=>{
+    const before=h.tokens(await h.payerAta()),s=await offer('partial-reclaim');await authorize(s);await expectAction(s,'beer');
+    expect(await view(s)).toMatchObject({remaining:60,refundableBaseUnits:'40000000',actions:{salmon:false,void:false,reclaim:false}});
+    h.setTime(NOW+150n);const r=await app.request(`${origin}/api/orders/${s.id}/reclaim`,{headers:{cookie:s.cookie}});expect(r.status).toBe(200);
+    const {unsigned}=await r.json() as any;
+    const result=await app.request(`${origin}/api/orders/${s.id}/reclaim`,{method:'POST',headers:{cookie:s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({transaction:await sign(unsigned)})});
+    expect(result.status).toBe(200);expect(h.state((await view(s)).payment)).toMatchObject({held:0n,refundable:40n*DEMO_UNIT});
+    expect(h.tokens(await h.payerAta())).toBe(before-40n*DEMO_UNIT);expect(h.tokens(await h.serverAta())).toBe(40n*DEMO_UNIT);
+  });
+  test('source-bound legacy recovery rejects stale provenance, retains original and survives separate reclaim preparation',async()=>{
+    const s=await offer();await authorize(s);h.setTime(NOW+150n);
+    const original=readFileSync(c.orders.path(s.id));const stored=c.orders.read(s.id);
+    c.b3Recovery={schema:1,order:s.id,payment:stored.payment,payer:stored.payer,sourceSha:'4e570a1adc14e1c5477d4a6270df02884cd58b88',orderSha256:createHash('sha256').update(original).digest('hex'),authorizeSignature:stored.events[0]!.transaction,originalEvidenceSha256:'b'.repeat(64),classification:'source-bound-pre-dispatch-refusal',action:'beer'};
+    app=createRestaurantApp(c);expect((await view(s)).b3Recovery).toMatchObject({order:s.id,continued:false});
+    for(const patch of [{order:'0'.repeat(32)},{payer:h.server.address},{payment:h.mint},{sourceSha:'a'.repeat(40)},{orderSha256:'a'.repeat(64)},{authorizeSignature:'wrong'},{classification:'balance-only'}]) {
+      const candidate=createRestaurantApp({...c,b3Recovery:{...c.b3Recovery,...patch} as any});
+      expect((await (await candidate.request(`${origin}/api/orders/${s.id}`,{headers:{cookie:s.cookie}})).json() as any).b3Recovery).toBeUndefined();
+    }
+    expect(readFileSync(c.orders.path(s.id))).toEqual(original);
+    const prep=await app.request(`${origin}/api/orders/${s.id}/reclaim`,{headers:{cookie:s.cookie}});expect(prep.status).toBe(200);
+    expect((await view(s)).b3Recovery).toMatchObject({continued:false});
+    const {unsigned}=await prep.json() as any;
+    const result=await app.request(`${origin}/api/orders/${s.id}/reclaim`,{method:'POST',headers:{cookie:s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({transaction:await sign(unsigned)})});
+    expect(result.status).toBe(200);expect((await view(s)).b3Recovery).toMatchObject({continued:true});
+    expect(c.orders.read(s.id).events[0]).toEqual(stored.events[0]);expect(c.orders.attempted(s.id,'beer')).toBe(false);
+  });
+  test('freshness must bind exact original wire; wallet consent durably blocks expired draft replacement',async()=>{
+    const s=await offer();c.ledger.offerBlockhashValid=async()=>true;
+    const preflight=()=>app.request(`${origin}/api/orders/${s.id}/signing-preflight?operation=authorize`,{headers:{cookie:s.cookie}});
+    expect((await preflight()).status).toBe(200);
+    const reserve=(unsignedSha256:string)=>app.request(`${origin}/api/orders/${s.id}/wallet-consent`,{method:'POST',headers:{cookie:s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({unsignedSha256})});
+    expect((await reserve('a'.repeat(64))).status).toBe(409);expect((await reserve(createHash('sha256').update(s.unsigned).digest('hex'))).status).toBe(200);
+    c.ledger.offerBlockhashValid=async()=>false;expect((await preflight()).status).toBe(409);h.setTime(NOW+300n);
+    const r=await app.request(`${origin}/api/orders`,{method:'POST',headers:{cookie:s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({payer:h.payer.address})});
+    expect(r.status).toBe(409);expect(h.ledger.submissions).toHaveLength(0);
+  });
+  test('reclaim wallet consent durably preserves its original draft without permitting replacement signing',async()=>{
+    const s=await offer();await authorize(s);h.setTime(NOW+150n);
+    const prepare=()=>app.request(`${origin}/api/orders/${s.id}/reclaim`,{headers:{cookie:s.cookie}});
+    const r=await prepare();expect(r.status).toBe(200);const {unsigned}=await r.json() as any;
+    const consent=await app.request(`${origin}/api/orders/${s.id}/wallet-consent?operation=reclaim`,{method:'POST',headers:{cookie:s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({unsignedSha256:createHash('sha256').update(unsigned).digest('hex')})});
+    expect(consent.status).toBe(200);app=createRestaurantApp({...c,orders:new RestaurantOrders(c.orders.dir)});
+    expect((await prepare()).status).toBe(409);expect(c.orders.read(s.id).reclaimUnsigned).toBe(unsigned);
+    const result=await app.request(`${origin}/api/orders/${s.id}/reclaim`,{method:'POST',headers:{cookie:s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({transaction:await sign(unsigned)})});
+    expect(result.status).toBe(200);expect((await view(s)).remaining).toBe(0);expect(h.ledger.submissions).toHaveLength(2);
+  });
+  test('concurrent reclaim preparation cannot replace the draft while wallet-consent eligibility awaits Clock',async()=>{
+    const s=await offer();await authorize(s);h.setTime(NOW+150n);
+    const prepare=()=>app.request(`${origin}/api/orders/${s.id}/reclaim`,{headers:{cookie:s.cookie}});
+    const {unsigned}=await (await prepare()).json() as any;
+    let entered!:()=>void,release!:(v:bigint)=>void;
+    const started=new Promise<void>(r=>entered=r),clock=new Promise<bigint>(r=>release=r);
+    c.now=()=>{entered();return clock;};
+    const consent=app.request(`${origin}/api/orders/${s.id}/wallet-consent?operation=reclaim`,{method:'POST',headers:{cookie:s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({unsignedSha256:createHash('sha256').update(unsigned).digest('hex')})});
+    await started;expect(c.orders.busy(s.id)).toBe(true);expect((await prepare()).status).toBe(409);
+    expect(c.orders.read(s.id).reclaimUnsigned).toBe(unsigned);release(NOW+150n);
+    expect((await consent).status).toBe(200);expect(c.orders.busy(s.id)).toBe(false);
+  });
   test("402 → signed authorize → menu handler → 40 → 25 → void remaining 35 with exact token deltas and finalized signatures", async () => {
     const before = h.tokens(await h.payerAta()); const s = await offer();
     const r = await authorize(s); expect(r.status).toBe(200); expect(decodeHeader(r.headers.get("PAYMENT-RESPONSE")!)).toMatchObject({ success: true });
@@ -308,9 +388,67 @@ describe("restaurant budget lifecycle", () => {
     const results = await Promise.all([action(s,"beer"),action(s,"beer")]); expect(results.map(r=>r.status).sort()).toEqual([200,409]);
     expect(h.ledger.submissions).toHaveLength(2); await expectAction(s,"salmon");
   });
+  test.each(["snapshot", "blockhash", "simulation"])("a %s refusal before merchant preparation returns definitive not-submitted without signing or changing originals", async phase => {
+    const s = await offer(); await authorize(s);
+    const original = readFileSync(c.orders.path(s.id), "utf8");
+    const secret = "SYNTHETIC_PRIVATE_RPC_DETAIL";
+    if (phase === "snapshot") vi.spyOn(c.ledger, "getAccountAtLeast").mockResolvedValueOnce({ kind: "unavailable", detail: secret });
+    if (phase === "blockhash") vi.spyOn(c, "getLatestBlockhash").mockRejectedValueOnce(new Error(secret));
+    if (phase === "simulation") vi.spyOn(c.ledger, "simulate").mockRejectedValueOnce(new Error(secret));
+    const relay = vi.fn(); c.fetchImpl = relay;
+    const response = await action(s, "beer");
+    const body = await response.json() as any;
+    expect(response.status).toBe(409);
+    expect(body).toMatchObject({ receipt: { success: false, errorReason: "settlement_not_submitted", transaction: "", payer: h.payer.address } });
+    expect(decodeHeader(response.headers.get("PAYMENT-RESPONSE")!)).toEqual(body.receipt);
+    expect(JSON.stringify(body)).not.toContain(secret);
+    expect(relay).not.toHaveBeenCalled(); expect(h.ledger.submissions).toHaveLength(1);
+    expect(readFileSync(c.orders.path(s.id), "utf8")).toBe(original);
+    expect(c.orders.busy(s.id)).toBe(false); expect(c.orders.attempted(s.id, "beer")).toBe(false);
+    h.setTime(NOW + 150n);
+    expect(await view(s)).toMatchObject({ status: "active", remaining: 100, actions: { reclaim: true } });
+  });
+  test("an unlock failure cannot produce a definitive not-submitted receipt or release the busy reservation", async () => {
+    const s = await offer(); await authorize(s);
+    vi.spyOn(c, "getLatestBlockhash").mockRejectedValueOnce(new Error("SYNTHETIC_PRIVATE_RPC_DETAIL"));
+    vi.spyOn(c.orders, "unlock").mockImplementationOnce(() => { throw new Error("SYNTHETIC_PRIVATE_UNLOCK_DETAIL"); });
+    const response = await action(s, "beer");
+    expect(response.status).toBe(409); expect(await response.json()).not.toHaveProperty("receipt");
+    expect(c.orders.busy(s.id)).toBe(true); expect(h.ledger.submissions).toHaveLength(1);
+  });
+  test("a partial preparation failure retains original bytes and reservations without a not-submitted receipt", async () => {
+    const s = await offer(); await authorize(s);
+    const prepare = c.orders.prepare.bind(c.orders);
+    vi.spyOn(c.orders, "prepare").mockImplementationOnce((order, event) => {
+      prepare(order, event); throw new Error("SYNTHETIC_PRIVATE_PREPARATION_DETAIL");
+    });
+    const relay = vi.fn(); c.fetchImpl = relay;
+    const response = await action(s, "beer");
+    expect(response.status).toBe(409); expect(await response.json()).not.toHaveProperty("receipt");
+    const record = c.orders.read(s.id);
+    expect(record.status).toBe("pending"); expect(record.events[1]!.transactionBase64.length).toBeGreaterThan(0);
+    expect(c.orders.attempted(s.id, "beer")).toBe(true); expect(c.orders.busy(s.id)).toBe(true);
+    expect(relay).not.toHaveBeenCalled(); expect(h.ledger.submissions).toHaveLength(1);
+  });
+  test("an action lock created before the order update also retains the busy reservation", async () => {
+    const s = await offer(); await authorize(s);
+    const original = readFileSync(c.orders.path(s.id), "utf8");
+    vi.spyOn(c.orders, "prepare").mockImplementationOnce((order, event) => {
+      createDurableFile(`${c.orders.path(order.id)}.${event.action}.lock`, JSON.stringify(event));
+      throw new Error("SYNTHETIC_PRIVATE_PREPARATION_DETAIL");
+    });
+    const response = await action(s, "beer");
+    expect(response.status).toBe(409); expect(await response.json()).not.toHaveProperty("receipt");
+    expect(readFileSync(c.orders.path(s.id), "utf8")).toBe(original);
+    expect(c.orders.attempted(s.id, "beer")).toBe(true); expect(c.orders.busy(s.id)).toBe(true);
+    expect(h.ledger.submissions).toHaveLength(1);
+  });
   test("lost finalized response freezes all new consent and retains original transaction bytes across restart", async () => {
     const s = await offer(); await authorize(s); h.ledger.failSubmit = "after-landing";
-    expect((await action(s,"beer")).status).toBe(409); expect(await view(s)).toMatchObject({ status:"pending",remaining:60 });
+    const response = await action(s,"beer");
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ receipt: { errorReason: "settlement_pending", transaction: expect.any(String) } });
+    expect(await view(s)).toMatchObject({ status:"pending",remaining:60 });
     const record = JSON.parse(readFileSync(c.orders.path(s.id),"utf8")); expect(record.events[1].transactionBase64.length).toBeGreaterThan(0);
     app = createRestaurantApp({ ...c, orders: new RestaurantOrders(join(dir,"orders")) });
     expect((await action(s,"salmon")).status).toBe(409); expect((await action(s,"void")).status).toBe(409); expect(h.ledger.submissions).toHaveLength(2);
@@ -420,7 +558,7 @@ describe("issue #45 read-only operator preflight and fail-closed eligibility", (
     const s = await offer(); await authorize(s); h.ledger.failSubmit = "after-landing"; await action(s, "beer");
     const disk = readFileSync(c.orders.path(s.id), "utf8");
     const v = await (await preflight(s)).json() as any;
-    expect(v.status).toBe("pending"); expect(Object.values(v.actions)).toEqual(Array(6).fill(false));
+    expect(v.status).toBe("pending"); expect(Object.values(v.actions)).toEqual(Array(7).fill(false));
     expect(v.actionReasons.salmon).toContain("pending");
     expect(readFileSync(c.orders.path(s.id), "utf8")).toBe(disk); expect(h.ledger.submissions).toHaveLength(2);
   });

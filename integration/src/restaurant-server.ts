@@ -13,6 +13,8 @@ import { OperationStore } from "./operation-store.ts";
 import { FileSubmissionJournal } from "./submission-journal.ts";
 import { RpcLedger, cachedClusterClock } from "./rpc-ledger.ts";
 import { TOKEN_PROGRAM_ADDRESS } from "./program.ts";
+import { AdmissionJournal } from './admission-journal.ts';
+import { E2E_SPONSOR, requireE2eRuntimeRpc, trustedRuntimeFile } from './e2e-runtime-policy.ts';
 
 export const DEMO_TIMING = { captureSeconds: 150, refundSecondsAfterCapture: 30 } as const;
 const root = fileURLToPath(new URL("../web/", import.meta.url));
@@ -28,7 +30,7 @@ export function createPresentationApp(info: { programId: string; network: string
   app.all("/assets/homepage.js", async (c, next) => { if (c.req.method !== "GET") return c.body(null, 405); await next(); });
   app.get("/", c => c.html(readFileSync(`${root}homepage.html`, "utf8")));
   for (const route of ["/customer", "/merchant"]) app.get(route, c => c.html(readFileSync(`${root}index.html`, "utf8")));
-  for (const [name, mime] of [["homepage.css", "text/css"], ["homepage.js", "text/javascript"], ["app.js", "text/javascript"], ["wallet.js", "text/javascript"], ["style.css", "text/css"], ["solflare.js", "text/javascript"], ["solflare.js.LEGAL.txt", "text/plain"]]) app.get(`/assets/${name}`, c => { c.header("Content-Type", `${mime}; charset=utf-8`); return c.body(readFileSync(`${root}${name}`)); });
+  for (const [name, mime] of [["homepage.css", "text/css"], ["homepage.js", "text/javascript"], ["app.js", "text/javascript"], ["receipt-state.js", "text/javascript"], ["wallet.js", "text/javascript"], ["style.css", "text/css"], ["solflare.js", "text/javascript"], ["solflare.js.LEGAL.txt", "text/plain"]]) app.get(`/assets/${name}`, c => { c.header("Content-Type", `${mime}; charset=utf-8`); return c.body(readFileSync(`${root}${name}`)); });
   app.get("/api/config", c => c.json({ ...info, venue: "Pivovar Marina", budget: 100, decimals: 6, assetLabel: "demo USDC", cluster: "devnet", walletChain: "solana:devnet", computeBudget: DEMO_COMPUTE, timing: DEMO_TIMING }));
   if (backend) app.route("/", backend);
   else { for (const pattern of ["/api/*", "/resource"]) app.all(pattern, c => c.json({ error: "Devnet demo awaits keypairs, six-decimal test mint and token funding." }, 503)); }
@@ -44,6 +46,11 @@ async function main() {
   const info = { programId: record.programId, network: record.network.caip2, configured: false, reason: "Provisioning required" };
   let backend: Hono | undefined;
   if (missing.length === 0) {
+    const e2e = process.env.SAC006_FEE_PAYER === E2E_SPONSOR || process.env.SAC006_SERVER_KEYPAIR_PATH!.includes('/capture402-e2e/');
+    if (e2e) requireE2eRuntimeRpc(process.env.SOLANA_RPC_URL!,record);
+    const b3Recovery = e2e && process.env.SAC006_B3_RECOVERY_POLICY_PATH ? JSON.parse(trustedRuntimeFile(process.env.SAC006_B3_RECOVERY_POLICY_PATH)) : undefined;
+    if (b3Recovery && (b3Recovery.order !== 'c17b234248fb69cf0e624fc32ac45bcd' || b3Recovery.payment !== '2ZGNGg4k97DX5RPnQSDsuTb99Nxjyt4cYpjvYitUv8JS' ||
+      b3Recovery.payer !== '93PtawNdAfDn7oTjRrbrJJMSgaFTjGS3wjtkrZSNGn74' || b3Recovery.authorizeSignature !== '2d3tAStAtNT891UPAqThpwVNvHGkFP76dX5yvfYNPjAmKLkzBdEFzvZ6ZBh9Ba7HhNotUGdrFmitwdDiW7iRh4dT')) throw Error('B3 recovery policy exceeds the selected operation');
     const ledger = new RpcLedger({ deployment: record, network: record.network.caip2, genesisHash: record.network.genesisHash, rpcUrl: process.env.SOLANA_RPC_URL! });
     await ledger.verifyGenesis();
     const server = await createKeyPairSignerFromBytes(Uint8Array.from(JSON.parse(readFileSync(process.env.SAC006_SERVER_KEYPAIR_PATH!, "utf8"))));
@@ -59,6 +66,9 @@ async function main() {
       reclaimJournal: new FileSubmissionJournal(process.env.SAC006_RECLAIM_JOURNAL_DIR ?? `${baseDir}-restaurant-reclaim`),
       origin: process.env.SAC006_PUBLIC_ORIGIN ?? "https://capture402.xyz", getLatestBlockhash: () => ledger.latestBlockhash(), now: cachedClusterClock(() => ledger.now()),
       handler: async () => { throw new Error("restaurant menu uses explicit lifecycle captures"); },
+      ...(e2e ? { orderAdmission:new AdmissionJournal(process.env.SAC006_E2E_ORDER_ADMISSION_DIR!,'orders',Number(process.env.SAC006_E2E_MAX_ORDERS)),
+        ...(b3Recovery ? {b3Recovery} : {}),
+        now:() => ledger.now() } : {}),
     };
     backend = createRestaurantApp(config); info.configured = true;
     Object.assign(info, { sponsor: config.feePayer, merchant: server.address, mint: config.asset, reason: undefined });

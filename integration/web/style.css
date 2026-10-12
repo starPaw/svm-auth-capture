@@ -10,4 +10,5 @@
 @media(max-width:700px){#merchant-panel>.step{display:inline-grid;grid-template-columns:1fr;width:calc((100% - 14px)/3);vertical-align:top;margin:2px 3px 3px 0;gap:2px}#merchant-panel>.step .button{padding-inline:3px;width:100%}#merchant-panel>.step .reason{font-size:9px}.secondary-actions{margin-top:3px}.history-heading .button{font-size:9px}.history-heading h2{font-size:11px}.metrics strong{font-size:18px}.metrics>div{padding-block:3px}}
 @media(max-width:360px){h1{font-size:15px!important}.brand{font-size:11px}.network{font-size:9px}.brand small{font-size:8px}.notice{font-size:9px}.metrics span{font-size:9px}.wallet-box .button{font-size:9px}.step .reason{font-size:8px}.card h2{font-size:12px}.secondary-actions .button{font-size:9px}.clock-details{font-size:8px}}
 @media(min-width:701px){header{padding-block:10px}.heading{margin:10px 0 8px}.metrics>div{padding:6px 10px}.clock-details{margin:5px 0 9px}.button{min-height:30px;padding:5px 9px}.card{padding:10px}.step{margin-block:3px}.history-card{padding-block:7px}}
+[hidden]{display:none!important}
 .wallet-box button{white-space:nowrap;flex-shrink:0}

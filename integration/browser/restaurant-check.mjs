@@ -22,7 +22,7 @@ await once(server, 'listening');
 const origin = `https://127.0.0.1:${server.address().port}`;
 let browser;
 const report = { scope:'Local HTTPS DOM fixtures; no Devnet, wallet signing or economic E2E claim.', browser:'', checks:[], viewports:[], requests:[] };
-let lastActionBody, nextActionPreflight;
+let lastActionBody, nextActionPreflight, definitiveResponse = false;
 let state, rpcFailure = false, posts = 0, gets = 0, loseResponse = false, delayPreflight = false, missingAuthority = false;
 const secret = 'local-browser-fixture-credential-' + 'x'.repeat(32);
 const id = 'a'.repeat(32);
@@ -55,12 +55,16 @@ try {
       }
       posts++; lastActionBody = req.postData();
       if (loseResponse) return route.abort('failed');
+      if (definitiveResponse) {
+        const receipt={success:false,errorReason:'settlement_not_submitted',transaction:'',network:info.network,payer:state.payer};
+        return route.fulfill({status:409,contentType:'application/json',headers:{'PAYMENT-RESPONSE':Buffer.from(JSON.stringify(receipt)).toString('base64')},body:JSON.stringify({receipt})});
+      }
       return route.fulfill({status:409,contentType:'application/json',body:JSON.stringify({receipt:{success:false,errorReason:'settlement_pending',transaction:''}})});
     }
     return route.fulfill({status:rpcFailure?409:200,contentType:'application/json',body:JSON.stringify(rpcFailure?{error:'Finalized RPC state unavailable.'}:state)});
   });
   async function load(next, wallet = false) {
-    nextActionPreflight = undefined; state = next; rpcFailure = false; posts = 0; gets = 0; loseResponse = false; missingAuthority = false;
+    nextActionPreflight = undefined; state = next; rpcFailure = false; posts = 0; gets = 0; loseResponse = false; missingAuthority = false; definitiveResponse = false;
     await page.goto(origin + '/customer');
     await page.evaluate(({state,id,wallet}) => {
       localStorage.clear(); if(state) localStorage.setItem('capture402-order',state.id);
@@ -174,6 +178,33 @@ try {
   await load({...fullRefund,balances:{...fullRefund.balances,merchant:{amount:10,reason:''}}}); await unlock();
   assert(await page.locator('[data-action=refund]').isDisabled());
   assert.equal(posts,0); check('Dedicated refund UI still requires full F liquidity');
+  await load(held());await unlock();definitiveResponse=true;
+  await page.locator('[data-action=beer]').click();await page.waitForFunction(()=>document.getElementById('action-status').textContent.includes('refused'));
+  assert.equal(posts,1);assert.equal(await page.evaluate(()=>localStorage.getItem('capture402-uncertain')),null);
+  assert(await page.evaluate(()=>JSON.parse(localStorage.getItem('capture402-request-'+localStorage.getItem('capture402-order'))).path.endsWith('/actions/beer')));
+  check('Exact pre-dispatch body/header releases only its fresh latch and retains source-bound request metadata');
+  const recovery={order:id,payer:info.merchant,payment:info.programId,policySha256:'a'.repeat(64),originalEvidenceSha256:'b'.repeat(64),classification:'source-bound-pre-dispatch-refusal',continued:false};
+  const expiredHeld={...held(),captureDeadline:Math.floor(Date.now()/1000)-1,actions:{...held().actions,reclaim:true},b3Recovery:recovery};
+  await load(expiredHeld,true);await page.locator('#connect-wallet').click();await page.locator('#wallet-list button').first().click();
+  await page.evaluate(()=>localStorage.setItem('capture402-uncertain',localStorage.getItem('capture402-order')));
+  await page.locator('#refresh').click();await page.waitForFunction(()=>!document.getElementById('reclaim').disabled);
+  assert(!(await page.locator('#reclaim').isDisabled()));assert(await page.locator('[data-action=beer]').isDisabled());assert(await page.locator('#new-budget').isHidden());
+  assert.equal(await page.evaluate(()=>localStorage.getItem('capture402-uncertain')),id);
+  check('Reviewed legacy provenance enables only distinct payer reclaim while original latch stays retained');
+  await page.evaluate(()=>localStorage.setItem('capture402-reclaim-wallet-attempt',localStorage.getItem('capture402-order')));
+  await page.locator('#refresh').click();await page.waitForFunction(()=>document.getElementById('reclaim').disabled);
+  assert.equal(posts,0);check('Original reclaim wallet-consent marker blocks replacement signing across refresh');
+  await page.evaluate(()=>localStorage.removeItem('capture402-reclaim-wallet-attempt')); // Controlled DOM fixture only.
+  state={...expiredHeld,b3Recovery:{...recovery,payment:'stale'}};await page.locator('#refresh').click();await page.waitForFunction(()=>document.getElementById('reclaim').disabled);
+  assert.equal(posts,0);check('Wrong legacy payment provenance keeps payer reclaim locked');
+  await load({...held(),scenario:'atomic',actions:{...held().actions,beer:false,atomic:true},actionReasons:{atomic:''}});await unlock();
+  assert(!(await page.locator('[data-action=atomic]').isDisabled()));assert(await page.locator('[data-action=atomic]').isVisible());
+  await page.locator('[data-action=atomic]').click();await page.waitForFunction(()=>document.getElementById('payment-state').textContent.includes('Unknown'));
+  assert.equal(posts,1);check('Atomic scenario exposes a single explicit action and UNKNOWN still blocks new actions');
+  await load({...fullRefund,status:'closed',remaining:0,heldBaseUnits:'0'},true);await page.locator('#connect-wallet').click();await page.locator('#wallet-list button').first().click();
+  assert(!(await page.locator('[data-scenario=cancelled]').isDisabled()));await page.locator('[data-scenario=cancelled]').click();await page.locator('#new-budget').click();
+  await page.waitForFunction(()=>localStorage.getItem('capture402-order')==='b'.repeat(32));assert.equal(posts,1);
+  check('Closed original hold permits explicit selection of the next scenario before a separately unsigned offer');
   assert.equal(errors.length,0,errors.join('\n'));
   check('No browser page errors or external runtime requests');
   writeFileSync(join(output,'restaurant-browser-report.json'),JSON.stringify(report,null,2));
