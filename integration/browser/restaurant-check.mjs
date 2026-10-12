@@ -191,6 +191,10 @@ try {
   assert(!(await page.locator('#reclaim').isDisabled()));assert(await page.locator('[data-action=beer]').isDisabled());assert(await page.locator('#new-budget').isHidden());
   assert.equal(await page.evaluate(()=>localStorage.getItem('capture402-uncertain')),id);
   check('Reviewed legacy provenance enables only distinct payer reclaim while original latch stays retained');
+  await page.evaluate(()=>localStorage.setItem('capture402-reclaim-wallet-attempt',localStorage.getItem('capture402-order')));
+  await page.locator('#refresh').click();await page.waitForFunction(()=>document.getElementById('reclaim').disabled);
+  assert.equal(posts,0);check('Original reclaim wallet-consent marker blocks replacement signing across refresh');
+  await page.evaluate(()=>localStorage.removeItem('capture402-reclaim-wallet-attempt')); // Controlled DOM fixture only.
   state={...expiredHeld,b3Recovery:{...recovery,payment:'stale'}};await page.locator('#refresh').click();await page.waitForFunction(()=>document.getElementById('reclaim').disabled);
   assert.equal(posts,0);check('Wrong legacy payment provenance keeps payer reclaim locked');
   await load({...held(),scenario:'atomic',actions:{...held().actions,beer:false,atomic:true},actionReasons:{atomic:''}});await unlock();

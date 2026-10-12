@@ -66,3 +66,8 @@ test('runtime cap drift and externally held lock deny without changing state',()
   try{flock(fd,'exnb');expect(()=>f.restart()).toThrow();}finally{flock(fd,'un');closeSync(fd);}
   expect(createHash('sha256').update(readFileSync(join(f.dir,'state.json'))).digest('hex')).toBe(before);
 });
+test('durable guard cannot silently expand its explicit configured attempt cap',()=>{
+  const f=fixture();
+  expect(()=>new SponsorshipGuard({admission:f.restart(),maxAttempts:1,minLamportsBalance:0n,feePayer:'11111111111111111111111111111111' as any,ledger:{} as any})).toThrow(/cap mismatch/);
+  expect(f.restart().summary().used).toBe(20);
+});

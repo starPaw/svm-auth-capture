@@ -86,7 +86,7 @@ function render() {
   if (!safeOperatorTransport()) $('operator-status').textContent = 'Operator-only controls require HTTPS on the configured Devnet demo.';
   $('reclaim-box').hidden = !order || order.remaining <= 0;
   const payerMatches = order?.payer === connection?.account?.address;
-  $('reclaim').disabled = diagnosticOnly || busy || stale || uncertain() && !recoveryAllowed() || localStorage.getItem('capture402-reclaim-uncertain') === order?.id || !payerMatches || !order?.actions?.reclaim;
+  $('reclaim').disabled = diagnosticOnly || busy || stale || uncertain() && !recoveryAllowed() || localStorage.getItem('capture402-reclaim-wallet-attempt') === order?.id || localStorage.getItem('capture402-reclaim-uncertain') === order?.id || !payerMatches || !order?.actions?.reclaim;
   $('reclaim').textContent = recoveryAllowed() ? 'Resume payer reclaim · preserve original refusal evidence' : 'Reclaim remaining hold';
   $('reclaim-description').textContent = recoveryAllowed() ? 'Reviewed source-bound pre-dispatch evidence; fresh payer consent reclaims the expired hold. Original latch remains archived; this is a new operation.' : uncertain() ? 'Original response unknown; inspect its signatures.' : stale ? 'Fresh finalized RPC state unavailable.' : !payerMatches ? 'Connect the original payer wallet to reclaim.' : order?.actionReasons?.reclaim || 'Ready for payer-direct reclaim; the facilitator is not used.';
   document.querySelectorAll('[data-scenario]').forEach(b => { b.classList.toggle('selected', b.dataset.scenario === scenario); b.disabled = busy || !!order && !canReplace(); });
@@ -224,7 +224,9 @@ $('reclaim').onclick = () => {
     const recovery = recoveryAllowed();
     if (recovery) localStorage.setItem(`capture402-recovery-archive-${order.id}`,JSON.stringify({originalLatch:localStorage.getItem('capture402-uncertain'),evidence:order.b3Recovery,acknowledgedAt:new Date().toISOString()}));
     const { data } = await request(`/api/orders/${order.id}/reclaim`);
-    await signingPreflight(data.unsigned,'reclaim');
+    const unsignedSha256=await signingPreflight(data.unsigned,'reclaim');
+    await request(`/api/orders/${order.id}/wallet-consent?operation=reclaim`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({unsignedSha256})});
+    localStorage.setItem('capture402-reclaim-wallet-attempt',order.id);
     const signed = await walletSign(connection, data.unsigned, config);
     localStorage.setItem(`capture402-reclaim-signed-${order.id}`,signed);
     await signingPreflight(data.unsigned,'reclaim');

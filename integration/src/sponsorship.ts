@@ -38,6 +38,7 @@ export class SponsorshipGuard {
   constructor(config: SponsorshipGuardConfig) {
     if (!Number.isSafeInteger(config.maxAttempts) || config.maxAttempts < 0) throw new Error("maxAttempts must be a nonnegative safe integer");
     if (config.minLamportsBalance < 0n) throw new Error("minLamportsBalance must be nonnegative");
+    if (config.admission && config.admission.policy.maximum !== config.maxAttempts) throw Error('sponsorship admission/guard cap mismatch');
     this.config = config;
   }
 

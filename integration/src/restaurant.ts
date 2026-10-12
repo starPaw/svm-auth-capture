@@ -276,9 +276,13 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
   app.post('/api/orders/:id/wallet-consent',async ctx => {
     const order = owned(ctx.req.param('id'),getCookie(ctx,cookieName));
     const body = await ctx.req.json();
-    if (Object.keys(body).sort().join() !== 'unsignedSha256' || body.unsignedSha256 !== digest(order.unsigned) || order.status !== 'draft' || order.events.length || c.orders.busy(order.id) ||
-      await c.now() >= BigInt(order.required.accepts[0]!.extra!.captureDeadline as number)) return ctx.json({error:'Original consent state differs.'},409);
-    createDurableFile(`${c.orders.path(order.id)}.wallet-consent.lock`,JSON.stringify({order:order.id,unsignedSha256:body.unsignedSha256}));
+    const reclaim=ctx.req.query('operation')==='reclaim',unsigned=reclaim?order.reclaimUnsigned:order.unsigned;
+    if (!unsigned || Object.keys(body).sort().join() !== 'unsignedSha256' || body.unsignedSha256 !== digest(unsigned) || c.orders.busy(order.id) || order.status==='pending') return ctx.json({error:'Original consent state differs.'},409);
+    if (reclaim) {
+      const p=await restaurantSnapshot(c,order);
+      if (!p || actionReasons(c,order,p,await orderClock(c,order),false).reclaim) return ctx.json({error:'Original reclaim consent is not eligible.'},409);
+    } else if(order.status!=='draft' || order.events.length || await orderClock(c,order)>=BigInt(order.required.accepts[0]!.extra!.captureDeadline as number)) return ctx.json({error:'Original consent state differs.'},409);
+    createDurableFile(`${c.orders.path(order.id)}.${reclaim?'reclaim-consent':'wallet-consent'}.lock`,JSON.stringify({order:order.id,unsignedSha256:body.unsignedSha256}));
     return ctx.json({reserved:true});
   });
   app.post("/resource", async ctx => {
@@ -361,6 +365,7 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
   });
   app.get("/api/orders/:id/reclaim", async ctx => {
     let order = owned(ctx.req.param("id"), getCookie(ctx, cookieName));
+    if(existsSync(`${c.orders.path(order.id)}.reclaim-consent.lock`)) return ctx.json({error:'Original reclaim consent already attempted; inspect retained draft/signature before replacement.'},409);
     c.orders.reserve(order.id, "reclaim");
     try {
       order = c.orders.read(order.id);

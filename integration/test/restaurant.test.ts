@@ -290,6 +290,16 @@ describe("restaurant budget lifecycle", () => {
     const r=await app.request(`${origin}/api/orders`,{method:'POST',headers:{cookie:s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({payer:h.payer.address})});
     expect(r.status).toBe(409);expect(h.ledger.submissions).toHaveLength(0);
   });
+  test('reclaim wallet consent durably preserves its original draft without permitting replacement signing',async()=>{
+    const s=await offer();await authorize(s);h.setTime(NOW+150n);
+    const prepare=()=>app.request(`${origin}/api/orders/${s.id}/reclaim`,{headers:{cookie:s.cookie}});
+    const r=await prepare();expect(r.status).toBe(200);const {unsigned}=await r.json() as any;
+    const consent=await app.request(`${origin}/api/orders/${s.id}/wallet-consent?operation=reclaim`,{method:'POST',headers:{cookie:s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({unsignedSha256:createHash('sha256').update(unsigned).digest('hex')})});
+    expect(consent.status).toBe(200);app=createRestaurantApp({...c,orders:new RestaurantOrders(c.orders.dir)});
+    expect((await prepare()).status).toBe(409);expect(c.orders.read(s.id).reclaimUnsigned).toBe(unsigned);
+    const result=await app.request(`${origin}/api/orders/${s.id}/reclaim`,{method:'POST',headers:{cookie:s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({transaction:await sign(unsigned)})});
+    expect(result.status).toBe(200);expect((await view(s)).remaining).toBe(0);expect(h.ledger.submissions).toHaveLength(2);
+  });
   test("402 → signed authorize → menu handler → 40 → 25 → void remaining 35 with exact token deltas and finalized signatures", async () => {
     const before = h.tokens(await h.payerAta()); const s = await offer();
     const r = await authorize(s); expect(r.status).toBe(200); expect(decodeHeader(r.headers.get("PAYMENT-RESPONSE")!)).toMatchObject({ success: true });
