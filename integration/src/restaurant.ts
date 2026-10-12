@@ -274,16 +274,22 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
     return ctx.json({id:order.id,operation:reclaim?'reclaim':'authorize',unsignedSha256:digest(unsigned),fresh:true});
   });
   app.post('/api/orders/:id/wallet-consent',async ctx => {
-    const order = owned(ctx.req.param('id'),getCookie(ctx,cookieName));
+    let order = owned(ctx.req.param('id'),getCookie(ctx,cookieName));
     const body = await ctx.req.json();
-    const reclaim=ctx.req.query('operation')==='reclaim',unsigned=reclaim?order.reclaimUnsigned:order.unsigned;
-    if (!unsigned || Object.keys(body).sort().join() !== 'unsignedSha256' || body.unsignedSha256 !== digest(unsigned) || c.orders.busy(order.id) || order.status==='pending') return ctx.json({error:'Original consent state differs.'},409);
-    if (reclaim) {
-      const p=await restaurantSnapshot(c,order);
-      if (!p || actionReasons(c,order,p,await orderClock(c,order),false).reclaim) return ctx.json({error:'Original reclaim consent is not eligible.'},409);
-    } else if(order.status!=='draft' || order.events.length || await orderClock(c,order)>=BigInt(order.required.accepts[0]!.extra!.captureDeadline as number)) return ctx.json({error:'Original consent state differs.'},409);
-    createDurableFile(`${c.orders.path(order.id)}.${reclaim?'reclaim-consent':'wallet-consent'}.lock`,JSON.stringify({order:order.id,unsignedSha256:body.unsignedSha256}));
-    return ctx.json({reserved:true});
+    const reclaim=ctx.req.query('operation')==='reclaim';
+    c.orders.reserve(order.id,reclaim?'reclaim':'authorize');
+    try {
+      // Serialize the consent marker against draft replacement and merchant actions.
+      order=c.orders.read(order.id);
+      const unsigned=reclaim?order.reclaimUnsigned:order.unsigned;
+      if (!unsigned || Object.keys(body).sort().join() !== 'unsignedSha256' || body.unsignedSha256 !== digest(unsigned) || order.status==='pending') return ctx.json({error:'Original consent state differs.'},409);
+      if (reclaim) {
+        const p=await restaurantSnapshot(c,order);
+        if (!p || actionReasons(c,order,p,await orderClock(c,order),false).reclaim) return ctx.json({error:'Original reclaim consent is not eligible.'},409);
+      } else if(order.status!=='draft' || order.events.length || await orderClock(c,order)>=BigInt(order.required.accepts[0]!.extra!.captureDeadline as number)) return ctx.json({error:'Original consent state differs.'},409);
+      createDurableFile(`${c.orders.path(order.id)}.${reclaim?'reclaim-consent':'wallet-consent'}.lock`,JSON.stringify({order:order.id,unsignedSha256:body.unsignedSha256}));
+      return ctx.json({reserved:true});
+    } finally {c.orders.unlock(order.id);}
   });
   app.post("/resource", async ctx => {
     const order = owned(ctx.req.query("order") ?? "", getCookie(ctx, cookieName));

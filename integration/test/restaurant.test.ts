@@ -300,6 +300,18 @@ describe("restaurant budget lifecycle", () => {
     const result=await app.request(`${origin}/api/orders/${s.id}/reclaim`,{method:'POST',headers:{cookie:s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({transaction:await sign(unsigned)})});
     expect(result.status).toBe(200);expect((await view(s)).remaining).toBe(0);expect(h.ledger.submissions).toHaveLength(2);
   });
+  test('concurrent reclaim preparation cannot replace the draft while wallet-consent eligibility awaits Clock',async()=>{
+    const s=await offer();await authorize(s);h.setTime(NOW+150n);
+    const prepare=()=>app.request(`${origin}/api/orders/${s.id}/reclaim`,{headers:{cookie:s.cookie}});
+    const {unsigned}=await (await prepare()).json() as any;
+    let entered!:()=>void,release!:(v:bigint)=>void;
+    const started=new Promise<void>(r=>entered=r),clock=new Promise<bigint>(r=>release=r);
+    c.now=()=>{entered();return clock;};
+    const consent=app.request(`${origin}/api/orders/${s.id}/wallet-consent?operation=reclaim`,{method:'POST',headers:{cookie:s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({unsignedSha256:createHash('sha256').update(unsigned).digest('hex')})});
+    await started;expect(c.orders.busy(s.id)).toBe(true);expect((await prepare()).status).toBe(409);
+    expect(c.orders.read(s.id).reclaimUnsigned).toBe(unsigned);release(NOW+150n);
+    expect((await consent).status).toBe(200);expect(c.orders.busy(s.id)).toBe(false);
+  });
   test("402 → signed authorize → menu handler → 40 → 25 → void remaining 35 with exact token deltas and finalized signatures", async () => {
     const before = h.tokens(await h.payerAta()); const s = await offer();
     const r = await authorize(s); expect(r.status).toBe(200); expect(decodeHeader(r.headers.get("PAYMENT-RESPONSE")!)).toMatchObject({ success: true });
