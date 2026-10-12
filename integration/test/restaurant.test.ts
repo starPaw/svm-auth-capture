@@ -10,6 +10,7 @@ import { createRestaurantApp, DEMO_BUDGET, DEMO_UNIT, RestaurantOrders, type Res
 import { createPresentationApp } from "../src/restaurant-server.js";
 import { OperationStore } from "../src/operation-store.js";
 import { FileSubmissionJournal } from "../src/submission-journal.js";
+import { createDurableFile } from "../src/durable-file.js";
 import { encodeTransaction, reclaimInstruction, refundInstruction } from "../src/transactions.js";
 import { decodeHeader, encodeHeader, type PaymentRequired } from "../src/http-transport.js";
 import { createHarness, type Harness, NOW, inspect } from "./fixture.js";
@@ -308,9 +309,67 @@ describe("restaurant budget lifecycle", () => {
     const results = await Promise.all([action(s,"beer"),action(s,"beer")]); expect(results.map(r=>r.status).sort()).toEqual([200,409]);
     expect(h.ledger.submissions).toHaveLength(2); await expectAction(s,"salmon");
   });
+  test.each(["snapshot", "blockhash", "simulation"])("a %s refusal before merchant preparation returns definitive not-submitted without signing or changing originals", async phase => {
+    const s = await offer(); await authorize(s);
+    const original = readFileSync(c.orders.path(s.id), "utf8");
+    const secret = "SYNTHETIC_PRIVATE_RPC_DETAIL";
+    if (phase === "snapshot") vi.spyOn(c.ledger, "getAccountAtLeast").mockResolvedValueOnce({ kind: "unavailable", detail: secret });
+    if (phase === "blockhash") vi.spyOn(c, "getLatestBlockhash").mockRejectedValueOnce(new Error(secret));
+    if (phase === "simulation") vi.spyOn(c.ledger, "simulate").mockRejectedValueOnce(new Error(secret));
+    const relay = vi.fn(); c.fetchImpl = relay;
+    const response = await action(s, "beer");
+    const body = await response.json() as any;
+    expect(response.status).toBe(409);
+    expect(body).toMatchObject({ receipt: { success: false, errorReason: "settlement_not_submitted", transaction: "", payer: h.payer.address } });
+    expect(decodeHeader(response.headers.get("PAYMENT-RESPONSE")!)).toEqual(body.receipt);
+    expect(JSON.stringify(body)).not.toContain(secret);
+    expect(relay).not.toHaveBeenCalled(); expect(h.ledger.submissions).toHaveLength(1);
+    expect(readFileSync(c.orders.path(s.id), "utf8")).toBe(original);
+    expect(c.orders.busy(s.id)).toBe(false); expect(c.orders.attempted(s.id, "beer")).toBe(false);
+    h.setTime(NOW + 150n);
+    expect(await view(s)).toMatchObject({ status: "active", remaining: 100, actions: { reclaim: true } });
+  });
+  test("an unlock failure cannot produce a definitive not-submitted receipt or release the busy reservation", async () => {
+    const s = await offer(); await authorize(s);
+    vi.spyOn(c, "getLatestBlockhash").mockRejectedValueOnce(new Error("SYNTHETIC_PRIVATE_RPC_DETAIL"));
+    vi.spyOn(c.orders, "unlock").mockImplementationOnce(() => { throw new Error("SYNTHETIC_PRIVATE_UNLOCK_DETAIL"); });
+    const response = await action(s, "beer");
+    expect(response.status).toBe(409); expect(await response.json()).not.toHaveProperty("receipt");
+    expect(c.orders.busy(s.id)).toBe(true); expect(h.ledger.submissions).toHaveLength(1);
+  });
+  test("a partial preparation failure retains original bytes and reservations without a not-submitted receipt", async () => {
+    const s = await offer(); await authorize(s);
+    const prepare = c.orders.prepare.bind(c.orders);
+    vi.spyOn(c.orders, "prepare").mockImplementationOnce((order, event) => {
+      prepare(order, event); throw new Error("SYNTHETIC_PRIVATE_PREPARATION_DETAIL");
+    });
+    const relay = vi.fn(); c.fetchImpl = relay;
+    const response = await action(s, "beer");
+    expect(response.status).toBe(409); expect(await response.json()).not.toHaveProperty("receipt");
+    const record = c.orders.read(s.id);
+    expect(record.status).toBe("pending"); expect(record.events[1]!.transactionBase64.length).toBeGreaterThan(0);
+    expect(c.orders.attempted(s.id, "beer")).toBe(true); expect(c.orders.busy(s.id)).toBe(true);
+    expect(relay).not.toHaveBeenCalled(); expect(h.ledger.submissions).toHaveLength(1);
+  });
+  test("an action lock created before the order update also retains the busy reservation", async () => {
+    const s = await offer(); await authorize(s);
+    const original = readFileSync(c.orders.path(s.id), "utf8");
+    vi.spyOn(c.orders, "prepare").mockImplementationOnce((order, event) => {
+      createDurableFile(`${c.orders.path(order.id)}.${event.action}.lock`, JSON.stringify(event));
+      throw new Error("SYNTHETIC_PRIVATE_PREPARATION_DETAIL");
+    });
+    const response = await action(s, "beer");
+    expect(response.status).toBe(409); expect(await response.json()).not.toHaveProperty("receipt");
+    expect(readFileSync(c.orders.path(s.id), "utf8")).toBe(original);
+    expect(c.orders.attempted(s.id, "beer")).toBe(true); expect(c.orders.busy(s.id)).toBe(true);
+    expect(h.ledger.submissions).toHaveLength(1);
+  });
   test("lost finalized response freezes all new consent and retains original transaction bytes across restart", async () => {
     const s = await offer(); await authorize(s); h.ledger.failSubmit = "after-landing";
-    expect((await action(s,"beer")).status).toBe(409); expect(await view(s)).toMatchObject({ status:"pending",remaining:60 });
+    const response = await action(s,"beer");
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ receipt: { errorReason: "settlement_pending", transaction: expect.any(String) } });
+    expect(await view(s)).toMatchObject({ status:"pending",remaining:60 });
     const record = JSON.parse(readFileSync(c.orders.path(s.id),"utf8")); expect(record.events[1].transactionBase64.length).toBeGreaterThan(0);
     app = createRestaurantApp({ ...c, orders: new RestaurantOrders(join(dir,"orders")) });
     expect((await action(s,"salmon")).status).toBe(409); expect((await action(s,"void")).status).toBe(409); expect(h.ledger.submissions).toHaveLength(2);

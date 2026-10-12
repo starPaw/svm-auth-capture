@@ -9,6 +9,7 @@ import {
   appendTransactionMessageInstructions,
   compileTransaction,
   createTransactionMessage,
+  createSolanaRpcFromTransport,
   generateKeyPairSigner,
   getBase64EncodedWireTransaction,
   getCompiledTransactionMessageDecoder,
@@ -23,6 +24,7 @@ import {
   type Rpc,
   SolanaError,
   SOLANA_ERROR__JSON_RPC__SERVER_ERROR_SEND_TRANSACTION_PREFLIGHT_FAILURE,
+  SOLANA_ERROR__RPC__TRANSPORT_HTTP_ERROR,
   type SolanaRpcApi,
   type Transaction,
 } from "@solana/kit";
@@ -178,6 +180,38 @@ describe("RpcLedger.getAccount", () => {
 });
 
 describe("RpcLedger.simulate", () => {
+  test("preserves a simulation refusal after the real SDK transforms InstructionError numbers to bigint", async () => {
+    let requests = 0;
+    const rpc = createSolanaRpcFromTransport(async <TResponse>() => {
+      requests++;
+      return { jsonrpc: "2.0", id: "fixture", result: { context: { slot: 1 }, value: {
+        err: { InstructionError: [2, { Custom: 6 }] }, logs: ["fixture program refusal"],
+      } } } as TResponse;
+    });
+    const ledger = new RpcLedger({ network: NETWORK, genesisHash: GENESIS, rpcUrl: "http://unused.invalid", rpc });
+    await expect(ledger.simulate(await sampleTransaction())).resolves.toEqual({
+      ok: false, error: '{"InstructionError":["2",{"Custom":"6"}]}', logs: ["fixture program refusal"],
+    });
+    expect(requests).toBe(1);
+  });
+
+  test("logs only the HTTP failure category/code, preserves the exception and sends once", async () => {
+    const privateText = "SYNTHETIC_PRIVATE_PROVIDER_DETAIL";
+    const error = new SolanaError(SOLANA_ERROR__RPC__TRANSPORT_HTTP_ERROR, {
+      statusCode: 429, message: privateText, headers: new Headers({ authorization: privateText }),
+    });
+    const send = vi.fn().mockRejectedValue(error);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const ledger = new RpcLedger({ network: NETWORK, genesisHash: GENESIS, rpcUrl: `https://rpc.invalid/${privateText}`,
+        rpc: fakeRpc({ simulateTransaction: () => ({ send }) }) });
+      await expect(ledger.simulate(await sampleTransaction())).rejects.toBe(error);
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls).toEqual([["rpc_request_failed", { category: "http", code: 429 }]]);
+      expect(JSON.stringify(warn.mock.calls)).not.toContain(privateText);
+    } finally { warn.mockRestore(); }
+  });
+
   test("maps a clean simulation to ok", async () => {
     const ledger = new RpcLedger({
       network: NETWORK,

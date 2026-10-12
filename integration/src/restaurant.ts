@@ -21,7 +21,7 @@ import { buildDemoTransaction } from "./demo-compute.ts";
 import { messageHash, submissionOutcome, type SubmissionJournal } from "./submission-journal.ts";
 import type { ChainReader } from "./reconciliation.ts";
 import type { Ledger } from "./ledger.ts";
-import type { PaymentRequirements, SettleResponse } from "./types.ts";
+import { Reason, type PaymentRequirements, type SettleResponse } from "./types.ts";
 
 export const DEMO_UNIT = 1_000_000n;
 export const DEMO_BUDGET = 100n * DEMO_UNIT;
@@ -302,7 +302,19 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
       ctx.header(PAYMENT_RESPONSE_HEADER, encodeHeader(result.receipt));
       return ctx.json({ receipt: result.receipt }, result.kind === "succeeded" ? 200 : 409);
     } catch (e) {
-      if (!prepared && order.status !== "pending") c.orders.unlock(order.id);
+      if (!prepared && order.status !== "pending" && !c.orders.attempted(order.id, action)) {
+        // This handler has not reached settle(), so no relay request or broadcast
+        // can have occurred. Return that definitive outcome for the exact POST;
+        // a generic 409 leaves the browser's pre-request UNKNOWN latch stranded.
+        // Partial preparation, an unlock failure, and every post-prepare error
+        // retain the existing fail-closed path, without a not-submitted claim.
+        c.orders.unlock(order.id);
+        const receipt: SettleResponse = { success: false, errorReason: Reason.settlementNotSubmitted,
+          transaction: "", network: c.network, payer: order.payer };
+        ctx.header(PAYMENT_RESPONSE_HEADER, encodeHeader(receipt));
+        return ctx.json({ error: e instanceof RestaurantRefusal ? e.message
+          : "Finalized RPC evidence unavailable or order conflict; refresh and inspect original signatures.", receipt }, 409);
+      }
       throw e;
     }
   });
