@@ -25,6 +25,7 @@ import { Reason, type PaymentRequirements, type SettleResponse } from "./types.t
 import type { AdmissionJournal } from './admission-journal.ts';
 import { b3RecoveryEvidence, type B3Recovery } from './b3-recovery.ts';
 import type { RpcLedger } from './rpc-ledger.ts';
+import { proveExpiredReclaimConsent } from './reclaim-consent-renewal.ts';
 
 export const DEMO_UNIT = 1_000_000n;
 export const DEMO_BUDGET = 100n * DEMO_UNIT;
@@ -33,7 +34,7 @@ type Scenario = typeof SCENARIOS[number];
 type Action = "authorize" | "beer" | "salmon" | "finish" | "void" | "refund" | "reclaim" | "atomic";
 type Event = { lifetimeObservation?: LifetimeObservation; action: Action; label: string; amount: string; at: string; status: "prepared" | "pending" | "finalized" | "rejected"; transaction: string; transactionBase64: string; receipt?: SettleResponse };
 type Order = { authorizeLifetime?: LifetimeObservation; id: string; capabilityHash: string; payer: Address; payment: Address; scenario: Scenario; required: PaymentRequired; unsigned: string; createdAt: number; status: "draft" | "active" | "closed" | "pending" | "rejected"; events: Event[]; reclaimUnsigned?: string; reclaimLifetime?: { blockhash: string; lastValidBlockHeight: string; blockhashSlot?: string } };
-export type RestaurantConfig = ResourceServerConfig & { ledger: Ledger & Pick<ChainReader, "getSignatureStatus" | "getAccountAtLeast"> & {offerBlockhashValid?: (hash: string) => Promise<boolean>; getClockAtLeast?:RpcLedger['getClockAtLeast']}; orders: RestaurantOrders; reclaimJournal: SubmissionJournal; origin: string; merchantToken?: string; orderAdmission?: AdmissionJournal; b3Recovery?:B3Recovery };
+export type RestaurantConfig = ResourceServerConfig & { ledger: Ledger & Pick<ChainReader, "getSignatureStatus"> & Pick<RpcLedger,"getAccountAtLeast"> & {offerBlockhashValid?: (hash: string) => Promise<boolean>; getClockAtLeast?:RpcLedger['getClockAtLeast']; getFinalizedBlockhashStatus?:RpcLedger['getFinalizedBlockhashStatus']}; orders: RestaurantOrders; reclaimJournal: SubmissionJournal; origin: string; merchantToken?: string; orderAdmission?: AdmissionJournal; b3Recovery?:B3Recovery };
 
 export class RestaurantOrders {
   readonly dir: string;
@@ -205,6 +206,7 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
     const balances = { payer: await tokenBalance(c, order.payer), merchant: await tokenBalance(c, c.server.address) };
     if (!reasons.refund && (balances.merchant.amount === null || balances.merchant.amount < money(refundAmount(order, p!)))) reasons.refund = balances.merchant.reason || "Merchant test-token balance cannot fund this refund.";
     return { id: order.id, payer: order.payer, payment: order.payment, scenario: order.scenario,
+      reclaimGeneration: existsSync(`${c.orders.path(order.id)}.reclaim-renewal.lock`) && order.reclaimUnsigned ? digest(order.reclaimUnsigned) : undefined,
       status: blocked ? "pending" : p ? p.held === 0n ? "closed" : "active" : order.status,
       authorized: p ? money(p.maximum) : 0, captured: money(captured), remaining: p ? money(p.held) : 0, refunded: money(refunded), released: p ? money(p.maximum - p.held - captured) : 0,
       heldBaseUnits: p?.held.toString(), refundableBaseUnits: p?.refundable.toString(),
@@ -287,7 +289,13 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
         const p=await restaurantSnapshot(c,order);
         if (!p || actionReasons(c,order,p,await orderClock(c,order),false).reclaim) return ctx.json({error:'Original reclaim consent is not eligible.'},409);
       } else if(order.status!=='draft' || order.events.length || await orderClock(c,order)>=BigInt(order.required.accepts[0]!.extra!.captureDeadline as number)) return ctx.json({error:'Original consent state differs.'},409);
-      createDurableFile(`${c.orders.path(order.id)}.${reclaim?'reclaim-consent':'wallet-consent'}.lock`,JSON.stringify({order:order.id,unsignedSha256:body.unsignedSha256}));
+      const renewed=reclaim && existsSync(`${c.orders.path(order.id)}.reclaim-renewal.lock`);
+      if(renewed) {
+        const renewal=JSON.parse(readFileSync(`${c.orders.path(order.id)}.reclaim-renewal.lock`,'utf8'));
+        if(order.reclaimUnsigned!==renewal.newUnsigned || JSON.stringify(order.reclaimLifetime)!==JSON.stringify(renewal.newLifetime)) return ctx.json({error:'Partial renewal remains blocked.'},409);
+      }
+      const marker=renewed ? `reclaim-consent-${digest(unsigned)}` : reclaim?'reclaim-consent':'wallet-consent';
+      createDurableFile(`${c.orders.path(order.id)}.${marker}.lock`,JSON.stringify({order:order.id,unsignedSha256:body.unsignedSha256}));
       return ctx.json({reserved:true});
     } finally {c.orders.unlock(order.id);}
   });
@@ -371,7 +379,14 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
   });
   app.get("/api/orders/:id/reclaim", async ctx => {
     let order = owned(ctx.req.param("id"), getCookie(ctx, cookieName));
-    if(existsSync(`${c.orders.path(order.id)}.reclaim-consent.lock`)) return ctx.json({error:'Original reclaim consent already attempted; inspect retained draft/signature before replacement.'},409);
+    if(existsSync(`${c.orders.path(order.id)}.reclaim-consent.lock`)) {
+      const path=`${c.orders.path(order.id)}.reclaim-renewal.lock`;
+      const renewal=existsSync(path) ? JSON.parse(readFileSync(path,'utf8')) : undefined;
+      if(renewal && order.reclaimUnsigned===renewal.newUnsigned && JSON.stringify(order.reclaimLifetime)===JSON.stringify(renewal.newLifetime) &&
+        !existsSync(`${c.orders.path(order.id)}.reclaim-consent-${digest(renewal.newUnsigned)}.lock`) && !c.orders.busy(order.id) && order.status!=='pending' && !c.orders.attempted(order.id,'reclaim'))
+        return ctx.json({unsigned:order.reclaimUnsigned,payer:order.payer}); // Retrieve the same retained renewed draft, never replace it.
+      return ctx.json({error:'Original reclaim consent already attempted; inspect retained draft/signature before replacement.'},409);
+    }
     c.orders.reserve(order.id, "reclaim");
     try {
       order = c.orders.read(order.id);
@@ -382,6 +397,40 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
       order.reclaimLifetime = { blockhash: lifetime.blockhash, lastValidBlockHeight: lifetime.lastValidBlockHeight.toString(), ...(lifetime.blockhashSlot === undefined ? {} : { blockhashSlot: lifetime.blockhashSlot.toString() }) };
       order.reclaimUnsigned = encodeTransaction(tx); c.orders.write(order); return ctx.json({ unsigned: order.reclaimUnsigned, payer: p.payer });
     } finally { c.orders.unlock(order.id); }
+  });
+  app.post('/api/orders/:id/reclaim-renewal',async ctx => {
+    let order=owned(ctx.req.param('id'),getCookie(ctx,cookieName));
+    if(await ctx.req.text() !== '') return ctx.json({error:'Renewal accepts no supplied wire or terms.'},400);
+    c.orders.reserve(order.id,'reclaim');
+    try {
+      order=c.orders.read(order.id);
+      const path=c.orders.path(order.id), consentPath=`${path}.reclaim-consent.lock`;
+      if(!existsSync(consentPath) || existsSync(`${path}.reclaim-renewal.lock`) || !order.reclaimUnsigned || !order.reclaimLifetime ||
+        order.status==='pending' || order.events.some(e=>e.action==='reclaim') || !c.ledger.getFinalizedBlockhashStatus || !c.ledger.getClockAtLeast)
+        return ctx.json({error:'Only one expired unsubmitted reclaim consent can be explicitly renewed.'},409);
+      // Existing finalized events remain authoritative; absence of a signature is not proof.
+      await restaurantSnapshot(c,order);
+      let minContextSlot=0n;
+      for(const e of order.events) if(e.transaction) {
+        const status=await c.ledger.getSignatureStatus(e.transaction);
+        if(status.kind!=='found' || status.commitment!=='finalized' || status.err!==null) return ctx.json({error:'Original outcome unavailable; renewal blocked.'},409);
+        if(status.slot>minContextSlot)minContextSlot=status.slot;
+      }
+      const oldUnsigned=order.reclaimUnsigned, oldLifetime=order.reclaimLifetime, oldConsent=readFileSync(consentPath,'utf8');
+      const proof=await proveExpiredReclaimConsent({unsigned:oldUnsigned,consent:oldConsent,order:order.id,payment:order.payment,payer:order.payer,
+        server:c.server.address,mint:c.asset,programId:c.programId,maximum:DEMO_BUDGET,
+        captureDeadline:BigInt(order.required.accepts[0]!.extra!.captureDeadline as number),refundDeadline:BigInt(order.required.accepts[0]!.extra!.refundDeadline as number),
+        lifetime:oldLifetime,minContextSlot,reader:{getAccountAtLeast:(...args)=>c.ledger.getAccountAtLeast(...args),
+          getFinalizedBlockhashStatus:(...args)=>c.ledger.getFinalizedBlockhashStatus!(...args),getClockAtLeast:(...args)=>c.ledger.getClockAtLeast!(...args)}});
+      const lifetime=await c.getLatestBlockhash();
+      if(lifetime.blockhash===oldLifetime.blockhash) return ctx.json({error:'Fresh distinct blockhash required.'},409);
+      const tx=await buildDemoTransaction({feePayer:order.payer,signers:[],lifetime,instructions:[await reclaimInstruction({programId:c.programId,payment:order.payment,payer:order.payer,server:c.server.address,mint:c.asset})]},c.ledger);
+      const newUnsigned=encodeTransaction(tx), newLifetime={blockhash:lifetime.blockhash,lastValidBlockHeight:lifetime.lastValidBlockHeight.toString(),...(lifetime.blockhashSlot===undefined?{}:{blockhashSlot:lifetime.blockhashSlot.toString()})};
+      // Immutable archive is flushed before the draft changes. Partial write/crash stays blocked.
+      createDurableFile(`${path}.reclaim-renewal.lock`,JSON.stringify({schema:1,order:order.id,payment:order.payment,payer:order.payer,oldUnsigned,oldLifetime,oldConsent,proof,newUnsigned,newLifetime}));
+      order.reclaimUnsigned=newUnsigned;order.reclaimLifetime=newLifetime;c.orders.write(order);
+      return ctx.json({unsigned:newUnsigned,payer:order.payer,proof});
+    } finally {c.orders.unlock(order.id);}
   });
   app.post("/api/orders/:id/reclaim", async ctx => {
     let order = owned(ctx.req.param("id"), getCookie(ctx, cookieName)); const body = await ctx.req.json() as { transaction?: string };

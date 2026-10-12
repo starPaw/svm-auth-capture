@@ -2,6 +2,7 @@
 // Run in an isolated network namespace with existing Playwright and Chromium:
 // RESTAURANT_PLAYWRIGHT_MODULE=/path/to/playwright/index.mjs node browser/restaurant-check.mjs
 import assert from 'node:assert/strict';
+import {createHash} from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -43,6 +44,10 @@ try {
       const next = { ...draft(), id:'b'.repeat(32), captureDeadline:Math.floor(Date.now()/1000)+150, refundDeadline:Math.floor(Date.now()/1000)+180 };
       state = next;
       return route.fulfill({ status:402, contentType:'application/json', headers:{'PAYMENT-REQUIRED':Buffer.from(JSON.stringify(next.required)).toString('base64')}, body:JSON.stringify({order:next.id,unsigned:next.unsigned,required:next.required}) });
+    }
+    if(path.endsWith('/reclaim-renewal') && req.method()==='POST') {
+      posts++;const unsigned='renewed-DOM-fixture-never-signed';state={...state,reclaimGeneration:createHash('sha256').update(unsigned).digest('hex')};
+      return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({unsigned,payer:state.payer,proof:{kind:'expired-no-reclaim-effect'}})});
     }
     if (path.includes('/actions/')) {
       if (req.method() === 'GET') {
@@ -194,6 +199,28 @@ try {
   await page.evaluate(()=>localStorage.setItem('capture402-reclaim-wallet-attempt',localStorage.getItem('capture402-order')));
   await page.locator('#refresh').click();await page.waitForFunction(()=>document.getElementById('reclaim').disabled);
   assert.equal(posts,0);check('Original reclaim wallet-consent marker blocks replacement signing across refresh');
+  await page.waitForFunction(()=>!document.getElementById('renew-reclaim').hidden);assert(await page.locator('#renew-reclaim').isVisible());
+  await page.locator('#renew-reclaim').click();await page.waitForFunction(()=>!document.getElementById('reclaim').disabled);
+  assert.equal(posts,1);assert.equal(await page.evaluate(()=>window.fixtureSigns||0),0);
+  assert.equal(await page.evaluate(()=>localStorage.getItem('capture402-uncertain')),id);
+  assert.equal(await page.evaluate(()=>localStorage.getItem('capture402-reclaim-wallet-attempt')),id);
+  check('Explicit renewal prepares one unsigned draft without wallet signing or clearing original latch/consent');
+  await page.reload();await page.waitForFunction(()=>document.getElementById('payment-id').querySelector('a'));
+  await page.locator('#connect-wallet').click();await page.locator('#wallet-list button').first().click();
+  await page.waitForFunction(()=>!document.getElementById('reclaim').disabled);
+  assert(await page.locator('#renew-reclaim').isHidden());
+  check('Retained renewed generation survives navigation and cannot expose a second renewal');
+  await page.evaluate(id=>localStorage.setItem('capture402-reclaim-wallet-attempt-'+id,localStorage.getItem('capture402-reclaim-renewed-'+id)),id);
+  await page.locator('#refresh').click();await page.waitForFunction(()=>document.getElementById('reclaim').disabled);
+  assert(await page.locator('#renew-reclaim').isHidden());
+  check('New generation wallet attempt locks further signing while old generation remains preserved');
+  state=expiredHeld;await page.evaluate(id=>{localStorage.setItem('capture402-reclaim-uncertain',id);localStorage.removeItem('capture402-reclaim-renewed-'+id);},id);
+  await page.locator('#refresh').click();await page.waitForFunction(()=>document.getElementById('reclaim').disabled);
+  assert(await page.locator('#renew-reclaim').isHidden());
+  check('UNKNOWN distinct reclaim response cannot use expiry-consent UI renewal');
+  await load(expiredHeld,true);await page.locator('#connect-wallet').click();await page.locator('#wallet-list button').first().click();
+  await page.evaluate(()=>localStorage.setItem('capture402-uncertain',localStorage.getItem('capture402-order')));
+
   await page.evaluate(()=>localStorage.removeItem('capture402-reclaim-wallet-attempt')); // Controlled DOM fixture only.
   state={...expiredHeld,b3Recovery:{...recovery,payment:'stale'}};await page.locator('#refresh').click();await page.waitForFunction(()=>document.getElementById('reclaim').disabled);
   assert.equal(posts,0);check('Wrong legacy payment provenance keeps payer reclaim locked');
