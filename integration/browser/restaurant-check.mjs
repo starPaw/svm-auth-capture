@@ -204,6 +204,8 @@ try {
   assert.equal(posts,1);assert.equal(await page.evaluate(()=>window.fixtureSigns||0),0);
   assert.equal(await page.evaluate(()=>localStorage.getItem('capture402-uncertain')),id);
   assert.equal(await page.evaluate(()=>localStorage.getItem('capture402-reclaim-wallet-attempt')),id);
+  assert.equal(await page.locator('#action-status').textContent(),'Expired original consent archived after finalized no-effect proof. Fresh reclaim prepared; sign separately when ready.');
+  check('Successful reviewed renewal preserves its no-effect preparation message after refresh, without claiming a finalized reclaim');
   check('Explicit renewal prepares one unsigned draft without wallet signing or clearing original latch/consent');
   await page.reload();await page.waitForFunction(()=>document.getElementById('payment-id').querySelector('a'));
   await page.locator('#connect-wallet').click();await page.locator('#wallet-list button').first().click();
@@ -211,12 +213,14 @@ try {
   assert(await page.locator('#renew-reclaim').isHidden());
   check('Retained renewed generation survives navigation and cannot expose a second renewal');
   await page.evaluate(id=>localStorage.setItem('capture402-reclaim-wallet-attempt-'+id,localStorage.getItem('capture402-reclaim-renewed-'+id)),id);
-  await page.locator('#refresh').click();await page.waitForFunction(()=>document.getElementById('reclaim').disabled);
+  await page.locator('#refresh').click();await page.waitForFunction(()=>document.getElementById('reclaim').disabled && document.getElementById('action-status').textContent.includes('All new operations stopped'));
   assert(await page.locator('#renew-reclaim').isHidden());
+  assert((await page.locator('#action-status').textContent()).includes('All new operations stopped'));
   check('New generation wallet attempt locks further signing while old generation remains preserved');
   state=expiredHeld;await page.evaluate(id=>{localStorage.setItem('capture402-reclaim-uncertain',id);localStorage.removeItem('capture402-reclaim-renewed-'+id);},id);
-  await page.locator('#refresh').click();await page.waitForFunction(()=>document.getElementById('reclaim').disabled);
+  await page.locator('#refresh').click();await page.waitForFunction(()=>document.getElementById('reclaim').disabled && document.getElementById('action-status').textContent.includes('All new operations stopped'));
   assert(await page.locator('#renew-reclaim').isHidden());
+  assert((await page.locator('#action-status').textContent()).includes('All new operations stopped'));
   check('UNKNOWN distinct reclaim response cannot use expiry-consent UI renewal');
   await load(expiredHeld,true);await page.locator('#connect-wallet').click();await page.locator('#wallet-list button').first().click();
   await page.evaluate(()=>localStorage.setItem('capture402-uncertain',localStorage.getItem('capture402-order')));

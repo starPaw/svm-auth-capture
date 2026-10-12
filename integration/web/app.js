@@ -121,9 +121,14 @@ async function refresh() {
   const selectedNext = order?.id === data.id && canReplace() ? scenario : data.scenario;
   stale = false; order = data; scenario = selectedNext; anchor = { clock: data.now, at: Date.now() }; render();
 }
-async function run(fn) {
+async function run(fn, renewalMessage = '') {
   if (busy || reading) return; busy = true; render(); setStatus('Waiting for the original result. No automatic retry.');
-  try { await fn(); await refresh(); setStatus(uncertain() || order?.status === 'pending' ? 'Original operation pending or unknown. All new operations stopped; inspect original signatures.' : 'Original state refreshed. Only finalized receipts confirm settlement.'); }
+  try {
+    await fn(); await refresh();
+    const preparedRenewal = renewalMessage && recoveryAllowed() && renewedReclaim() && !reclaimAttempted() && order.status !== 'pending' && order.remaining > 0 && order.actions?.reclaim &&
+      localStorage.getItem('capture402-reclaim-uncertain') !== order.id;
+    setStatus(preparedRenewal ? renewalMessage : uncertain() || order?.status === 'pending' ? 'Original operation pending or unknown. All new operations stopped; inspect original signatures.' : 'Original state refreshed. Only finalized receipts confirm settlement.');
+  }
   catch (error) { setStatus(error.message + (diagnosticOnly && signingReport() ? '\n\n' + JSON.stringify(signingReport(),null,2) : ''), true); try { await refresh(); } catch { stale = true; accessId = ''; } }
   finally { busy = false; render(); }
 }
@@ -228,8 +233,7 @@ $('renew-reclaim').onclick = () => {
     const hash=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(data.unsigned))),b=>b.toString(16).padStart(2,'0')).join('');
     if(data.payer!==order.payer || data.proof?.kind!=='expired-no-reclaim-effect') throw Error('Renewal proof differs; nothing signed.');
     localStorage.setItem(`capture402-reclaim-renewed-${order.id}`,hash);
-    setStatus('Expired original consent archived after finalized no-effect proof. Fresh reclaim prepared; sign separately when ready.');
-  });
+  }, 'Expired original consent archived after finalized no-effect proof. Fresh reclaim prepared; sign separately when ready.');
 };
 $('reclaim').onclick = () => {
   if ($('reclaim').disabled) return;
