@@ -27,6 +27,7 @@ import { b3RecoveryEvidence, type B3Recovery } from './b3-recovery.ts';
 import type { RpcLedger } from './rpc-ledger.ts';
 import { proveExpiredReclaimConsent } from './reclaim-consent-renewal.ts';
 import { currentReclaimGeneration, nextReclaimArchive } from './reclaim-generations.ts';
+import { abandonmentCustody, abandonmentEvidence, proveExpiredUnfundedAuthorize, sha256, type AuthorizeAbandonPolicy } from './authorize-abandon.ts';
 
 export const DEMO_UNIT = 1_000_000n;
 export const DEMO_BUDGET = 100n * DEMO_UNIT;
@@ -35,7 +36,7 @@ type Scenario = typeof SCENARIOS[number];
 type Action = "authorize" | "beer" | "salmon" | "finish" | "void" | "refund" | "reclaim" | "atomic";
 type Event = { lifetimeObservation?: LifetimeObservation; action: Action; label: string; amount: string; at: string; status: "prepared" | "pending" | "finalized" | "rejected"; transaction: string; transactionBase64: string; receipt?: SettleResponse };
 type Order = { authorizeLifetime?: LifetimeObservation; id: string; capabilityHash: string; payer: Address; payment: Address; scenario: Scenario; required: PaymentRequired; unsigned: string; createdAt: number; status: "draft" | "active" | "closed" | "pending" | "rejected"; events: Event[]; reclaimUnsigned?: string; reclaimLifetime?: { blockhash: string; lastValidBlockHeight: string; blockhashSlot?: string } };
-export type RestaurantConfig = ResourceServerConfig & { ledger: Ledger & Pick<ChainReader, "getSignatureStatus"> & Pick<RpcLedger,"getAccountAtLeast"> & {offerBlockhashValid?: (hash: string) => Promise<boolean>; getClockAtLeast?:RpcLedger['getClockAtLeast']; getFinalizedBlockhashStatus?:RpcLedger['getFinalizedBlockhashStatus']}; orders: RestaurantOrders; reclaimJournal: SubmissionJournal; origin: string; merchantToken?: string; orderAdmission?: AdmissionJournal; b3Recovery?:B3Recovery };
+export type RestaurantConfig = ResourceServerConfig & { ledger: Ledger & Pick<ChainReader, "getSignatureStatus"> & Pick<RpcLedger,"getAccountAtLeast"> & {offerBlockhashValid?: (hash: string) => Promise<boolean>; getClockAtLeast?:RpcLedger['getClockAtLeast']; getFinalizedBlockhashStatus?:RpcLedger['getFinalizedBlockhashStatus']}; orders: RestaurantOrders; reclaimJournal: SubmissionJournal; origin: string; merchantToken?: string; orderAdmission?: AdmissionJournal; b3Recovery?:B3Recovery; authorizeAbandonPolicy?:AuthorizeAbandonPolicy };
 
 export class RestaurantOrders {
   readonly dir: string;
@@ -211,6 +212,9 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
     const balances = { payer: await tokenBalance(c, order.payer), merchant: await tokenBalance(c, c.server.address) };
     if (!reasons.refund && (balances.merchant.amount === null || balances.merchant.amount < money(refundAmount(order, p!)))) reasons.refund = balances.merchant.reason || "Merchant test-token balance cannot fund this refund.";
     const path=c.orders.path(order.id);
+    const abandoned=abandonmentEvidence(c.authorizeAbandonPolicy,order,path);
+    if(abandoned && p) throw Error('Abandoned identity now has a payment; continuation stopped.');
+    const successorReserved=!!abandoned && existsSync(`${path}.authorize-successor.lock`);
     const generation=retainedReclaimGeneration(order);
     const consentUsed=!!generation && (existsSync(`${path}.reclaim-consent-${digest(generation.newUnsigned)}.lock`) ||
       c.reclaimJournal.findByMessageHash(messageHash(decode(generation.newUnsigned).messageBytes)).length > 0);
@@ -220,14 +224,16 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
       reclaimGeneration: generation ? digest(generation.newUnsigned) : undefined,
       reclaimDraftState: generation ? consentUsed || blocked || c.orders.attempted(order.id,'reclaim') || order.events.some(e=>e.action==='reclaim') ? 'stopped' : draftValid === true ? 'ready' : draftValid === false ? 'expired-or-unavailable' : 'stopped' : undefined,
       reclaimPreparation: !blocked && !reasons.reclaim && existsSync(`${path}.reclaim-consent.lock`) && !consentUsed && !order.events.some(e=>e.action==='reclaim') && (!generation || draftValid === false),
-      status: blocked ? "pending" : p ? p.held === 0n ? "closed" : "active" : order.status,
+      authorizeAbandoned: abandoned,
+      authorizeAbandonEligible: !blocked && !p && !abandoned && now>=BigInt(order.required.accepts[0]!.extra!.refundDeadline as number) && !!abandonmentCustody(c.authorizeAbandonPolicy,order,path),
+      status: blocked || successorReserved ? "pending" : abandoned ? 'abandoned' : p ? p.held === 0n ? "closed" : "active" : order.status,
       authorized: p ? money(p.maximum) : 0, captured: money(captured), remaining: p ? money(p.held) : 0, refunded: money(refunded), released: p ? money(p.maximum - p.held - captured) : 0,
       heldBaseUnits: p?.held.toString(), refundableBaseUnits: p?.refundable.toString(),
       captureDeadline: Number(order.required.accepts[0]!.extra!.captureDeadline), refundDeadline: Number(order.required.accepts[0]!.extra!.refundDeadline), now: Number(now),
       actions: Object.fromEntries(Object.entries(reasons).map(([action, reason]) => [action, !reason])), actionReasons: reasons, balances,
       events: await Promise.all(order.events.map(async e => ({ action: e.action, label: e.label, amount: money(BigInt(e.amount)), at: e.at, status: e.status, signature: e.transaction, ...(e.transaction ? { chainStatus: await publicSignatureStatus(e.transaction) } : {}) }))),
       ...(b3RecoveryEvidence(c.b3Recovery,order,c.orders.path(order.id),blocked) ? {b3Recovery:b3RecoveryEvidence(c.b3Recovery,order,c.orders.path(order.id),blocked)} : {}),
-      ...(order.status === "draft" ? { required: order.required, unsigned: order.unsigned } : {}),
+      ...(order.status === "draft" && !abandoned ? { required: order.required, unsigned: order.unsigned } : {}),
     };
   }
   async function recordResult(order: Order, event: Event, receipt: SettleResponse, kind: "succeeded" | "rejected" | "unresolved") {
@@ -253,12 +259,18 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
     const { payer, scenario = "normal" } = body as { payer?: unknown; scenario?: unknown };
     if (typeof payer !== "string" || !isAddress(payer) || typeof scenario !== "string" || !(SCENARIOS as readonly string[]).includes(scenario)) return ctx.json({ error: "connect a Solana wallet and select a demo scenario" }, 400);
     const previous = getCookie(ctx, cookieName);
+    let abandonedPredecessor:string|undefined;
     if (previous?.includes(".")) {
       try {
         const old = owned(previous.split(".")[0]!, previous);
         const p = await restaurantSnapshot(c, old);
+        const abandoned=abandonmentEvidence(c.authorizeAbandonPolicy,old,c.orders.path(old.id));
+        if(abandoned) {
+          if(p || existsSync(`${c.orders.path(old.id)}.authorize-successor.lock`)) return ctx.json({error:'Original successor or payment already reserved; inspect it without replacement.'},409);
+          abandonedPredecessor=old.id;
+        }
         if (c.orders.busy(old.id) || old.status === "pending" || (p && p.held > 0n)) return ctx.json({ error: "finish or reconcile the existing budget before opening another" }, 409);
-        if (old.status === "draft" && (existsSync(`${c.orders.path(old.id)}.wallet-consent.lock`) || old.events.length !== 0 || await c.now() < BigInt(old.required.accepts[0]!.extra!.captureDeadline as number))) return ctx.json({ error: "Original unsigned offer is still valid or has an attempt; inspect it before replacement." }, 409);
+        if (old.status === "draft" && !abandonmentEvidence(c.authorizeAbandonPolicy,old,c.orders.path(old.id)) && (existsSync(`${c.orders.path(old.id)}.wallet-consent.lock`) || old.events.length !== 0 || await c.now() < BigInt(old.required.accepts[0]!.extra!.captureDeadline as number))) return ctx.json({ error: "Original unsigned offer is still valid or has an attempt; inspect it before replacement." }, 409);
       } catch (e) { if (!(e instanceof Error) || !e.message.includes("ENOENT")) throw e; }
     }
     const id = randomBytes(16).toString("hex"); const capability = `${id}.${randomBytes(32).toString("hex")}`;
@@ -268,6 +280,9 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
     const required: PaymentRequired = { x402Version: 2, resource: { url: `${c.origin}/resource`, description: "Pivovar Marina · 100 test-token Devnet budget", mimeType: "application/json" }, accepts: [requirements] };
     const tx = await buildDemoTransaction({ feePayer: c.feePayer, signers: [], lifetime: await c.getLatestBlockhash(), instructions: [await authorizeInstruction({ programId: c.programId, payer, server: c.server.address, mint: c.asset, funder: c.feePayer, salt, maximum: DEMO_BUDGET, captureDeadline: BigInt(requirements.extra!.captureDeadline as number), refundDeadline: BigInt(requirements.extra!.refundDeadline as number) })] }, c.ledger);
     const order: Order = { id, capabilityHash: digest(capability), payer, payment: await paymentAddress(c.programId, payer, salt), scenario: scenario as Scenario, required, unsigned: encodeTransaction(tx), authorizeLifetime: transactionObservation(tx), createdAt: Number(await c.now()), status: "draft", events: [] };
+    // One durable successor intent before admission/publication. Concurrent POSTs
+    // cannot consume two extra A slots; crash/lost response never creates another.
+    if(abandonedPredecessor) createDurableFile(`${c.orders.path(abandonedPredecessor)}.authorize-successor.lock`,JSON.stringify({schema:1,previousOrder:abandonedPredecessor,nextOrder:id}));
     c.orderAdmission?.reserve(); // Durable cap before offer publication/wallet signing; never refunded.
     c.orders.create(order);
     setCookie(ctx, cookieName, capability, { httpOnly: true, secure: secured, sameSite: "Strict", path: "/", maxAge: 86400 });
@@ -280,6 +295,7 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
     const reclaim = ctx.req.query('operation') === 'reclaim';
     const dispatch = reclaim && ctx.req.query('phase') === 'dispatch';
     const unsigned = reclaim ? order.reclaimUnsigned : order.unsigned;
+    if(!reclaim && existsSync(`${c.orders.path(order.id)}.authorize-abandon.lock`)) return ctx.json({error:'Original expired authorization was abandoned; fresh signing is stopped.'},409);
     const p = await restaurantSnapshot(c,order);
     if (reclaim) {
       const generation=retainedReclaimGeneration(order);
@@ -305,6 +321,7 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
     try {
       // Serialize the consent marker against draft replacement and merchant actions.
       order=c.orders.read(order.id);
+      if(!reclaim && existsSync(`${c.orders.path(order.id)}.authorize-abandon.lock`)) return ctx.json({error:'Original authorization abandoned; no fresh consent.'},409);
       const unsigned=reclaim?order.reclaimUnsigned:order.unsigned;
       if (!unsigned || Object.keys(body).sort().join() !== 'unsignedSha256' || body.unsignedSha256 !== digest(unsigned) || order.status==='pending') return ctx.json({error:'Original consent state differs.'},409);
       if (reclaim) {
@@ -321,6 +338,25 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
       return ctx.json({reserved:true});
     } finally {c.orders.unlock(order.id);}
   });
+  app.post('/api/orders/:id/abandon-authorize',async ctx => {
+    let order=owned(ctx.req.param('id'),getCookie(ctx,cookieName));
+    if(await ctx.req.text()!=='')return ctx.json({error:'No supplied wire, terms or proof accepted.'},400);
+    c.orders.reserve(order.id,'authorize');
+    try {
+      order=c.orders.read(order.id);
+      const path=c.orders.path(order.id),custody=abandonmentCustody(c.authorizeAbandonPolicy,order,path);
+      if(!custody || existsSync(`${path}.authorize-abandon.lock`) || !c.ledger.getFinalizedBlockhashStatus || !c.ledger.getClockAtLeast ||
+        c.store.list().some(e=>e.authorize?.payment===order.payment || e.terminal?.payment===order.payment) ||
+        c.reclaimJournal.findByMessageHash(messageHash(decode(order.unsigned).messageBytes)).length) return ctx.json({error:'Selected original custody is not an unused draft; preserve it.'},409);
+      const proof=await proveExpiredUnfundedAuthorize({order,programId:c.programId,server:c.server.address,mint:c.asset,funder:c.feePayer,network:c.network,maximum:DEMO_BUDGET,
+        captureDeadline:BigInt(order.required.accepts[0]!.extra!.captureDeadline as number),refundDeadline:BigInt(order.required.accepts[0]!.extra!.refundDeadline as number),
+        reader:{getAccountAtLeast:(...args)=>c.ledger.getAccountAtLeast(...args),getFinalizedBlockhashStatus:(...args)=>c.ledger.getFinalizedBlockhashStatus!(...args),getClockAtLeast:(...args)=>c.ledger.getClockAtLeast!(...args)}});
+      // The one fsynced immutable classification is the entire commit. The original
+      // order, wire, deadlines and consent are never mutated. Partial files block.
+      createDurableFile(`${path}.authorize-abandon.lock`,JSON.stringify({schema:1,policySha256:sha256(JSON.stringify(c.authorizeAbandonPolicy)),...custody,proof}));
+      return ctx.json({abandoned:true,proof});
+    } finally {c.orders.unlock(order.id);}
+  });
   app.post("/resource", async ctx => {
     const order = owned(ctx.req.query("order") ?? "", getCookie(ctx, cookieName));
     if (order.status !== "draft") return ctx.json({ error: "budget already submitted; inspect the original payment" }, 409);
@@ -332,6 +368,7 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
     const tx = decode(payload.payload.transaction); const signed = await peekAuthorize(c, tx);
     if (signed.payer !== order.payer || !equalMessage(tx, decode(order.unsigned))) return ctx.json({ error: "wallet must sign the exact offered budget" }, 400);
     c.orders.reserve(order.id, "authorize");
+    if(existsSync(`${c.orders.path(order.id)}.authorize-abandon.lock`)) {c.orders.unlock(order.id);return ctx.json({error:"Original authorization abandoned; no dispatch."},409);}
     const event: Event = { action: "authorize", label: labels.authorize, amount: DEMO_BUDGET.toString(), at: new Date().toISOString(), status: "prepared", transaction: "", transactionBase64: payload.payload.transaction, lifetimeObservation: order.authorizeLifetime };
     c.orders.prepare(order, event);
     const result = await settle(c, { x402Version: 2, paymentPayload: { ...payload, extensions: undefined }, paymentRequirements: order.required.accepts[0]! }, tx, order.payer, order.authorizeLifetime);

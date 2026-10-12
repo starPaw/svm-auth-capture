@@ -249,6 +249,13 @@ http {
     expect((await https(path,'POST',{cookie,origin:'https://attacker.invalid'})).status).toBe(403);
     expect((await https(path,'POST',{cookie,origin})).status).toBe(409);expect(h.ledger.submissions).toHaveLength(0);
   });
+  test('selected authorize abandonment exposes only POST with original cookie and Origin',async()=>{
+    const path=`/api/orders/${'a'.repeat(32)}/abandon-authorize`,before=upstream.length;
+    for(const method of ['GET','PUT','DELETE'])expect((await https(path,method)).status).toBe(405);
+    expect(upstream).toHaveLength(before);
+    expect((await https(path,'POST',{origin:'https://attacker.invalid'})).status).toBe(403);
+    expect((await https(path,'POST',{origin})).status).toBe(409);expect(h.ledger.submissions).toHaveLength(0);
+  });
   test('atomic action crosses only the existing authenticated operator boundary',async()=>{
     const prepared=await https('/api/orders','POST',{origin,'content-type':'application/json'},JSON.stringify({payer:h.payer.address,scenario:'atomic'}));
     const {order}=JSON.parse(prepared.body),path=`/api/orders/${order}/actions/atomic`;
@@ -263,7 +270,7 @@ http {
     expect(upstream).toHaveLength(before);
   });
 
-  test.each(["/api/orders/", "/api/orders-other", "/api/private", "/api/orders/invalid", `/api/orders/${"a".repeat(32)}/actions/unrelated`, `/api/orders/${"a".repeat(32)}/reclaim/`, `/api/orders/${'a'.repeat(32)}/wallet-consent/extra`, `/api/orders/${'a'.repeat(32)}/reclaim-renewal/extra`, `/api/orders/${'a'.repeat(32)}/signing-preflight/`, "/assets/private.js", "/settle", "/verify", "/supported", "/json/list", "/.git/config"])("%s remains private or outside the allowlist", async path => {
+  test.each(["/api/orders/", "/api/orders-other", "/api/private", "/api/orders/invalid", `/api/orders/${"a".repeat(32)}/actions/unrelated`, `/api/orders/${"a".repeat(32)}/reclaim/`, `/api/orders/${'a'.repeat(32)}/wallet-consent/extra`, `/api/orders/${'a'.repeat(32)}/reclaim-renewal/extra`, `/api/orders/${'a'.repeat(32)}/abandon-authorize/extra`, `/api/orders/${'a'.repeat(32)}/signing-preflight/`, "/assets/private.js", "/settle", "/verify", "/supported", "/json/list", "/.git/config"])("%s remains private or outside the allowlist", async path => {
     const before = upstream.length;
     for (const method of ["GET", "POST"]) expect((await https(path, method, { origin })).status).toBe(404);
     expect(upstream).toHaveLength(before);

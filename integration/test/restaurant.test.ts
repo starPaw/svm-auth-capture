@@ -3,6 +3,7 @@ import { mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from 'node:crypto';
+import { EXPIRED_A_POLICY } from '../src/authorize-abandon.ts';
 import { getBase64Encoder, getTransactionDecoder, partiallySignTransaction, type Address } from "@solana/kit";
 import { getMintToInstruction, getTransferInstruction } from "@solana-program/token";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
@@ -290,6 +291,101 @@ describe("restaurant budget lifecycle", () => {
     c.ledger.offerBlockhashValid=async()=>false;expect((await preflight()).status).toBe(409);h.setTime(NOW+300n);
     const r=await app.request(`${origin}/api/orders`,{method:'POST',headers:{cookie:s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({payer:h.payer.address})});
     expect(r.status).toBe(409);expect(h.ledger.submissions).toHaveLength(0);
+  });
+  async function expiredAuthorizeDraft() {
+    c.getLatestBlockhash=async()=>({...h.lifetime(),blockhashSlot:1n,commitment:'finalized' as const,network:c.network,genesisHash:'local-genesis'});
+    const s=await offer();
+    const consent=await app.request(`${origin}/api/orders/${s.id}/wallet-consent`,{method:'POST',headers:{cookie:s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({unsignedSha256:createHash('sha256').update(s.unsigned).digest('hex')})});expect(consent.status).toBe(200);
+    const path=c.orders.path(s.id),stored=c.orders.read(s.id);
+    // First-party lifetime provenance fixture, not a live origin claim.
+    stored.authorizeLifetime={version:1,messageHash:(await import('../src/submission-journal.ts')).messageHash(getTransactionDecoder().decode(getBase64Encoder().encode(s.unsigned)).messageBytes),blockhash:h.lifetime().blockhash,lastValidBlockHeight:h.lifetime().lastValidBlockHeight.toString(),contextSlot:'1',commitment:'finalized',network:c.network,genesisHash:'local-genesis'};c.orders.write(stored);
+    const original=readFileSync(path,'utf8'),consentBytes=readFileSync(`${path}.wallet-consent.lock`,'utf8');
+    c.authorizeAbandonPolicy={...EXPIRED_A_POLICY,order:s.id,payment:stored.payment,payer:stored.payer,orderSha256:createHash('sha256').update(original).digest('hex'),consentSha256:createHash('sha256').update(consentBytes).digest('hex')};
+    h.setTime(NOW+190n);h.svm.expireBlockhash();
+    c.ledger.getFinalizedBlockhashStatus=async()=>({kind:'ok',valid:false,slot:5n});
+    c.ledger.getAccountAtLeast=async address=>({kind:'ok',slot:6n,account:await h.ledger.getAccount(address)});
+    c.ledger.getClockAtLeast=async()=>({kind:'ok',commitment:'finalized',slot:7n,unixTimestamp:NOW+190n});
+    app=createRestaurantApp(c);
+    return {s,path,original,consentBytes,abandon:()=>app.request(`${origin}/api/orders/${s.id}/abandon-authorize`,{method:'POST',headers:{cookie:s.cookie,origin}})};
+  }
+  test('explicit selected unfunded abandonment retains original bytes, survives restart and permits only a separate new offer',async()=>{
+    const a=await expiredAuthorizeDraft();
+    const r=await a.abandon();expect(r.status).toBe(200);expect(await r.json()).toMatchObject({abandoned:true,proof:{kind:'expired-unfunded-authorize',originSlot:'1',expirySlot:'5',paymentSlot:'6',clockSlot:'7'}});
+    expect(readFileSync(a.path,'utf8')).toBe(a.original);expect(readFileSync(`${a.path}.wallet-consent.lock`,'utf8')).toBe(a.consentBytes);
+    const archive=readFileSync(`${a.path}.authorize-abandon.lock`,'utf8');expect(JSON.parse(archive)).toMatchObject({originalOrder:a.original,originalConsent:a.consentBytes});
+    app=createRestaurantApp({...c,orders:new RestaurantOrders(c.orders.dir)});
+    const v=await view(a.s);expect(v).toMatchObject({status:'abandoned',authorizeAbandoned:{kind:'expired-unfunded-authorize'}});expect(v.unsigned).toBeUndefined();
+    expect((await a.abandon()).status).toBe(409);
+    expect((await app.request(`${origin}/api/orders/${a.s.id}/signing-preflight?operation=authorize`,{headers:{cookie:a.s.cookie}})).status).toBe(409);
+    const next=await app.request(`${origin}/api/orders`,{method:'POST',headers:{cookie:a.s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({payer:h.payer.address,scenario:'normal'})});expect(next.status).toBe(402);
+    const body=await next.json() as any;expect(body.order).not.toBe(a.s.id);expect(body.required.accepts[0].extra.captureDeadline).toBe(Number(NOW+340n));
+    expect(readFileSync(a.path,'utf8')).toBe(a.original);expect(readFileSync(`${a.path}.authorize-abandon.lock`,'utf8')).toBe(archive);expect(h.ledger.submissions).toHaveLength(0);
+  });
+  test.each(['no-policy','wrong-order','wrong-identity','order-drift','consent-drift','valid-hash','unavailable','stale-expiry','stale-payment','stale-clock','before-deadline','existing-PDA','pending','event','dispatch-lock','operation-journal','submission-journal','partial-archive','signed-wire','wrong-wire','missing-origin'])('authorize abandonment refuses %s without modifying originals or sending',async failure=>{
+    const a=await expiredAuthorizeDraft();
+    if(failure==='no-policy')delete c.authorizeAbandonPolicy;
+    if(failure==='wrong-order')c.authorizeAbandonPolicy!.order='0'.repeat(32);
+    if(failure==='wrong-identity')c.authorizeAbandonPolicy!.payer=h.server.address;
+    if(failure==='valid-hash')c.ledger.getFinalizedBlockhashStatus=async()=>({kind:'ok',valid:true,slot:5n});
+    if(failure==='unavailable')c.ledger.getFinalizedBlockhashStatus=async()=>({kind:'unavailable',detail:'fixture'});
+    if(failure==='stale-expiry')c.ledger.getFinalizedBlockhashStatus=async()=>({kind:'ok',valid:false,slot:1n});
+    if(failure==='stale-payment')c.ledger.getAccountAtLeast=async address=>({kind:'ok',slot:4n,account:await h.ledger.getAccount(address)});
+    if(failure==='stale-clock')c.ledger.getClockAtLeast=async()=>({kind:'ok',commitment:'finalized',slot:4n,unixTimestamp:NOW+190n});
+    if(failure==='before-deadline')c.ledger.getClockAtLeast=async()=>({kind:'ok',commitment:'finalized',slot:7n,unixTimestamp:NOW+170n});
+    if(failure==='existing-PDA')c.ledger.getAccountAtLeast=async()=>({kind:'ok',slot:6n,account:{owner:c.programId,lamports:1n,executable:false,data:new Uint8Array()}});
+    if(failure==='operation-journal')vi.spyOn(c.store,'list').mockReturnValue([{authorize:{payment:c.orders.read(a.s.id).payment}} as any]);
+    if(failure==='submission-journal')vi.spyOn(c.reclaimJournal,'findByMessageHash').mockReturnValue([{} as any]);
+    const order=c.orders.read(a.s.id);
+    if(failure==='signed-wire')order.unsigned=await sign(order.unsigned);
+    if(failure==='wrong-wire')order.unsigned=encodeTransaction(await h.signedAuthorize({salt:h.newSalt(),signers:[]}));
+    if(failure==='missing-origin')order.authorizeLifetime!.contextSlot=null;
+    if(failure==='pending')order.status='pending';
+    if(failure==='event')order.events.push({action:'authorize',status:'prepared',transaction:'original'} as any);
+    if(failure==='order-drift')order.required.accepts[0]!.extra!.captureDeadline=1;
+    c.orders.write(order);
+    if(['signed-wire','wrong-wire','missing-origin'].includes(failure)) {
+      c.authorizeAbandonPolicy!.orderSha256=createHash('sha256').update(readFileSync(a.path)).digest('hex');
+      (await import('node:fs')).writeFileSync(`${a.path}.wallet-consent.lock`,JSON.stringify({order:order.id,unsignedSha256:createHash('sha256').update(order.unsigned).digest('hex')}));
+      c.authorizeAbandonPolicy!.consentSha256=createHash('sha256').update(readFileSync(`${a.path}.wallet-consent.lock`)).digest('hex');
+    }
+    if(failure==='consent-drift')(await import('node:fs')).writeFileSync(`${a.path}.wallet-consent.lock`,'{}');
+    if(failure==='dispatch-lock')createDurableFile(`${a.path}.authorize.lock`,'original');
+    if(failure==='partial-archive')createDurableFile(`${a.path}.authorize-abandon.lock`,'{');
+    const before=readFileSync(a.path),consent=readFileSync(`${a.path}.wallet-consent.lock`);
+    expect((await a.abandon()).status).toBe(409);expect(readFileSync(a.path)).toEqual(before);expect(readFileSync(`${a.path}.wallet-consent.lock`)).toEqual(consent);expect(h.ledger.submissions).toHaveLength(0);
+  });
+  test('partial abandonment archive and busy reservation remain blocked across restart',async()=>{
+    const a=await expiredAuthorizeDraft();createDurableFile(`${a.path}.authorize-abandon.lock`,'{"schema":1}');
+    app=createRestaurantApp({...c,orders:new RestaurantOrders(c.orders.dir)});
+    expect((await app.request(`${origin}/api/orders/${a.s.id}`,{headers:{cookie:a.s.cookie}})).status).toBe(409);
+    expect((await app.request(`${origin}/api/orders`,{method:'POST',headers:{cookie:a.s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({payer:h.payer.address})})).status).toBe(409);
+    expect((await a.abandon()).status).toBe(409);expect(h.ledger.submissions).toHaveLength(0);
+  });
+  test('concurrent successor offers reserve exactly one; partial intent blocks after restart',async()=>{
+    const a=await expiredAuthorizeDraft();expect((await a.abandon()).status).toBe(200);
+    const next=()=>app.request(`${origin}/api/orders`,{method:'POST',headers:{cookie:a.s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({payer:h.payer.address,scenario:'normal'})});
+    const results=await Promise.all([next(),next()]);expect(results.map(r=>r.status).sort()).toEqual([402,409]);
+    const intent=JSON.parse(readFileSync(`${a.path}.authorize-successor.lock`,'utf8'));
+    expect(intent.previousOrder).toBe(a.s.id);expect(c.orders.read(intent.nextOrder).status).toBe('draft');
+    app=createRestaurantApp({...c,orders:new RestaurantOrders(c.orders.dir)});expect((await next()).status).toBe(409);expect((await view(a.s)).status).toBe('pending');expect(h.ledger.submissions).toHaveLength(0);
+  });
+  test('partial successor reservation blocks new offer without fabricating a completed successor',async()=>{
+    const a=await expiredAuthorizeDraft();await a.abandon();createDurableFile(`${a.path}.authorize-successor.lock`,'{');
+    app=createRestaurantApp({...c,orders:new RestaurantOrders(c.orders.dir)});
+    expect((await view(a.s)).status).toBe('pending');
+    expect((await app.request(`${origin}/api/orders`,{method:'POST',headers:{cookie:a.s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({payer:h.payer.address})})).status).toBe(409);expect(h.ledger.submissions).toHaveLength(0);
+  });
+  test('retained busy abandonment reservation cannot be reused after restart',async()=>{
+    const a=await expiredAuthorizeDraft();c.orders.reserve(a.s.id,'authorize');
+    app=createRestaurantApp({...c,orders:new RestaurantOrders(c.orders.dir)});
+    expect((await a.abandon()).status).toBe(409);expect(c.orders.busy(a.s.id)).toBe(true);expect((await view(a.s)).authorizeAbandonEligible).toBe(false);expect(h.ledger.submissions).toHaveLength(0);
+  });
+  test('abandonment serializes against concurrent abandonment and fresh consent',async()=>{
+    const a=await expiredAuthorizeDraft();let entered!:()=>void,release!:(v:any)=>void;const started=new Promise<void>(r=>entered=r),waiting=new Promise<any>(r=>release=r);
+    c.ledger.getFinalizedBlockhashStatus=async()=>{entered();return waiting;};const first=a.abandon();await started;
+    expect((await a.abandon()).status).toBe(409);
+    expect((await app.request(`${origin}/api/orders/${a.s.id}/wallet-consent`,{method:'POST',headers:{cookie:a.s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({unsignedSha256:createHash('sha256').update(a.s.unsigned).digest('hex')})})).status).toBe(409);
+    release({kind:'ok',valid:false,slot:5n});expect((await first).status).toBe(200);expect(h.ledger.submissions).toHaveLength(0);
   });
   test('reclaim wallet consent durably preserves its original draft without permitting replacement signing',async()=>{
     const s=await offer();await authorize(s);h.setTime(NOW+150n);
