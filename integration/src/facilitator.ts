@@ -1,3 +1,4 @@
+import type { SponsorBudget } from './campaign-sponsorship.ts';
 import { withShared } from "./coordination.ts";
 // SAC-004 facilitator: x402 v2 `/verify` and `/settle` for scheme="auth-capture",
 // extra.paymentFlow="escrow" against the accepted SVM program. Contract: docs/ARCHITECTURE.md,
@@ -78,6 +79,8 @@ export type FacilitatorConfig = {
    * for the bounded SAC-004 endpoint exercise, which claims no recovery behavior.
    */
   journal?: SubmissionJournal;
+  /** Optional for historical profiles; mandatory in the E2E runtime. */
+  sponsorBudget?: SponsorBudget;
   /** Existing trusted-caller bearer key; authenticates recording only, never economic consent. */
   observationKey?: string;
 };
@@ -168,6 +171,7 @@ export class Facilitator {
   private readonly maxUnitLimit: number;
   private readonly maxUnitPrice: bigint;
   private readonly journal?: SubmissionJournal;
+  private readonly sponsorBudget?: SponsorBudget;
   private readonly observationKey?: string;
   /**
    * Settlements in flight in this process, keyed by the exact message bytes of the validated
@@ -188,6 +192,7 @@ export class Facilitator {
     this.maxUnitLimit = config.maxComputeUnitLimit ?? 400_000;
     this.maxUnitPrice = config.maxComputeUnitPriceMicroLamports ?? 10_000n;
     this.journal = config.journal;
+    this.sponsorBudget = config.sponsorBudget;
     this.observationKey = config.observationKey;
   }
 
@@ -294,6 +299,9 @@ export class Facilitator {
 
   /** Co-signs as fee payer, submits once, and maps the adapter's three-way outcome. */
   private async broadcast(verified: Verified, observation: unknown): Promise<SettleResponse> {
+    let budgetId: string | undefined;
+    try { budgetId = await this.sponsorBudget?.reserve(verified.transaction, verified.result.operation); }
+    catch { return {success:false,errorReason:Reason.settlementNotSubmitted,transaction:'',network:this.network,payer:verified.payer}; }
     const signed = await partiallySignTransaction([this.feePayer.keyPair], verified.transaction);
     const signature = getSignatureFromTransaction(signed);
     const base = { transaction: signature, network: this.network, payer: verified.payer };
@@ -326,6 +334,10 @@ export class Facilitator {
     } catch (e) {
       this.recordOutcome(signature, "submit-threw", e instanceof Error ? e.message : String(e));
       return { success: false, errorReason: Reason.settlementPending, ...base };
+    }
+    if (budgetId) {
+      try { await this.sponsorBudget!.observe(budgetId,signature); }
+      catch { /* Budget UNKNOWN remains reserved independently of settlement reporting. */ }
     }
     const { result, detail } = submissionOutcome(outcome);
     this.recordOutcome(signature, result, detail);

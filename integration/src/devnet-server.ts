@@ -1,3 +1,6 @@
+import { CampaignBudget, type CampaignPolicy } from './campaign-budget.ts';
+import { campaignSponsorship } from './campaign-sponsorship.ts';
+import { rpcBackend } from '../operators/e2e-provision.ts';
 // SAC-006 runnable facilitator entry point for Devnet. Wires `RpcLedger` to the HTTP
 // `createGatewayApp` binding using the externally pinned, independently accepted SAC-007
 // deployment record (see `deployment-record.ts`) and `SOLANA_RPC_URL`; refuses to start on a
@@ -40,7 +43,15 @@ async function main(): Promise<void> {
 
   // The exact co-signed bytes, signature, and blockhash of every broadcast are written here first.
   const journal = new FileSubmissionJournal(requireEnv("SAC006_FACILITATOR_JOURNAL_DIR"));
-  const facilitator = new Facilitator({ network: record.network.caip2, programId: record.programId, feePayer, ledger, journal, observationKey: requireEnv("SAC006_BEARER_TOKEN"), ...demoSponsorComputeBounds() });
+  // Binding to the E2E sponsor prevents a missing/renamed environment profile bypass.
+  let sponsorBudget;
+  if (feePayer.address === '5mkvwgKeWMYrFppGm8ugLzQC9Wff4vduqWphsGhQNigX' || requireEnv('SAC006_FACILITATOR_KEYPAIR_PATH').includes('/capture402-e2e/')) {
+    const directory = '/var/lib/capture402-e2e/facilitator/campaign-budget';
+    const policy = JSON.parse(readFileSync(`${directory}/policy.json`,'utf8')) as CampaignPolicy;
+    if (policy.sponsor !== feePayer.address || policy.browser !== '93PtawNdAfDn7oTjRrbrJJMSgaFTjGS3wjtkrZSNGn74' || policy.genesisHash !== record.network.genesisHash || rpcUrl !== 'https://api.devnet.solana.com') throw Error('E2E campaign policy/runtime mismatch');
+    sponsorBudget = campaignSponsorship(new CampaignBudget(directory,policy),rpcBackend(record));
+  }
+  const facilitator = new Facilitator({ network: record.network.caip2, programId: record.programId, feePayer, ledger, journal, sponsorBudget, observationKey: requireEnv("SAC006_BEARER_TOKEN"), ...demoSponsorComputeBounds() });
   const sponsorship = new SponsorshipGuard({
     ledger,
     feePayer: feePayer.address,
