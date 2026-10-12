@@ -266,6 +266,24 @@ try {
   await page.evaluate(id=>{localStorage.removeItem('capture402-signed-'+id);localStorage.setItem('capture402-uncertain',id);},id);
   await page.locator('#refresh').click();assert(await page.locator('#abandon-authorize').isHidden());assert.equal(posts,0);
   check('UNKNOWN authorization cannot enter unfunded abandonment');
+  const isolatedSignature='3'.repeat(88),isolated={...draft(),status:'pending',refundDeadline:Math.floor(Date.now()/1000)-1,
+    events:[{action:'authorize',status:'pending',signature:isolatedSignature,label:'Preserved UNKNOWN original',amount:100,at:new Date().toISOString()}],
+    authorizeIsolation:{kind:'expired-no-successful-authorize-effect',originalOutcome:'unknown',originalSignature:isolatedSignature,reserveRetained:true,
+      proof:{kind:'expired-no-successful-authorize-effect',payment:info.programId,unsignedSha256:'a'.repeat(64),originSlot:'1',expirySlot:'2',paymentSlot:'3',clockSlot:'4',clockUnixTimestamp:String(Math.floor(Date.now()/1000))}}};
+  await load(isolated,true);await page.locator('#connect-wallet').click();await page.locator('#wallet-list button').first().click();
+  await page.evaluate(id=>{localStorage.setItem('capture402-uncertain',id);localStorage.setItem('capture402-wallet-attempt',id);localStorage.setItem('capture402-signed-'+id,'preserved-signed-original');},id);
+  await page.locator('#refresh').click();await page.waitForFunction(()=>document.getElementById('payment-state').textContent.includes('new order available'));
+  assert(await page.locator('#authorize').isDisabled());assert(await page.locator('[data-action=beer]').isDisabled());assert(await page.locator('#abandon-authorize').isHidden());
+  await page.locator('#new-budget').waitFor({state:'visible'});assert.equal(posts,0);
+  await page.locator('#new-budget').click();await page.waitForFunction(()=>localStorage.getItem('capture402-order')==='b'.repeat(32));
+  assert.equal(posts,1);assert.equal(await page.evaluate(()=>window.fixtureSigns||0),0);
+  const custody=await page.evaluate(id=>({latch:localStorage.getItem('capture402-uncertain'),attempt:localStorage.getItem('capture402-wallet-attempt'),signed:localStorage.getItem('capture402-signed-'+id),archive:JSON.parse(localStorage.getItem('capture402-isolation-archive-'+id))}),id);
+  assert.equal(custody.latch,id);assert.equal(custody.attempt,id);assert.equal(custody.signed,'preserved-signed-original');assert.equal(custody.archive.evidence.originalOutcome,'unknown');assert.equal(custody.archive.evidence.reserveRetained,true);
+  check('Selected expired signed UNKNOWN permits one explicit unsigned successor while preserving original latch, signed bytes and reserve evidence');
+  await load({...isolated,authorizeIsolation:{...isolated.authorizeIsolation,reserveRetained:false}});
+  assert(await page.locator('#new-budget').isHidden());assert.equal(posts,0);check('Incomplete isolation evidence never exposes a successor');
+  await load(isolated);rpcFailure=true;await page.locator('#refresh').click();await page.waitForFunction(()=>document.getElementById('payment-state').textContent.includes('RPC unavailable'));
+  assert(await page.locator('#new-budget').isHidden());assert.equal(posts,0);check('Stale RPC state hides the isolated successor and shows paused status');
   // Exercise actual app.js orchestration through both preflights. The wallet module
   // and HTTP backend are explicit non-economic stubs; no real signature is created.
   const flow=await context.newPage(),sequence=[];

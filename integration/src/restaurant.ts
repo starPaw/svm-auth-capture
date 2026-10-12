@@ -6,6 +6,7 @@ import { transactionObservation, type LifetimeObservation } from "./lifetime-pro
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync, readFileSync, unlinkSync, openSync, fsyncSync, closeSync } from "node:fs";
 import { join } from "node:path";
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { Hono } from "hono";
 import { AccountState, getTokenDecoder } from "@solana-program/token";
 import { requireBearerToken } from "./auth.ts";
@@ -28,6 +29,7 @@ import type { RpcLedger } from './rpc-ledger.ts';
 import { proveExpiredReclaimConsent } from './reclaim-consent-renewal.ts';
 import { currentReclaimGeneration, nextReclaimArchive } from './reclaim-generations.ts';
 import { abandonmentCustody, abandonmentEvidence, proveExpiredUnfundedAuthorize, sha256, type AuthorizeAbandonPolicy } from './authorize-abandon.ts';
+import { authorizeIsolationEvidence, type InstalledIsolationPolicy } from './unknown-authorize-isolation.ts';
 
 export const DEMO_UNIT = 1_000_000n;
 export const DEMO_BUDGET = 100n * DEMO_UNIT;
@@ -36,7 +38,7 @@ type Scenario = typeof SCENARIOS[number];
 type Action = "authorize" | "beer" | "salmon" | "finish" | "void" | "refund" | "reclaim" | "atomic";
 type Event = { lifetimeObservation?: LifetimeObservation; action: Action; label: string; amount: string; at: string; status: "prepared" | "pending" | "finalized" | "rejected"; transaction: string; transactionBase64: string; receipt?: SettleResponse };
 type Order = { authorizeLifetime?: LifetimeObservation; id: string; capabilityHash: string; payer: Address; payment: Address; scenario: Scenario; required: PaymentRequired; unsigned: string; createdAt: number; status: "draft" | "active" | "closed" | "pending" | "rejected"; events: Event[]; reclaimUnsigned?: string; reclaimLifetime?: { blockhash: string; lastValidBlockHeight: string; blockhashSlot?: string } };
-export type RestaurantConfig = ResourceServerConfig & { ledger: Ledger & Pick<ChainReader, "getSignatureStatus"> & Pick<RpcLedger,"getAccountAtLeast"> & {offerBlockhashValid?: (hash: string) => Promise<boolean>; getClockAtLeast?:RpcLedger['getClockAtLeast']; getFinalizedBlockhashStatus?:RpcLedger['getFinalizedBlockhashStatus']}; orders: RestaurantOrders; reclaimJournal: SubmissionJournal; origin: string; merchantToken?: string; orderAdmission?: AdmissionJournal; b3Recovery?:B3Recovery; authorizeAbandonPolicy?:AuthorizeAbandonPolicy };
+export type RestaurantConfig = ResourceServerConfig & { ledger: Ledger & Pick<ChainReader, "getSignatureStatus"> & Pick<RpcLedger,"getAccountAtLeast"> & {offerBlockhashValid?: (hash: string) => Promise<boolean>; getClockAtLeast?:RpcLedger['getClockAtLeast']; getFinalizedBlockhashStatus?:RpcLedger['getFinalizedBlockhashStatus']}; orders: RestaurantOrders; reclaimJournal: SubmissionJournal; origin: string; merchantToken?: string; orderAdmission?: AdmissionJournal; b3Recovery?:B3Recovery; authorizeAbandonPolicy?:AuthorizeAbandonPolicy; authorizeIsolationPolicy?:InstalledIsolationPolicy };
 
 export class RestaurantOrders {
   readonly dir: string;
@@ -135,10 +137,22 @@ async function tokenBalance(c: RestaurantConfig, owner: Address) {
   } catch { return { amount: null, reason: "Finalized token balance unavailable." }; }
 }
 
-export async function restaurantSnapshot(c: RestaurantConfig, order: Order): Promise<Payment | null> {
+type SignatureObservations=Map<string,Awaited<ReturnType<RestaurantConfig['ledger']['getSignatureStatus']>>>;
+const requestSignatures=new AsyncLocalStorage<Map<RestaurantConfig['ledger'],SignatureObservations>>();
+async function originalStatus(c:RestaurantConfig,signature:string) {
+  const scope=requestSignatures.getStore();let observations=scope?.get(c.ledger);
+  if(scope && !observations){observations=new Map();scope.set(c.ledger,observations);}
+  const known=observations?.get(signature);if(known)return known;
+  const status=await c.ledger.getSignatureStatus(signature);
+  // Finalized outcomes are immutable. Do not cache weak/missing/unavailable
+  // evidence, and never carry any observation into a later HTTP request.
+  if(status.kind==='found' && status.commitment==='finalized')observations?.set(signature,status);
+  return status;
+}
+export async function restaurantSnapshot(c: RestaurantConfig, order: Order, observations?:SignatureObservations): Promise<Payment | null> {
   let slot = 0n;
   for (const e of order.events) if (e.transaction) {
-    const status = await c.ledger.getSignatureStatus(e.transaction);
+    const status = observations?.get(e.transaction) ?? await originalStatus(c,e.transaction);
     if (e.status === "finalized" && (status.kind !== "found" || status.commitment !== "finalized" || status.err !== null)) throw new Error("original finalized signature evidence unavailable; inspect before new actions");
     if (status.kind === "found" && status.commitment === "finalized" && status.slot > slot) slot = status.slot;
   }
@@ -149,11 +163,11 @@ export async function restaurantSnapshot(c: RestaurantConfig, order: Order): Pro
   if (!p || snapshot.account.owner !== c.programId || p.payer !== order.payer || p.server !== c.server.address || p.mint !== c.asset || p.maximum !== DEMO_BUDGET || String(p.captureDeadline) !== String(order.required.accepts[0]!.extra!.captureDeadline) || String(p.refundDeadline) !== String(order.required.accepts[0]!.extra!.refundDeadline)) throw new Error("payment identity differs from this order");
   return p;
 }
-async function orderClock(c: RestaurantConfig,order:Order): Promise<bigint> {
+async function orderClock(c: RestaurantConfig,order:Order,observations?:SignatureObservations): Promise<bigint> {
   if (!c.ledger.getClockAtLeast) return c.now(); // Local ledger fixture implements its own Clock.
   let slot=0n;
   for(const e of order.events) if(e.transaction) {
-    const status=await c.ledger.getSignatureStatus(e.transaction);
+    const status=observations?.get(e.transaction) ?? await originalStatus(c,e.transaction);
     if(e.status==='finalized' && (status.kind!=='found' || status.commitment!=='finalized' || status.err!==null)) throw Error('original finalized Clock fence unavailable');
     if(status.kind==='found' && status.commitment==='finalized' && status.slot>slot)slot=status.slot;
   }
@@ -173,7 +187,7 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
   const app = new Hono();
   // Acquire before any order/draft read; all callbacks and durable results stay in this scope.
   if (c.orders.coordination !== c.reclaimJournal.coordination && c.orders.coordination?.metadata.domain !== c.reclaimJournal.coordination?.metadata.domain) throw new Error("restaurant journals require one complete domain");
-  app.use("*", async (_ctx, next) => withShared(c.orders.coordination, async () => { c.orders.assertAccess(); c.reclaimJournal.assertAccess?.(); await next(); }));
+  app.use("*", async (_ctx, next) => requestSignatures.run(new Map(),()=>withShared(c.orders.coordination, async () => { c.orders.assertAccess(); c.reclaimJournal.assertAccess?.(); await next(); })));
   const cookieName = "capture402-order";
   const secured = c.origin.startsWith("https:");
   function owned(id: string, cookie: string | undefined): Order {
@@ -193,8 +207,8 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
   // SDK/provider errors can embed private credential URLs. Never echo them to the browser.
   app.onError((error, ctx) => ctx.json({ error: error instanceof RestaurantRefusal ? error.message : error.message.includes("ENOENT") ? "order unavailable" : error.message.includes("EEXIST") ? "action reserved; inspect original outcome before any new consent" : "Finalized RPC evidence unavailable or order conflict; refresh and inspect original signatures." }, 409));
 
-  async function publicSignatureStatus(signature: string) {
-    const status = await c.ledger.getSignatureStatus(signature);
+  async function publicSignatureStatus(signature: string, observation?:Awaited<ReturnType<RestaurantConfig['ledger']['getSignatureStatus']>>) {
+    const status = observation ?? await originalStatus(c,signature);
     if (status.kind === "unavailable") return { kind: "unavailable", detail: "RPC signature evidence unavailable" };
     return JSON.parse(JSON.stringify(status, (_k,v) => typeof v === "bigint" ? v.toString() : v));
   }
@@ -203,8 +217,12 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
       wire=>c.reclaimJournal.findByMessageHash(messageHash(decode(wire).messageBytes)).length > 0);
   }
   async function view(order: Order) {
-    const p = await restaurantSnapshot(c, order);
-    const now = await orderClock(c,order);
+    // One fresh observation per original signature in this response, shared by
+    // the payment/Clock fences and receipts. Nothing is cached across requests.
+    const observations:SignatureObservations=new Map();
+    for(const e of order.events)if(e.transaction && !observations.has(e.transaction))observations.set(e.transaction,await originalStatus(c,e.transaction));
+    const p = await restaurantSnapshot(c, order,observations);
+    const now = await orderClock(c,order,observations);
     const blocked = order.status === "pending" || c.orders.busy(order.id);
     const captured = order.events.filter(e => e.status === "finalized" && ["beer", "salmon", "atomic"].includes(e.action)).reduce((s,e) => s + BigInt(e.amount), 0n);
     const refunded = order.events.filter(e => e.status === "finalized" && e.action === "refund").reduce((s,e) => s + BigInt(e.amount), 0n);
@@ -213,8 +231,10 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
     if (!reasons.refund && (balances.merchant.amount === null || balances.merchant.amount < money(refundAmount(order, p!)))) reasons.refund = balances.merchant.reason || "Merchant test-token balance cannot fund this refund.";
     const path=c.orders.path(order.id);
     const abandoned=abandonmentEvidence(c.authorizeAbandonPolicy,order,path);
+    const isolated=authorizeIsolationEvidence(c.authorizeIsolationPolicy,order,path);
+    if(isolated && p)throw Error('Isolated original now has a payment; continuation stopped.');
     if(abandoned && p) throw Error('Abandoned identity now has a payment; continuation stopped.');
-    const successorReserved=!!abandoned && existsSync(`${path}.authorize-successor.lock`);
+    const successorReserved=!!(abandoned || isolated) && existsSync(`${path}.authorize-successor.lock`);
     const generation=retainedReclaimGeneration(order);
     const consentUsed=!!generation && (existsSync(`${path}.reclaim-consent-${digest(generation.newUnsigned)}.lock`) ||
       c.reclaimJournal.findByMessageHash(messageHash(decode(generation.newUnsigned).messageBytes)).length > 0);
@@ -225,13 +245,14 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
       reclaimDraftState: generation ? consentUsed || blocked || c.orders.attempted(order.id,'reclaim') || order.events.some(e=>e.action==='reclaim') ? 'stopped' : draftValid === true ? 'ready' : draftValid === false ? 'expired-or-unavailable' : 'stopped' : undefined,
       reclaimPreparation: !blocked && !reasons.reclaim && existsSync(`${path}.reclaim-consent.lock`) && !consentUsed && !order.events.some(e=>e.action==='reclaim') && (!generation || draftValid === false),
       authorizeAbandoned: abandoned,
+      authorizeIsolation:isolated && !successorReserved ? isolated : undefined,
       authorizeAbandonEligible: !blocked && !p && !abandoned && now>=BigInt(order.required.accepts[0]!.extra!.refundDeadline as number) && !!abandonmentCustody(c.authorizeAbandonPolicy,order,path),
       status: blocked || successorReserved ? "pending" : abandoned ? 'abandoned' : p ? p.held === 0n ? "closed" : "active" : order.status,
       authorized: p ? money(p.maximum) : 0, captured: money(captured), remaining: p ? money(p.held) : 0, refunded: money(refunded), released: p ? money(p.maximum - p.held - captured) : 0,
       heldBaseUnits: p?.held.toString(), refundableBaseUnits: p?.refundable.toString(),
       captureDeadline: Number(order.required.accepts[0]!.extra!.captureDeadline), refundDeadline: Number(order.required.accepts[0]!.extra!.refundDeadline), now: Number(now),
       actions: Object.fromEntries(Object.entries(reasons).map(([action, reason]) => [action, !reason])), actionReasons: reasons, balances,
-      events: await Promise.all(order.events.map(async e => ({ action: e.action, label: e.label, amount: money(BigInt(e.amount)), at: e.at, status: e.status, signature: e.transaction, ...(e.transaction ? { chainStatus: await publicSignatureStatus(e.transaction) } : {}) }))),
+      events: await Promise.all(order.events.map(async e => ({ action: e.action, label: e.label, amount: money(BigInt(e.amount)), at: e.at, status: e.status, signature: e.transaction, ...(e.transaction ? { chainStatus: await publicSignatureStatus(e.transaction,observations.get(e.transaction)) } : {}) }))),
       ...(b3RecoveryEvidence(c.b3Recovery,order,c.orders.path(order.id),blocked) ? {b3Recovery:b3RecoveryEvidence(c.b3Recovery,order,c.orders.path(order.id),blocked)} : {}),
       ...(order.status === "draft" && !abandoned ? { required: order.required, unsigned: order.unsigned } : {}),
     };
@@ -261,17 +282,28 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
     const previous = getCookie(ctx, cookieName);
     let abandonedPredecessor:string|undefined;
     if (previous?.includes(".")) {
-      try {
+      {
         const old = owned(previous.split(".")[0]!, previous);
         const p = await restaurantSnapshot(c, old);
         const abandoned=abandonmentEvidence(c.authorizeAbandonPolicy,old,c.orders.path(old.id));
-        if(abandoned) {
+        const isolated=authorizeIsolationEvidence(c.authorizeIsolationPolicy,old,c.orders.path(old.id));
+        if(isolated) {
+          if(payer!==old.payer)return ctx.json({error:'Selected original payer required for its one explicit successor.'},409);
+          if(!c.ledger.getFinalizedBlockhashStatus)throw Error('Fresh canonical isolation evidence unavailable.');
+          const expiry=await c.ledger.getFinalizedBlockhashStatus(old.authorizeLifetime!.blockhash,BigInt(isolated.proof.originSlot),Date.now()+10000);
+          if(expiry.kind!=='ok' || expiry.valid || expiry.slot<BigInt(isolated.proof.expirySlot))throw Error('Fresh canonical original expiry unavailable.');
+          const fenced=await c.ledger.getAccountAtLeast(old.payment,expiry.slot,Date.now()+10000);
+          if(fenced.kind!=='ok' || fenced.slot<expiry.slot || fenced.account!==null)throw Error('Original successful authorization cannot be excluded.');
+          const status=await c.ledger.getSignatureStatus(isolated.originalSignature);
+          if(status.kind==='found' && (status.commitment!=='finalized' || status.err===null))throw Error('Original signature contradicts isolation; inspect it.');
+        }
+        if(abandoned || isolated) {
           if(p || existsSync(`${c.orders.path(old.id)}.authorize-successor.lock`)) return ctx.json({error:'Original successor or payment already reserved; inspect it without replacement.'},409);
           abandonedPredecessor=old.id;
         }
-        if (c.orders.busy(old.id) || old.status === "pending" || (p && p.held > 0n)) return ctx.json({ error: "finish or reconcile the existing budget before opening another" }, 409);
+        if (!isolated && (c.orders.busy(old.id) || old.status === "pending") || (p && p.held > 0n)) return ctx.json({ error: "finish or reconcile the existing budget before opening another" }, 409);
         if (old.status === "draft" && !abandonmentEvidence(c.authorizeAbandonPolicy,old,c.orders.path(old.id)) && (existsSync(`${c.orders.path(old.id)}.wallet-consent.lock`) || old.events.length !== 0 || await c.now() < BigInt(old.required.accepts[0]!.extra!.captureDeadline as number))) return ctx.json({ error: "Original unsigned offer is still valid or has an attempt; inspect it before replacement." }, 409);
-      } catch (e) { if (!(e instanceof Error) || !e.message.includes("ENOENT")) throw e; }
+      }
     }
     const id = randomBytes(16).toString("hex"); const capability = `${id}.${randomBytes(32).toString("hex")}`;
     const salt = randomBytes(32); const requirements = await freshRequirements(c);

@@ -1,6 +1,6 @@
 import { afterEach, expect, test, vi } from 'vitest';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, writeFileSync, renameSync, rmSync, chmodSync, openSync, closeSync, statSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync, renameSync, rmSync, chmodSync, openSync, closeSync, statSync,readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
@@ -13,7 +13,7 @@ const dirs:string[]=[];
 afterEach(()=>dirs.splice(0).forEach(d=>rmSync(d,{recursive:true,force:true})));
 function fixture(kind:AdmissionPolicy['kind']='relay-attempts',maximum=45,carryForward=20) {
   const dir=mkdtempSync(join(tmpdir(),'b3-admission-'));dirs.push(dir);
-  const policy:AdmissionPolicy={schema:1,kind,reference:'synthetic-b3',maximum,carryForward,historicalActual:kind==='relay-attempts'?null:carryForward,sourceSha256:'a'.repeat(64)};
+  const policy:AdmissionPolicy={schema:1,kind,reference:'issue-68-b3-continuation',maximum,carryForward,historicalActual:kind==='relay-attempts'?null:carryForward,sourceSha256:'a'.repeat(64)};
   AdmissionJournal.initialize(dir,policy);
   return {dir,policy,restart:()=>new AdmissionJournal(dir,kind,maximum)};
 }
@@ -102,4 +102,40 @@ test.each([1,2])('interrupted extension write %i blocks both caps and retains or
   expect(()=>f.restart().extendExpiredAOrderLimit()).toThrow(/crash/);spy.mockRestore();
   const archive=JSON.parse(readFileSync(join(f.dir,'expired-A-maximum-11-to-12.lock'),'utf8'));expect(archive.oldState.used).toBe(6);expect(archive.newState.used).toBe(6);
   expect(()=>new AdmissionJournal(f.dir,'orders',11)).toThrow();expect(()=>new AdmissionJournal(f.dir,'orders',12)).toThrow();
+});
+function demoFixture(kind:AdmissionPolicy['kind']) {
+  if(kind==='relay-attempts'){const f=fixture();f.restart().reserve();return{dir:f.dir,oldMax:45,newMax:600,used:21,old:()=>new AdmissionJournal(f.dir,kind,45)};}
+  const f=fixture('orders',11,5);f.restart().reserve();f.restart().extendExpiredAOrderLimit();
+  new AdmissionJournal(f.dir,kind,12).reserve();
+  return{dir:f.dir,oldMax:12,newMax:100,used:7,old:()=>new AdmissionJournal(f.dir,kind,12)};
+}
+test.each(['orders','relay-attempts'] as const)('100 demo runs migration preserves %s usage and lock custody across restart',kind=>{
+  const f=demoFixture(kind),lock=statSync(join(f.dir,'.lock')),before=f.old().summary();
+  const first=kind==='orders'?readFileSync(join(f.dir,'expired-A-maximum-11-to-12.lock')):undefined;
+  f.old().extendDemoRuns100();
+  const active=()=>new AdmissionJournal(f.dir,kind,f.newMax);
+  expect(active().summary()).toEqual({...before,maximum:f.newMax});expect(()=>f.old()).toThrow();
+  expect(statSync(join(f.dir,'.lock')).ino).toBe(lock.ino);
+  if(first)expect(readFileSync(join(f.dir,'expired-A-maximum-11-to-12.lock'))).toEqual(first);
+  for(let i=f.used;i<f.newMax;i++)active().reserve();
+  expect(active().summary().used).toBe(f.newMax);expect(()=>active().reserve()).toThrow(/cap/);
+  expect(()=>active().extendDemoRuns100()).toThrow(/snapshot/);
+});
+test.each([['orders',1],['orders',2],['relay-attempts',1],['relay-attempts',2]] as const)('partial 100-runs migration %s write %i blocks both runtime caps', (kind,at)=>{
+  const f=demoFixture(kind),before=f.old().summary();let calls=0;const original=durable.replaceDurableFile;
+  const spy=vi.spyOn(durable,'replaceDurableFile').mockImplementation((path,data)=>{if(++calls===at)throw Error('crash injection');original(path,data);});
+  expect(()=>f.old().extendDemoRuns100()).toThrow(/crash/);spy.mockRestore();
+  for(const maximum of [f.oldMax,f.newMax])expect(()=>new AdmissionJournal(f.dir,kind,maximum)).toThrow();
+  const name=kind==='orders'?'demo-maximum-100-orders.lock':'demo-maximum-600-relay-attempts.lock';
+  expect(JSON.parse(readFileSync(join(f.dir,name),'utf8'))).toMatchObject({oldPolicy:{maximum:f.oldMax},oldState:{used:before.used},newState:{used:before.used}});
+});
+test.each(['orders','relay-attempts'] as const)('100 demo runs migration refuses drifted %s snapshot without new writes',kind=>{
+  const f=demoFixture(kind);f.old().reserve();const before=readdir(f.dir);
+  expect(()=>f.old().extendDemoRuns100()).toThrow(/snapshot/);expect(readdir(f.dir)).toEqual(before);
+});
+function readdir(directory:string) {return readdirSync(directory).sort().map(name=>[name,readFileSync(join(directory,name))]);}
+test.each(['orders','relay-attempts'] as const)('missing %s migration archive cannot admit with an expanded runtime cap',kind=>{
+  const f=demoFixture(kind);f.old().extendDemoRuns100();
+  rmSync(join(f.dir,kind==='orders'?'demo-maximum-100-orders.lock':'demo-maximum-600-relay-attempts.lock'));
+  expect(()=>new AdmissionJournal(f.dir,kind,f.newMax)).toThrow(/missing/);
 });

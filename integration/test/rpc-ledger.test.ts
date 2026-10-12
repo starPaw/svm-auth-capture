@@ -204,7 +204,7 @@ describe("RpcLedger.simulate", () => {
     const send = vi.fn().mockRejectedValue(error);
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
-      const ledger = new RpcLedger({ network: NETWORK, genesisHash: GENESIS, rpcUrl: `https://rpc.invalid/${privateText}`,
+      const ledger = new RpcLedger({ network: NETWORK, genesisHash: GENESIS, rpcUrl: `https://rpc.invalid/${privateText}`, rpcReadRetries:0,
         rpc: fakeRpc({ simulateTransaction: () => ({ send }) }) });
       await expect(ledger.simulate(await sampleTransaction())).rejects.toBe(error);
       expect(send).toHaveBeenCalledTimes(1);
@@ -380,10 +380,54 @@ describe("RpcLedger.submit", () => {
       network: NETWORK,
       genesisHash: GENESIS,
       rpcUrl: "http://unused.invalid",
+      confirmTimeoutMs: 10, pollIntervalMs: 1,
       rpc: fakeRpc({ sendTransaction: () => ({ send: () => Promise.reject(new Error("transport timeout")) }) }),
     });
     const result = await ledger.submit(await sampleTransaction());
-    expect(result).toEqual({ kind: "submitted" });
+    expect(result).toEqual({ kind: "submitted", outcome: undefined });
+  });
+
+  test.each([["succeeded", false], ["failed", false], ["succeeded", true], ["failed", true]] as const)(
+    "a lost send acknowledgement observes original finalized %s after HTTP429=%s without resending", async (status, rateLimited) => {
+    const transaction = await sampleTransaction(), signature = getSignatureFromTransaction(transaction);
+    const error = rateLimited ? new SolanaError(SOLANA_ERROR__RPC__TRANSPORT_HTTP_ERROR, {
+      statusCode: 429, message: "SYNTHETIC_PRIVATE_PROVIDER_DETAIL", headers: new Headers(),
+    }) : new Error("provider response lost");
+    const send = vi.fn((_wire: string, _options: unknown) => ({ send: async () => { throw error; } }));
+    let reads = 0;
+    const lookup = vi.fn((signatures: string[]) => {
+      expect(signatures).toEqual([signature]);
+      reads++;
+      return sendable({ value: [reads === 1 ? null : { confirmationStatus: "finalized", slot: 7n,
+        err: status === "succeeded" ? null : "BlockhashNotFound" }] });
+    });
+    const ledger = new RpcLedger({ network: NETWORK, genesisHash: GENESIS, rpcUrl: "http://unused.invalid",
+      confirmTimeoutMs: 1000, pollIntervalMs: 1, rpc: fakeRpc({ sendTransaction: send, getSignatureStatuses: lookup,
+        getTransaction: () => sendable({ meta: { logMessages: [] } }) }) });
+    expect(await ledger.submit(transaction)).toMatchObject({ kind: "submitted", outcome: { status, commitment: "finalized" } });
+    expect(send).toHaveBeenCalledOnce();
+    expect(send.mock.calls[0]?.[0]).toBe(getBase64EncodedWireTransaction(transaction));
+    expect(lookup).toHaveBeenCalledTimes(2);
+  });
+
+  test("a lost acknowledgement and stalled original status share the original absolute deadline", async () => {
+    const transaction = await sampleTransaction(), signature = getSignatureFromTransaction(transaction);
+    let sends = 0;
+    const signals: AbortSignal[] = [];
+    const ledger = new RpcLedger({ network: NETWORK, genesisHash: GENESIS, rpcUrl: "http://unused.invalid",
+      confirmTimeoutMs: 35, requestTimeoutMs: 10, pollIntervalMs: 1, rpc: fakeRpc({
+        sendTransaction: () => ({ send: async () => { sends++; await new Promise(r => setTimeout(r, 12)); throw new Error("response lost"); } }),
+        getSignatureStatuses: (signatures: string[]) => {
+          expect(signatures).toEqual([signature]);
+          return { send: ({ abortSignal }: {abortSignal: AbortSignal}) => { signals.push(abortSignal); return new Promise(() => {}); } };
+        },
+      }) });
+    const start = Date.now();
+    expect(await ledger.submit(transaction)).toEqual({ kind: "submitted", outcome: undefined });
+    expect(Date.now() - start).toBeLessThan(250);
+    expect(sends).toBe(1);
+    expect(signals).toHaveLength(1);
+    expect(signals[0]?.aborted).toBe(true);
   });
 
   test("classifies a signature mismatch as ambiguous submitted", async () => {
@@ -491,7 +535,7 @@ describe("RpcLedger network awaits are bounded", () => {
     });
     const transaction = await sampleTransaction();
     const [result, ms] = await elapsed(() => ledger.submit(transaction));
-    expect(result).toEqual({ kind: "submitted" });
+    expect(result).toEqual({ kind: "submitted", outcome: undefined });
     expect(ms).toBeLessThan(500);
     expect(sends).toBe(1);
     expect(signals[0]?.aborted).toBe(true);
@@ -616,16 +660,17 @@ describe("RpcLedger network awaits are bounded", () => {
       pollIntervalMs: 1,
       rpc: fakeRpc({
         sendTransaction: () => stalled([]),
-        getSignatureStatuses: () => {
+        getSignatureStatuses: (signatures: string[]) => {
+          expect(signatures).toEqual([getSignatureFromTransaction(transaction)]);
           statusCalls += 1;
           return sendable({ value: [null] });
         },
       }),
     });
     const [result, ms] = await elapsed(() => ledger.submit(transaction));
-    expect(result).toEqual({ kind: "submitted" });
-    expect(ms).toBeLessThan(150);
-    expect(statusCalls).toBe(0); // an unconfirmed send never polls a signature it cannot trust
+    expect(result).toEqual({ kind: "submitted", outcome: undefined });
+    expect(ms).toBeLessThan(500);
+    expect(statusCalls).toBeGreaterThan(0); // Only the signature derived from the retained signed bytes.
   });
 
   test("a late failure log cannot extend the original settlement window", async () => {
