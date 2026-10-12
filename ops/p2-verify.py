@@ -4,6 +4,7 @@ import hashlib
 import ipaddress
 import json
 import os
+import re
 from pathlib import Path
 import stat
 import sys
@@ -42,8 +43,21 @@ def verify(root, approval_path='/etc/capture402-e2e/provision-approved.json', ne
         if not ipaddress.ip_address(value).is_global:raise RuntimeError('public approved RPC address required')
     expected=''.join(f'{v} api.devnet.solana.com\n' for v in addresses)
     if Path(hosts_path).read_text()!=expected or approved['networkSha256']!=digest(network_path) or approved['hostsSha256']!=digest(hosts_path):raise RuntimeError('network approval changed')
-    if action is not None and (action not in ['init-budget','budget-status','accept-funding','observe-funding','plan-assets','assets','observe-assets'] or not isinstance(approved.get('actions',{}).get(action),str) or not approved['actions'][action].strip()):raise RuntimeError('exact operator action approval missing before credentials')
-    if action=='assets':
+    if action is not None and (action not in ['init-budget','budget-status','accept-funding','observe-funding','plan-assets','assets','observe-assets','continue-assets-presigner-stop'] or not isinstance(approved.get('actions',{}).get(action),str) or not approved['actions'][action].strip()):raise RuntimeError('exact operator action approval missing before credentials')
+    if action=='continue-assets-presigner-stop':
+        stop_path=Path('/etc/capture402-e2e/p2-presigner-stop.json');protected(stop_path,0o600)
+        if approved.get('preSignerStopSha256')!=digest(stop_path):raise RuntimeError('specific pre-signer stop approval missing')
+        stop=json.loads(stop_path.read_text())
+        expected={'schema':1,'reason':'B206_SYSTEMD_SERVICE_SUFFIX_REJECTED_BEFORE_SDK_SIGNER','stoppedSourceRevision':'b2062584b488adfa3e34e43918fddaafd7e0dc37','stoppedEntrypointSha256':'2d4ac36d064410b834b7eecf13127c4c9818fcb19dcee4dc1a2716c5f13cf4f8','stoppedManifestSha256':'dda6fa6162d0ddd4199b38e023ec602f178c364715196510650ea78de5c39301'}
+        if any(stop.get(k)!=v for k,v in expected.items()) or not re.fullmatch(r'/run/credentials/capture402-e2e-p2-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\.service',stop.get('observedCredentialDirectory','')):raise RuntimeError('unknown stop cannot receive signer credentials')
+        intent=Path('/var/lib/capture402-e2e/setup/assets-intent.json');protected(intent,0o600)
+        if digest(intent)!=stop.get('originalIntentSha256') or json.loads(intent.read_text()).get('planHash')!=stop.get('originalPlanHash'):raise RuntimeError('original intent drift')
+        if any(os.path.lexists(intent.parent/('assets-'+s+'.json')) for s in ['signed','broadcast','response','receipt','continuation-intent']):raise RuntimeError('existing signed/continuation state must remain frozen')
+        state_path=Path('/var/lib/capture402-e2e/facilitator/campaign-budget/state.json');ss=state_path.lstat()
+        if not stat.S_ISREG(ss.st_mode) or ss.st_uid!=0 or ss.st_nlink!=1 or stat.S_IMODE(ss.st_mode)!=0o600:raise RuntimeError('unsafe campaign state')
+        state=json.loads(state_path.read_text())
+        if not isinstance(state.get('entries'),dict) or 'assets' in state['entries']:raise RuntimeError('existing budget admission cannot be continued')
+    if action in ['assets','continue-assets-presigner-stop']:
         for role,uid,gid in [('sponsor',989,986),('mint',0,0)]:
             key=Path('/etc/capture402-e2e/keys')/(role+'.json');protected(key.parent)
             s=key.lstat()

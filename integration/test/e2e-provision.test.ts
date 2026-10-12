@@ -207,3 +207,49 @@ test('read-only assets plan carries both signer identities without loading/signi
  expect(Object.values(q.unsigned.signatures).every(x=>x===null)).toBe(true);
  expect(f.counters()).toEqual({requests:0,sends:0,signerLoads:0});expect(f.budget.summary().reserved).toBe(0n);expect(f.store.read('assets-intent.json')).toBeNull();
 });
+
+async function stoppedFixture() {
+ const f=await fixture();await f.provisioner.acceptFunding();
+ await expect(f.provisioner.assets(async()=>{throw Error('old credential directory guard');})).rejects.toThrow(/credential/);
+ const {STOPPED_P2_SOURCE,STOPPED_P2_ENTRY,STOPPED_P2_MANIFEST}=await import('../operators/p2-presigner-stop.ts');
+ const continuation={stop:{schema:1 as const,reason:'B206_SYSTEMD_SERVICE_SUFFIX_REJECTED_BEFORE_SDK_SIGNER' as const,stoppedSourceRevision:STOPPED_P2_SOURCE,stoppedEntrypointSha256:STOPPED_P2_ENTRY,stoppedManifestSha256:STOPPED_P2_MANIFEST,originalIntentSha256:f.store.originalAssetsIntentHash(),originalPlanHash:f.store.read('assets-intent.json')!.planHash as string,observedCredentialDirectory:'/run/credentials/capture402-e2e-p2-57070b79-1663-4cff-b39b-12c5c765a625.service'},attestationSha256:'b'.repeat(64),ownerApprovalReference:'explicit-new-owner-approval-synthetic-only'};
+ return {...f,continuation};
+}
+test('specific approved pre-signer continuation preserves original intent, signs/sends once and remains restart-fenced',async()=>{
+ const f=await stoppedFixture(),original=readFileSync(join(f.directory,'assets-intent.json'));
+ await expect(f.provisioner.assets(f.load)).rejects.toThrow(); // ordinary action still cannot retry
+ const p=new E2EProvisioner(f.plan,new ProvisionStore(f.directory),f.backend,'synthetic-devnet',f.budget);
+ await p.assets(f.load,f.continuation);
+ expect(readFileSync(join(f.directory,'assets-intent.json'))).toEqual(original);
+ expect(f.store.read('assets-continuation-intent.json')).toMatchObject({ownerApprovalReference:f.continuation.ownerApprovalReference});
+ expect(f.store.read('assets-receipt.json')).toMatchObject({status:'FINALIZED_SUCCEEDED'});
+ await expect(p.assets(f.load,f.continuation)).rejects.toThrow();expect(f.counters()).toEqual({requests:0,sends:1,signerLoads:1});
+});
+test('concurrent specific continuations admit only one signer/send',async()=>{
+ const f=await stoppedFixture();const outcomes=await Promise.allSettled([f.provisioner.assets(f.load,f.continuation),f.provisioner.assets(f.load,f.continuation)]);
+ expect(outcomes.filter(x=>x.status==='fulfilled')).toHaveLength(1);expect(f.counters()).toEqual({requests:0,sends:1,signerLoads:1});
+});
+test.each(['source','entry','manifest','intent','plan','reason','approval','directory'] as const)('invalid continuation %s refuses before signer access',async fault=>{
+ const f=await stoppedFixture(),c=structuredClone(f.continuation);
+ if(fault==='source')c.stop.stoppedSourceRevision='unknown';if(fault==='entry')c.stop.stoppedEntrypointSha256='a'.repeat(64);if(fault==='manifest')c.stop.stoppedManifestSha256='a'.repeat(64);
+ if(fault==='intent')c.stop.originalIntentSha256='a'.repeat(64);if(fault==='plan')c.stop.originalPlanHash='a'.repeat(64);if(fault==='reason')c.stop.reason='UNKNOWN' as any;
+ if(fault==='approval')c.ownerApprovalReference='';if(fault==='directory')c.stop.observedCredentialDirectory='/run/credentials/other.service';
+ await expect(f.provisioner.assets(f.load,c)).rejects.toThrow();expect(f.counters()).toEqual({requests:0,sends:0,signerLoads:0});expect(f.store.read('assets-continuation-intent.json')).toBeNull();
+});
+test.each(['signed','broadcast','response','receipt','budget','dangling-signed'] as const)('any existing %s state preserves UNKNOWN and blocks continuation before keys',async kind=>{
+ const f=await stoppedFixture();
+ if(kind==='budget')f.budget.reserve('assets','assets','a'.repeat(64),{fees:100000n,rent:4043680n,browserAllocation:10000000n});
+ else if(kind==='dangling-signed')symlinkSync(join(f.directory,'missing-original-wire'),join(f.directory,'assets-signed.json'));
+ else f.store.write(`assets-${kind}.json`,{original:'preserve'});
+ await expect(f.provisioner.assets(f.load,f.continuation)).rejects.toThrow();expect(f.counters()).toEqual({requests:0,sends:0,signerLoads:0});expect(f.store.read('assets-continuation-intent.json')).toBeNull();
+ if(kind==='budget')expect(f.budget.summary().reserved).toBe(14143680n);
+});
+test('failed continuation latch fsync freezes again before keys, even with no budget admission',async()=>{
+ const f=await stoppedFixture(),write=f.store.write.bind(f.store);f.store.write=(name,value)=>{write(name,value);if(name==='assets-continuation-intent.json')throw Error('continuation fsync failure');};
+ await expect(f.provisioner.assets(f.load,f.continuation)).rejects.toThrow(/fsync/);f.store.write=write;
+ await expect(f.provisioner.assets(f.load,f.continuation)).rejects.toThrow();expect(f.counters()).toEqual({requests:0,sends:0,signerLoads:0});expect(f.budget.summary().reserved).toBe(0n);
+});
+test('continuation signer failure leaves its permanent latch; no general retry route',async()=>{
+ const f=await stoppedFixture();await expect(f.provisioner.assets(async()=>{throw Error('new signer failure');},f.continuation)).rejects.toThrow();
+ await expect(f.provisioner.assets(f.load,f.continuation)).rejects.toThrow();expect(f.counters().sends).toBe(0);
+});

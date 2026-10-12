@@ -1,5 +1,6 @@
 // Separate operator entry point: never defaults to historical dev, never starts services.
 import { createDurableFile } from '../src/durable-file.ts';
+import { credentialDirectory, validatePreSignerContinuation, type PreSignerStop } from './p2-presigner-stop.ts';
 import { CampaignBudget, type CampaignPolicy } from '../src/campaign-budget.ts';
 import { lstatSync, readFileSync, realpathSync } from 'node:fs';
 import { createHash } from 'node:crypto';
@@ -19,8 +20,8 @@ export const ACCEPTED_EXTERNAL_FUNDING = [
 ];
 const RPC = 'https://api.devnet.solana.com';
 export function provisionArguments(args: string[]) {
-  if (args.length !== 3 || args[1] !== '--profile' || args[2] !== 'e2e' || !['accept-funding', 'assets', 'observe-funding', 'observe-assets', 'init-budget', 'budget-status', 'plan-assets'].includes(args[0]!)) throw Error('expected accept-funding|assets|observe-funding|observe-assets|init-budget|budget-status --profile e2e');
-  return args[0] as 'accept-funding' | 'assets' | 'observe-funding' | 'observe-assets' | 'init-budget' | 'budget-status' | 'plan-assets';
+  if (args.length !== 3 || args[1] !== '--profile' || args[2] !== 'e2e' || !['accept-funding', 'assets', 'observe-funding', 'observe-assets', 'init-budget', 'budget-status', 'plan-assets', 'continue-assets-presigner-stop'].includes(args[0]!)) throw Error('expected accept-funding|assets|observe-funding|observe-assets|init-budget|budget-status --profile e2e');
+  return args[0] as 'accept-funding' | 'assets' | 'observe-funding' | 'observe-assets' | 'init-budget' | 'budget-status' | 'plan-assets' | 'continue-assets-presigner-stop';
 }
 function protectedPath(path: string, mode?: number): void {
   let current = path;
@@ -65,8 +66,7 @@ export function rpcBackend(record: ReturnType<typeof loadDeploymentRecord>): Pro
 async function setupSigner(role: 'sponsor' | 'mint') {
   // PID 1 loads only these two approved sources for the assets unit. Original key
   // custody is verified before launch; the key directory is hidden in the unit.
-  const directory = process.env.CREDENTIALS_DIRECTORY;
-  if (!directory || !/^\/run\/credentials\/capture402-e2e-p2-[a-f0-9-]+$/.test(directory)) throw Error('scoped ephemeral signer credentials required');
+  const directory = credentialDirectory(process.env.CREDENTIALS_DIRECTORY);
   const path = `${directory}/${role}-key`;
   protectedPath(path, 0o400);
   return await loadKeypair(path);
@@ -109,6 +109,13 @@ async function main(): Promise<void> {
   }
   if (action === 'accept-funding') await provisioner.acceptFunding();
   else if (action === 'assets') await provisioner.assets(async () => ({ sponsor: await setupSigner('sponsor'), mint: await setupSigner('mint') }));
+  else if (action === 'continue-assets-presigner-stop') {
+    const stopPath = `${PRIVATE}/p2-presigner-stop.json`; protectedPath(stopPath, 0o600);
+    if (typeof approved.preSignerStopSha256 !== 'string' || digest(stopPath) !== approved.preSignerStopSha256) throw Error('approved specific stop attestation required');
+    const continuation = { stop: JSON.parse(readFileSync(stopPath, 'utf8')) as PreSignerStop, attestationSha256: approved.preSignerStopSha256, ownerApprovalReference: permission };
+    validatePreSignerContinuation(continuation);
+    await provisioner.assets(async () => ({ sponsor: await setupSigner('sponsor'), mint: await setupSigner('mint') }), continuation);
+  }
   const result = await provisioner.observe(action.endsWith('funding') ? 'external-funding' : 'assets');
   console.log(JSON.stringify(result, (_k,x)=>typeof x==='bigint'?String(x):x));
   if (result.status !== 'FINALIZED_SUCCEEDED') process.exitCode = 2;
