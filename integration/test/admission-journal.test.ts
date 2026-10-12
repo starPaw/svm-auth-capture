@@ -1,12 +1,13 @@
-import { afterEach, expect, test } from 'vitest';
+import { afterEach, expect, test, vi } from 'vitest';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, writeFileSync, renameSync, rmSync, chmodSync, openSync, closeSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync, renameSync, rmSync, chmodSync, openSync, closeSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { createRequire } from 'node:module';
 import { AdmissionJournal, type AdmissionPolicy } from '../src/admission-journal.ts';
+import * as durable from '../src/durable-file.ts';
 import { SponsorshipGuard } from '../src/sponsorship.ts';
 const dirs:string[]=[];
 afterEach(()=>dirs.splice(0).forEach(d=>rmSync(d,{recursive:true,force:true})));
@@ -70,4 +71,35 @@ test('durable guard cannot silently expand its explicit configured attempt cap',
   const f=fixture();
   expect(()=>new SponsorshipGuard({admission:f.restart(),maxAttempts:1,minLamportsBalance:0n,feePayer:'11111111111111111111111111111111' as any,ledger:{} as any})).toThrow(/cap mismatch/);
   expect(f.restart().summary().used).toBe(20);
+});
+
+test('selected A extension preserves six consumed orders, immutable archive and lock inode across restart',()=>{
+  const f=fixture('orders',11,5);f.restart().reserve();
+  const lock=statSync(join(f.dir,'.lock'));
+  const oldPolicy=readFileSync(join(f.dir,'policy.json'),'utf8'),oldState=readFileSync(join(f.dir,'state.json'),'utf8');
+  const live=f.restart();live.extendExpiredAOrderLimit();
+  expect(()=>live.reserve()).toThrow(/drift/);
+  const archive=readFileSync(join(f.dir,'expired-A-maximum-11-to-12.lock'),'utf8');
+  expect(JSON.parse(archive)).toMatchObject({oldPolicy:JSON.parse(oldPolicy),oldState:JSON.parse(oldState),newState:{used:6}});
+  const next=()=>new AdmissionJournal(f.dir,'orders',12);
+  expect(next().summary()).toMatchObject({used:6,maximum:12,carryForward:5,historicalActual:5});
+  for(let i=0;i<6;i++)next().reserve();
+  expect(next().summary().used).toBe(12);expect(()=>next().reserve()).toThrow(/cap/);
+  expect(readFileSync(join(f.dir,'expired-A-maximum-11-to-12.lock'),'utf8')).toBe(archive);
+  expect(statSync(join(f.dir,'.lock')).ino).toBe(lock.ino);
+});
+test.each(['relay','five-used','seven-used'])('order extension refuses %s without replacing policy/state',fault=>{
+  const f=fault==='relay'?fixture():fixture('orders',11,5);
+  if(fault==='seven-used'){f.restart().reserve();f.restart().reserve();}
+  const policy=readFileSync(join(f.dir,'policy.json')),state=readFileSync(join(f.dir,'state.json'));
+  expect(()=>f.restart().extendExpiredAOrderLimit()).toThrow(/scope/);
+  expect(readFileSync(join(f.dir,'policy.json'))).toEqual(policy);expect(readFileSync(join(f.dir,'state.json'))).toEqual(state);
+});
+test.each([1,2])('interrupted extension write %i blocks both caps and retains originals in immutable archive',at=>{
+  const f=fixture('orders',11,5);f.restart().reserve();let calls=0;
+  const real=durable.replaceDurableFile;
+  const spy=vi.spyOn(durable,'replaceDurableFile').mockImplementation((path,data)=>{if(++calls===at)throw Error('crash injection');real(path,data);});
+  expect(()=>f.restart().extendExpiredAOrderLimit()).toThrow(/crash/);spy.mockRestore();
+  const archive=JSON.parse(readFileSync(join(f.dir,'expired-A-maximum-11-to-12.lock'),'utf8'));expect(archive.oldState.used).toBe(6);expect(archive.newState.used).toBe(6);
+  expect(()=>new AdmissionJournal(f.dir,'orders',11)).toThrow();expect(()=>new AdmissionJournal(f.dir,'orders',12)).toThrow();
 });

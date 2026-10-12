@@ -46,6 +46,10 @@ try {
       state = next;
       return route.fulfill({ status:402, contentType:'application/json', headers:{'PAYMENT-REQUIRED':Buffer.from(JSON.stringify(next.required)).toString('base64')}, body:JSON.stringify({order:next.id,unsigned:next.unsigned,required:next.required}) });
     }
+    if(path.endsWith('/abandon-authorize') && req.method()==='POST') {
+      posts++;state={...state,status:'abandoned',authorizeAbandonEligible:false,authorizeAbandoned:{kind:'expired-unfunded-authorize',order:state.id,payment:state.payment}};
+      return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({abandoned:true,proof:{kind:'expired-unfunded-authorize',payment:state.payment}})});
+    }
     if(path.endsWith('/reclaim-renewal') && req.method()==='POST') {
       posts++;const unsigned='renewed-DOM-fixture-never-signed-'+(++renewalSequence);state={...state,reclaimGeneration:createHash('sha256').update(unsigned).digest('hex'),reclaimDraftState:'ready',reclaimPreparation:false};
       return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({unsigned,payer:state.payer,proof:{kind:'expired-no-reclaim-effect'}})});
@@ -247,6 +251,21 @@ try {
   assert(!(await page.locator('[data-scenario=cancelled]').isDisabled()));await page.locator('[data-scenario=cancelled]').click();await page.locator('#new-budget').click();
   await page.waitForFunction(()=>localStorage.getItem('capture402-order')==='b'.repeat(32));assert.equal(posts,1);
   check('Closed original hold permits explicit selection of the next scenario before a separately unsigned offer');
+  await load({...draft(),authorizeAbandonEligible:true},true);
+  await page.evaluate(id=>localStorage.setItem('capture402-wallet-attempt',id),id);
+  await page.locator('#refresh').click();await page.waitForFunction(()=>!document.getElementById('abandon-authorize').hidden);
+  assert(await page.locator('#authorize').isDisabled());assert(await page.locator('#new-budget').isHidden());
+  await page.locator('#abandon-authorize').click();await page.waitForFunction(()=>document.getElementById('payment-state').textContent.includes('archived'));
+  assert.equal(posts,1);assert.equal(await page.evaluate(()=>window.fixtureSigns||0),0);assert(await page.locator('#new-budget').isVisible());
+  assert.equal(await page.evaluate(()=>localStorage.getItem('capture402-wallet-attempt')),id);
+  check('Selected abandoned unfunded draft preserves old consent and enables only explicit separate offer, with no signing/dispatch');
+  await load({...draft(),authorizeAbandonEligible:true},true);
+  await page.evaluate(id=>localStorage.setItem('capture402-signed-'+id,'retained-signed-original'),id);
+  await page.locator('#refresh').click();assert(await page.locator('#abandon-authorize').isHidden());assert.equal(posts,0);
+  check('Retained signed authorization forbids the narrow abandonment control');
+  await page.evaluate(id=>{localStorage.removeItem('capture402-signed-'+id);localStorage.setItem('capture402-uncertain',id);},id);
+  await page.locator('#refresh').click();assert(await page.locator('#abandon-authorize').isHidden());assert.equal(posts,0);
+  check('UNKNOWN authorization cannot enter unfunded abandonment');
   // Exercise actual app.js orchestration through both preflights. The wallet module
   // and HTTP backend are explicit non-economic stubs; no real signature is created.
   const flow=await context.newPage(),sequence=[];

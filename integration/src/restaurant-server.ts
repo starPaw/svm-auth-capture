@@ -14,6 +14,7 @@ import { FileSubmissionJournal } from "./submission-journal.ts";
 import { RpcLedger, cachedClusterClock } from "./rpc-ledger.ts";
 import { TOKEN_PROGRAM_ADDRESS } from "./program.ts";
 import { AdmissionJournal } from './admission-journal.ts';
+import { EXPIRED_A_POLICY } from './authorize-abandon.ts';
 import { E2E_SPONSOR, requireE2eRuntimeRpc, trustedRuntimeFile } from './e2e-runtime-policy.ts';
 
 export const DEMO_TIMING = { captureSeconds: 150, refundSecondsAfterCapture: 30 } as const;
@@ -51,6 +52,8 @@ async function main() {
     const b3Recovery = e2e && process.env.SAC006_B3_RECOVERY_POLICY_PATH ? JSON.parse(trustedRuntimeFile(process.env.SAC006_B3_RECOVERY_POLICY_PATH)) : undefined;
     if (b3Recovery && (b3Recovery.order !== 'c17b234248fb69cf0e624fc32ac45bcd' || b3Recovery.payment !== '2ZGNGg4k97DX5RPnQSDsuTb99Nxjyt4cYpjvYitUv8JS' ||
       b3Recovery.payer !== '93PtawNdAfDn7oTjRrbrJJMSgaFTjGS3wjtkrZSNGn74' || b3Recovery.authorizeSignature !== '2d3tAStAtNT891UPAqThpwVNvHGkFP76dX5yvfYNPjAmKLkzBdEFzvZ6ZBh9Ba7HhNotUGdrFmitwdDiW7iRh4dT')) throw Error('B3 recovery policy exceeds the selected operation');
+    const authorizeAbandonPolicy=e2e && process.env.SAC006_B3_AUTHORIZE_ABANDON_POLICY_PATH ? JSON.parse(trustedRuntimeFile(process.env.SAC006_B3_AUTHORIZE_ABANDON_POLICY_PATH)) : undefined;
+    if(authorizeAbandonPolicy && (Object.keys(authorizeAbandonPolicy).sort().join()!==Object.keys(EXPIRED_A_POLICY).sort().join() || Object.entries(EXPIRED_A_POLICY).some(([k,v])=>authorizeAbandonPolicy[k]!==v))) throw Error('Authorize abandonment policy exceeds the selected expired draft');
     const ledger = new RpcLedger({ deployment: record, network: record.network.caip2, genesisHash: record.network.genesisHash, rpcUrl: process.env.SOLANA_RPC_URL! });
     await ledger.verifyGenesis();
     const server = await createKeyPairSignerFromBytes(Uint8Array.from(JSON.parse(readFileSync(process.env.SAC006_SERVER_KEYPAIR_PATH!, "utf8"))));
@@ -68,6 +71,7 @@ async function main() {
       handler: async () => { throw new Error("restaurant menu uses explicit lifecycle captures"); },
       ...(e2e ? { orderAdmission:new AdmissionJournal(process.env.SAC006_E2E_ORDER_ADMISSION_DIR!,'orders',Number(process.env.SAC006_E2E_MAX_ORDERS)),
         ...(b3Recovery ? {b3Recovery} : {}),
+        ...(authorizeAbandonPolicy ? {authorizeAbandonPolicy} : {}),
         now:() => ledger.now() } : {}),
     };
     backend = createRestaurantApp(config); info.configured = true;

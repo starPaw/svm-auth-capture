@@ -67,6 +67,15 @@ export class AdmissionJournal {
     const s = JSON.parse(readFileSync(join(this.directory,'state.json'),'utf8'));
     if (Object.keys(s).sort().join() !== 'policyHash,schema,used' || s.schema !== 1 || s.policyHash !== hash(encode(this.policy)) ||
       !Number.isSafeInteger(s.used) || s.used < this.policy.carryForward || s.used > this.policy.maximum) throw Error('admission state mismatch');
+    const archive='expired-A-maximum-11-to-12.lock';
+    if(existsSync(join(this.directory,archive))) {
+      this.file(archive);
+      const a=JSON.parse(readFileSync(join(this.directory,archive),'utf8'));
+      if(a.schema!==1 || a.reason!=='owner-approved-one-extra-A-order' || a.oldPolicy?.kind!=='orders' || a.oldPolicy.maximum!==11 || a.oldPolicy.carryForward!==5 ||
+        a.oldState?.schema!==1 || a.oldState.used!==6 || a.oldState.policyHash!==hash(encode(a.oldPolicy)) ||
+        encode(a.newPolicy)!==encode({...a.oldPolicy,maximum:12}) || encode(a.newPolicy)!==encode(this.policy) ||
+        a.newState?.schema!==1 || a.newState.used!==6 || a.newState.policyHash!==s.policyHash || s.used<6) throw Error('partial admission extension remains blocked');
+    }
     return s;
   }
   summary() { return this.withLock(() => ({...this.policy,used:this.state().used})); }
@@ -77,6 +86,23 @@ export class AdmissionJournal {
       s.used++;
       replaceDurableFile(join(this.directory,'state.json'),encode(s));
       // No rollback for any subsequent refusal, crash, failed read or lost response.
+    });
+  }
+  /** Operator-only preparation while restaurant is stopped; never called by HTTP.
+   * One extra order for the selected expired A. Preserve used=6 and lock custody.
+   * An immutable archive precedes the two replacements; partial migration refuses
+   * either runtime cap on restart and cannot silently initialize or reset usage. */
+  extendExpiredAOrderLimit(): void {
+    this.withLock(() => {
+      const s=this.state();
+      if(this.policy.kind!=='orders' || this.policy.maximum!==11 || this.policy.carryForward!==5 || s.used!==6) throw Error('selected A order-limit extension exceeds scope');
+      const next={...this.policy,maximum:12};
+      const nextState={...s,policyHash:hash(encode(next))};
+      createDurableFile(join(this.directory,'expired-A-maximum-11-to-12.lock'),encode({schema:1,reason:'owner-approved-one-extra-A-order',oldPolicy:this.policy,oldState:s,newPolicy:next,newState:nextState}));
+      replaceDurableFile(join(this.directory,'policy.json'),encode(next));
+      replaceDurableFile(join(this.directory,'state.json'),encode(nextState));
+      // This instance intentionally remains pinned to the old policy and cannot
+      // admit. Open a new explicitly configured maximum=12 instance after restart.
     });
   }
 }
