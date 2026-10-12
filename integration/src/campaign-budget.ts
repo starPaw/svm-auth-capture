@@ -94,6 +94,9 @@ export class CampaignBudget {
     if (charged > CAMPAIGN_SPEND_LIMIT || browserUsed > browserCredit) throw Error('campaign cap/allocated browser pool exceeded');
     return s;
   }
+  hasReservation(id: string): boolean {
+    return this.withLock(() => Object.hasOwn(this.state().entries, id));
+  }
   summary() {
     return this.withLock(() => {
       const s = this.state(); let committed = 0n, reserved = 0n, browserUsed = 0n, browserCredit = 0n;

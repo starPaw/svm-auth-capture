@@ -1,6 +1,6 @@
 // Issue #68 operator-only bounded provisioning. No imports have network side effects.
 import { createHash } from 'node:crypto';
-import { existsSync, lstatSync, readFileSync } from 'node:fs';
+import { lstatSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   createNoopSigner, getPublicKeyFromAddress,
@@ -11,6 +11,7 @@ import {
 import { getCreateAccountInstruction, getTransferSolInstruction, getTransferSolInstructionDataDecoder, SYSTEM_PROGRAM_ADDRESS } from '@solana-program/system';
 import { AccountState, getCreateAssociatedTokenIdempotentInstruction, getInitializeMint2Instruction, getMintDecoder, getMintSize, getMintToInstruction, getTokenDecoder, getTokenSize } from '@solana-program/token';
 import { CampaignBudget } from '../src/campaign-budget.ts';
+import { validatePreSignerContinuation, type PreSignerContinuation } from './p2-presigner-stop.ts';
 import { verifiedProof, messageDigest, type FinalizedTransaction } from '../src/campaign-proof.ts';
 export type { FinalizedTransaction } from '../src/campaign-proof.ts';
 import { createDurableFile } from '../src/durable-file.ts';
@@ -49,16 +50,23 @@ export class ProvisionStore {
     if (!s.isDirectory() || s.isSymbolicLink() || (s.mode & 0o077)) throw Error('private existing provisioning directory required');
   }
   write(name: string, value: unknown): void {
-    if (!/^(external-funding|assets)-(intent|response|signed|broadcast|receipt)\.json$/.test(name)) throw Error('invalid provisioning record');
+    if (!/^(external-funding|assets)-(intent|response|signed|broadcast|receipt)\.json$/.test(name) && name !== 'assets-continuation-intent.json') throw Error('invalid provisioning record');
     createDurableFile(join(this.directory, name), stringify(value));
   }
   read(name: string): Record<string, any> | null {
-    if (!/^(external-funding|assets)-(intent|response|signed|broadcast|receipt)\.json$/.test(name)) throw Error('invalid provisioning record');
+    if (!/^(external-funding|assets)-(intent|response|signed|broadcast|receipt)\.json$/.test(name) && name !== 'assets-continuation-intent.json') throw Error('invalid provisioning record');
     const p = join(this.directory, name);
-    if (!existsSync(p)) return null;
-    const s = lstatSync(p);
+    let s;
+    try { s = lstatSync(p); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw error;
+    }
     if (!s.isFile() || s.isSymbolicLink() || s.nlink !== 1 || (s.mode & 0o077)) throw Error('unsafe provisioning record');
     return JSON.parse(readFileSync(p, 'utf8'));
+  }
+  originalAssetsIntentHash(): string {
+    if (!this.read('assets-intent.json')) throw Error('missing original assets intent');
+    return hash(readFileSync(join(this.directory, 'assets-intent.json'), 'utf8'));
   }
 }
 export class E2EProvisioner {
@@ -145,11 +153,18 @@ export class E2EProvisioner {
     if (spend > this.budget.summary().available) throw Error('campaign budget insufficient for assets plan');
     return {browserAta,merchantAta,pre,mintRent,tokenRent,lifetime,instructions,unsigned,fee,spend};
   }
-  async assets(loadSigners: () => Promise<{ sponsor: KeyPairSigner; mint: KeyPairSigner }>): Promise<void> {
+  async assets(loadSigners: () => Promise<{ sponsor: KeyPairSigner; mint: KeyPairSigner }>, continuation?: PreSignerContinuation): Promise<void> {
     await this.identity();
     const funded = this.store.read('external-funding-receipt.json');
     if (!funded || funded.planHash !== this.planHash || funded.status !== 'FINALIZED_SUCCEEDED' || (await this.observe('external-funding')).status !== 'FINALIZED_SUCCEEDED') throw Error('original finalized funding proof required');
-    this.reserve('assets');
+    if (continuation) {
+      validatePreSignerContinuation(continuation);
+      this.bound('assets');
+      if (continuation.stop.originalPlanHash !== this.planHash || this.store.originalAssetsIntentHash() !== continuation.stop.originalIntentSha256 || ['signed','broadcast','response','receipt'].some(s => this.store.read(`assets-${s}.json`)) || this.budget.hasReservation('assets')) throw Error('original pre-signer stop does not match; never continue UNKNOWN signing');
+      // Preserve the original intent verbatim. Exclusive continuation latch precedes signer access.
+      // Any subsequent failure freezes this continuation too; never clear/retry it.
+      this.store.write('assets-continuation-intent.json', { planHash: this.planHash, ...continuation });
+    } else this.reserve('assets');
     // No signer is loaded before the durable logical reservation.
     const signers = await loadSigners();
     if (signers.sponsor.address !== this.plan.sponsor || signers.mint.address !== this.plan.mint) throw Error('setup signer identity mismatch');

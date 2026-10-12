@@ -2,7 +2,7 @@
 # Run only from an owner-approved root-owned snapshot, after external digest checks.
 set -euo pipefail
 [[ $# == 3 && $2 == --profile && $3 == e2e ]] || exit 64
-case "$1" in init-budget|budget-status|accept-funding|observe-funding|plan-assets|assets|observe-assets) ;; *) exit 64 ;; esac
+case "$1" in init-budget|budget-status|accept-funding|observe-funding|plan-assets|assets|observe-assets|continue-assets-presigner-stop) ;; *) exit 64 ;; esac
 [[ $(id -u) == 0 ]] || exit 77
 snapshot=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 # This verifier checks complete source/dependency/interpreter closure BEFORE Node imports.
@@ -11,7 +11,7 @@ mapfile -t rpc_ips < <(/usr/bin/python3 -I -B -c 'import json; print("\n".join(j
 [[ ${#rpc_ips[@]} -gt 0 ]] || exit 78
 allow=(--property="IPAddressAllow=${rpc_ips[*]}")
 credentials=()
-if [[ $1 == assets ]];then
+if [[ $1 == assets || $1 == continue-assets-presigner-stop ]];then
  credentials+=(--property=LoadCredential=sponsor-key:/etc/capture402-e2e/keys/sponsor.json --property=LoadCredential=mint-key:/etc/capture402-e2e/keys/mint.json)
 fi
 exec /usr/bin/systemd-run --quiet --wait --pipe --collect --unit="capture402-e2e-p2-$(cat /proc/sys/kernel/random/uuid)" \
