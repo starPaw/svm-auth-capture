@@ -390,10 +390,10 @@ export class RpcLedger implements Ledger, ChainReader {
         // finalized status resolves any of these cases; never infer global non-submission.
         return { kind: "submitted", outcome: await this.pollForFinalized(expectedSignature, deadline) };
       }
-      // Any other failure (transport error, an expired deadline, a malformed response) cannot
-      // prove the exact bytes were never broadcast: stay in the ambiguous `submitted` branch,
-      // never guess `not-submitted`, and never send again.
-      return { kind: "submitted" };
+      // A lost acknowledgement can follow a successful broadcast. Observe only the locally
+      // derived original signature within the remaining settlement deadline. Missing status
+      // stays ambiguous; an exhausted deadline performs no further requests. Never resend.
+      return { kind: "submitted", outcome: await this.pollForFinalized(expectedSignature, deadline) };
     }
 
     if (signature !== expectedSignature) {
