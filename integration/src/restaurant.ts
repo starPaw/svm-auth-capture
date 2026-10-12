@@ -26,6 +26,7 @@ import type { AdmissionJournal } from './admission-journal.ts';
 import { b3RecoveryEvidence, type B3Recovery } from './b3-recovery.ts';
 import type { RpcLedger } from './rpc-ledger.ts';
 import { proveExpiredReclaimConsent } from './reclaim-consent-renewal.ts';
+import { currentReclaimGeneration, nextReclaimArchive } from './reclaim-generations.ts';
 
 export const DEMO_UNIT = 1_000_000n;
 export const DEMO_BUDGET = 100n * DEMO_UNIT;
@@ -196,6 +197,10 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
     if (status.kind === "unavailable") return { kind: "unavailable", detail: "RPC signature evidence unavailable" };
     return JSON.parse(JSON.stringify(status, (_k,v) => typeof v === "bigint" ? v.toString() : v));
   }
+  function retainedReclaimGeneration(order:Order) {
+    return currentReclaimGeneration(c.orders.path(order.id),order,
+      wire=>c.reclaimJournal.findByMessageHash(messageHash(decode(wire).messageBytes)).length > 0);
+  }
   async function view(order: Order) {
     const p = await restaurantSnapshot(c, order);
     const now = await orderClock(c,order);
@@ -205,8 +210,16 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
     const reasons = actionReasons(c, order, p, now, blocked);
     const balances = { payer: await tokenBalance(c, order.payer), merchant: await tokenBalance(c, c.server.address) };
     if (!reasons.refund && (balances.merchant.amount === null || balances.merchant.amount < money(refundAmount(order, p!)))) reasons.refund = balances.merchant.reason || "Merchant test-token balance cannot fund this refund.";
+    const path=c.orders.path(order.id);
+    const generation=retainedReclaimGeneration(order);
+    const consentUsed=!!generation && (existsSync(`${path}.reclaim-consent-${digest(generation.newUnsigned)}.lock`) ||
+      c.reclaimJournal.findByMessageHash(messageHash(decode(generation.newUnsigned).messageBytes)).length > 0);
+    const draftValid=generation && !consentUsed && !blocked && !c.orders.attempted(order.id,'reclaim') && !order.events.some(e=>e.action==='reclaim') && c.ledger.offerBlockhashValid
+      ? await c.ledger.offerBlockhashValid(generation.newLifetime.blockhash) : undefined;
     return { id: order.id, payer: order.payer, payment: order.payment, scenario: order.scenario,
-      reclaimGeneration: existsSync(`${c.orders.path(order.id)}.reclaim-renewal.lock`) && order.reclaimUnsigned ? digest(order.reclaimUnsigned) : undefined,
+      reclaimGeneration: generation ? digest(generation.newUnsigned) : undefined,
+      reclaimDraftState: generation ? consentUsed || blocked || c.orders.attempted(order.id,'reclaim') || order.events.some(e=>e.action==='reclaim') ? 'stopped' : draftValid === true ? 'ready' : draftValid === false ? 'expired-or-unavailable' : 'stopped' : undefined,
+      reclaimPreparation: !blocked && !reasons.reclaim && existsSync(`${path}.reclaim-consent.lock`) && !consentUsed && !order.events.some(e=>e.action==='reclaim') && (!generation || draftValid === false),
       status: blocked ? "pending" : p ? p.held === 0n ? "closed" : "active" : order.status,
       authorized: p ? money(p.maximum) : 0, captured: money(captured), remaining: p ? money(p.held) : 0, refunded: money(refunded), released: p ? money(p.maximum - p.held - captured) : 0,
       heldBaseUnits: p?.held.toString(), refundableBaseUnits: p?.refundable.toString(),
@@ -267,6 +280,10 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
     const reclaim = ctx.req.query('operation') === 'reclaim';
     const unsigned = reclaim ? order.reclaimUnsigned : order.unsigned;
     const p = await restaurantSnapshot(c,order);
+    if (reclaim) {
+      const generation=retainedReclaimGeneration(order);
+      if (existsSync(`${c.orders.path(order.id)}.${generation ? `reclaim-consent-${digest(unsigned ?? '')}` : 'reclaim-consent'}.lock`)) return ctx.json({error:'Retained consent already used; signing stopped.'},409);
+    }
     if (!unsigned || c.orders.busy(order.id) || order.status === 'pending' ||
       (reclaim ? !p || !!actionReasons(c,order,p,await orderClock(c,order),false).reclaim : order.status !== 'draft' || order.events.length !== 0 || p !== null || await orderClock(c,order) >= BigInt(order.required.accepts[0]!.extra!.captureDeadline as number))) {
       return ctx.json({error:'Original offer is not eligible for fresh consent.'},409);
@@ -289,10 +306,10 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
         const p=await restaurantSnapshot(c,order);
         if (!p || actionReasons(c,order,p,await orderClock(c,order),false).reclaim) return ctx.json({error:'Original reclaim consent is not eligible.'},409);
       } else if(order.status!=='draft' || order.events.length || await orderClock(c,order)>=BigInt(order.required.accepts[0]!.extra!.captureDeadline as number)) return ctx.json({error:'Original consent state differs.'},409);
-      const renewed=reclaim && existsSync(`${c.orders.path(order.id)}.reclaim-renewal.lock`);
-      if(renewed) {
-        const renewal=JSON.parse(readFileSync(`${c.orders.path(order.id)}.reclaim-renewal.lock`,'utf8'));
-        if(order.reclaimUnsigned!==renewal.newUnsigned || JSON.stringify(order.reclaimLifetime)!==JSON.stringify(renewal.newLifetime)) return ctx.json({error:'Partial renewal remains blocked.'},409);
+      const renewed=reclaim && !!retainedReclaimGeneration(order);
+      if(reclaim) {
+        const message=getCompiledTransactionMessageDecoder().decode(decode(unsigned).messageBytes);
+        if(!c.ledger.offerBlockhashValid || !await c.ledger.offerBlockhashValid(message.lifetimeToken)) return ctx.json({error:'Expired or unavailable draft cannot receive fresh consent.'},409);
       }
       const marker=renewed ? `reclaim-consent-${digest(unsigned)}` : reclaim?'reclaim-consent':'wallet-consent';
       createDurableFile(`${c.orders.path(order.id)}.${marker}.lock`,JSON.stringify({order:order.id,unsignedSha256:body.unsignedSha256}));
@@ -380,11 +397,9 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
   app.get("/api/orders/:id/reclaim", async ctx => {
     let order = owned(ctx.req.param("id"), getCookie(ctx, cookieName));
     if(existsSync(`${c.orders.path(order.id)}.reclaim-consent.lock`)) {
-      const path=`${c.orders.path(order.id)}.reclaim-renewal.lock`;
-      const renewal=existsSync(path) ? JSON.parse(readFileSync(path,'utf8')) : undefined;
-      if(renewal && order.reclaimUnsigned===renewal.newUnsigned && JSON.stringify(order.reclaimLifetime)===JSON.stringify(renewal.newLifetime) &&
-        !existsSync(`${c.orders.path(order.id)}.reclaim-consent-${digest(renewal.newUnsigned)}.lock`) && !c.orders.busy(order.id) && order.status!=='pending' && !c.orders.attempted(order.id,'reclaim'))
-        return ctx.json({unsigned:order.reclaimUnsigned,payer:order.payer}); // Retrieve the same retained renewed draft, never replace it.
+      const renewal=retainedReclaimGeneration(order);
+      if(renewal && !existsSync(`${c.orders.path(order.id)}.reclaim-consent-${digest(renewal.newUnsigned)}.lock`) && !c.orders.busy(order.id) && order.status!=='pending' && !c.orders.attempted(order.id,'reclaim'))
+        return ctx.json({unsigned:order.reclaimUnsigned,payer:order.payer}); // Same retained wire only; signing preflight checks validity.
       return ctx.json({error:'Original reclaim consent already attempted; inspect retained draft/signature before replacement.'},409);
     }
     c.orders.reserve(order.id, "reclaim");
@@ -405,9 +420,10 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
     try {
       order=c.orders.read(order.id);
       const path=c.orders.path(order.id), consentPath=`${path}.reclaim-consent.lock`;
-      if(!existsSync(consentPath) || existsSync(`${path}.reclaim-renewal.lock`) || !order.reclaimUnsigned || !order.reclaimLifetime ||
+      const generation=retainedReclaimGeneration(order);
+      if(!existsSync(consentPath) || generation && existsSync(`${path}.reclaim-consent-${digest(generation.newUnsigned)}.lock`) || !order.reclaimUnsigned || !order.reclaimLifetime ||
         order.status==='pending' || order.events.some(e=>e.action==='reclaim') || !c.ledger.getFinalizedBlockhashStatus || !c.ledger.getClockAtLeast)
-        return ctx.json({error:'Only one expired unsubmitted reclaim consent can be explicitly renewed.'},409);
+        return ctx.json({error:'Only an expired initial consent or unused retained draft can be explicitly prepared.'},409);
       // Existing finalized events remain authoritative; absence of a signature is not proof.
       await restaurantSnapshot(c,order);
       let minContextSlot=0n;
@@ -416,7 +432,8 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
         if(status.kind!=='found' || status.commitment!=='finalized' || status.err!==null) return ctx.json({error:'Original outcome unavailable; renewal blocked.'},409);
         if(status.slot>minContextSlot)minContextSlot=status.slot;
       }
-      const oldUnsigned=order.reclaimUnsigned, oldLifetime=order.reclaimLifetime, oldConsent=readFileSync(consentPath,'utf8');
+      const oldUnsigned=order.reclaimUnsigned, oldLifetime=order.reclaimLifetime, oldConsent=generation ? null : readFileSync(consentPath,'utf8');
+      if(c.reclaimJournal.findByMessageHash(messageHash(decode(oldUnsigned).messageBytes)).length) return ctx.json({error:'Retained journal attempt blocks preparation.'},409);
       const proof=await proveExpiredReclaimConsent({unsigned:oldUnsigned,consent:oldConsent,order:order.id,payment:order.payment,payer:order.payer,
         server:c.server.address,mint:c.asset,programId:c.programId,maximum:DEMO_BUDGET,
         captureDeadline:BigInt(order.required.accepts[0]!.extra!.captureDeadline as number),refundDeadline:BigInt(order.required.accepts[0]!.extra!.refundDeadline as number),
@@ -426,8 +443,9 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
       if(lifetime.blockhash===oldLifetime.blockhash) return ctx.json({error:'Fresh distinct blockhash required.'},409);
       const tx=await buildDemoTransaction({feePayer:order.payer,signers:[],lifetime,instructions:[await reclaimInstruction({programId:c.programId,payment:order.payment,payer:order.payer,server:c.server.address,mint:c.asset})]},c.ledger);
       const newUnsigned=encodeTransaction(tx), newLifetime={blockhash:lifetime.blockhash,lastValidBlockHeight:lifetime.lastValidBlockHeight.toString(),...(lifetime.blockhashSlot===undefined?{}:{blockhashSlot:lifetime.blockhashSlot.toString()})};
+      if(!c.ledger.offerBlockhashValid || !await c.ledger.offerBlockhashValid(lifetime.blockhash)) return ctx.json({error:'Fresh draft expired or unavailable before publication; nothing prepared.'},409);
       // Immutable archive is flushed before the draft changes. Partial write/crash stays blocked.
-      createDurableFile(`${path}.reclaim-renewal.lock`,JSON.stringify({schema:1,order:order.id,payment:order.payment,payer:order.payer,oldUnsigned,oldLifetime,oldConsent,proof,newUnsigned,newLifetime}));
+      createDurableFile(generation ? nextReclaimArchive(path,oldUnsigned) : `${path}.reclaim-renewal.lock`,JSON.stringify({schema:1,order:order.id,payment:order.payment,payer:order.payer,oldUnsigned,oldLifetime,oldConsent,proof,newUnsigned,newLifetime}));
       order.reclaimUnsigned=newUnsigned;order.reclaimLifetime=newLifetime;c.orders.write(order);
       return ctx.json({unsigned:newUnsigned,payer:order.payer,proof});
     } finally {c.orders.unlock(order.id);}
@@ -445,6 +463,14 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
     // Never associate its lifetime evidence with another signed wire.
     if (!order.reclaimUnsigned || !equalMessage(tx, decode(order.reclaimUnsigned)) || order.reclaimLifetime && order.reclaimLifetime.blockhash !== m.lifetimeToken) {
       c.orders.unlock(order.id); return ctx.json({ error: "reclaim draft changed; inspect the current offer" }, 409);
+    }
+    const generation=retainedReclaimGeneration(order);
+    if(generation) {
+      const marker=`${c.orders.path(order.id)}.reclaim-consent-${digest(generation.newUnsigned)}.lock`;
+      const consent=existsSync(marker) ? JSON.parse(readFileSync(marker,'utf8')) : undefined;
+      if(!consent || Object.keys(consent).sort().join()!=='order,unsignedSha256' || consent.order!==order.id || consent.unsignedSha256!==digest(generation.newUnsigned)) {
+        c.orders.unlock(order.id); return ctx.json({error:'Fresh generation consent required before signed dispatch.'},409);
+      }
     }
     const sig = getSignatureFromTransaction(tx);
     const event: Event = { action: "reclaim", label: labels.reclaim, amount: p.held.toString(), at: new Date().toISOString(), status: "prepared", transaction: sig, transactionBase64: body.transaction };

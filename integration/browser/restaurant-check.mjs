@@ -24,6 +24,7 @@ const origin = `https://127.0.0.1:${server.address().port}`;
 let browser;
 const report = { scope:'Local HTTPS DOM fixtures; no Devnet, wallet signing or economic E2E claim.', browser:'', checks:[], viewports:[], requests:[] };
 let lastActionBody, nextActionPreflight, definitiveResponse = false;
+let renewalSequence=0;
 let state, rpcFailure = false, posts = 0, gets = 0, loseResponse = false, delayPreflight = false, missingAuthority = false;
 const secret = 'local-browser-fixture-credential-' + 'x'.repeat(32);
 const id = 'a'.repeat(32);
@@ -46,7 +47,7 @@ try {
       return route.fulfill({ status:402, contentType:'application/json', headers:{'PAYMENT-REQUIRED':Buffer.from(JSON.stringify(next.required)).toString('base64')}, body:JSON.stringify({order:next.id,unsigned:next.unsigned,required:next.required}) });
     }
     if(path.endsWith('/reclaim-renewal') && req.method()==='POST') {
-      posts++;const unsigned='renewed-DOM-fixture-never-signed';state={...state,reclaimGeneration:createHash('sha256').update(unsigned).digest('hex')};
+      posts++;const unsigned='renewed-DOM-fixture-never-signed-'+(++renewalSequence);state={...state,reclaimGeneration:createHash('sha256').update(unsigned).digest('hex'),reclaimDraftState:'ready',reclaimPreparation:false};
       return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({unsigned,payer:state.payer,proof:{kind:'expired-no-reclaim-effect'}})});
     }
     if (path.includes('/actions/')) {
@@ -189,7 +190,7 @@ try {
   assert(await page.evaluate(()=>JSON.parse(localStorage.getItem('capture402-request-'+localStorage.getItem('capture402-order'))).path.endsWith('/actions/beer')));
   check('Exact pre-dispatch body/header releases only its fresh latch and retains source-bound request metadata');
   const recovery={order:id,payer:info.merchant,payment:info.programId,policySha256:'a'.repeat(64),originalEvidenceSha256:'b'.repeat(64),classification:'source-bound-pre-dispatch-refusal',continued:false};
-  const expiredHeld={...held(),captureDeadline:Math.floor(Date.now()/1000)-1,actions:{...held().actions,reclaim:true},b3Recovery:recovery};
+  const expiredHeld={...held(),captureDeadline:Math.floor(Date.now()/1000)-1,actions:{...held().actions,reclaim:true},reclaimPreparation:true,b3Recovery:recovery};
   await load(expiredHeld,true);await page.locator('#connect-wallet').click();await page.locator('#wallet-list button').first().click();
   await page.evaluate(()=>localStorage.setItem('capture402-uncertain',localStorage.getItem('capture402-order')));
   await page.locator('#refresh').click();await page.waitForFunction(()=>!document.getElementById('reclaim').disabled);
@@ -204,14 +205,24 @@ try {
   assert.equal(posts,1);assert.equal(await page.evaluate(()=>window.fixtureSigns||0),0);
   assert.equal(await page.evaluate(()=>localStorage.getItem('capture402-uncertain')),id);
   assert.equal(await page.evaluate(()=>localStorage.getItem('capture402-reclaim-wallet-attempt')),id);
-  assert.equal(await page.locator('#action-status').textContent(),'Expired original consent archived after finalized no-effect proof. Fresh reclaim prepared; sign separately when ready.');
+  assert.equal(await page.locator('#action-status').textContent(),'Previous reclaim wire archived after finalized no-effect proof. Fresh unsigned draft prepared; request signature separately.');
   check('Successful reviewed renewal preserves its no-effect preparation message after refresh, without claiming a finalized reclaim');
   check('Explicit renewal prepares one unsigned draft without wallet signing or clearing original latch/consent');
   await page.reload();await page.waitForFunction(()=>document.getElementById('payment-id').querySelector('a'));
   await page.locator('#connect-wallet').click();await page.locator('#wallet-list button').first().click();
   await page.waitForFunction(()=>!document.getElementById('reclaim').disabled);
   assert(await page.locator('#renew-reclaim').isHidden());
-  check('Retained renewed generation survives navigation and cannot expose a second renewal');
+  check('Retained valid generation survives navigation without offering replacement');
+  const firstGeneration=state.reclaimGeneration;
+  state={...state,reclaimDraftState:'expired-or-unavailable',reclaimPreparation:true};
+  await page.locator('#refresh').click();await page.waitForFunction(()=>document.getElementById('reclaim').disabled && !document.getElementById('renew-reclaim').hidden);
+  assert((await page.locator('#reclaim-description').textContent()).includes('expired or unavailable'));
+  assert.equal(await page.evaluate(()=>window.fixtureSigns||0),0);
+  check('Expired unsigned generation disables signing and exposes explicit proof-gated preparation');
+  await page.locator('#renew-reclaim').click();await page.waitForFunction(()=>!document.getElementById('reclaim').disabled);
+  assert.notEqual(state.reclaimGeneration,firstGeneration);assert.equal(posts,2);assert.equal(await page.evaluate(()=>window.fixtureSigns||0),0);
+  check('Explicit repeated preparation changes generation without wallet signing or dispatch');
+  state={...state,reclaimDraftState:'stopped',reclaimPreparation:false};
   await page.evaluate(id=>localStorage.setItem('capture402-reclaim-wallet-attempt-'+id,localStorage.getItem('capture402-reclaim-renewed-'+id)),id);
   await page.locator('#refresh').click();await page.waitForFunction(()=>document.getElementById('reclaim').disabled && document.getElementById('action-status').textContent.includes('All new operations stopped'));
   assert(await page.locator('#renew-reclaim').isHidden());
