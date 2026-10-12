@@ -1,5 +1,5 @@
 import { wallets, onWallets, connect, walletSign, encodeEnvelope, decodeEnvelope, signingReport, assertDevnetPolicy } from './wallet.js';
-import { definitiveReceipt, recoveryMatches } from './receipt-state.js';
+import { definitiveReceipt, recoveryMatches, authorizeIsolationMatches } from './receipt-state.js';
 const $ = id => document.getElementById(id);
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
 const explorer = (kind, value) => `https://explorer.solana.com/${kind}/${encodeURIComponent(value)}?cluster=devnet`;
@@ -14,8 +14,9 @@ const continued = () => recoveryAllowed() && order.b3Recovery.continued === true
 const renewedReclaim = () => !!order?.reclaimGeneration;
 const reclaimAttempted = () => order?.reclaimDraftState === 'stopped' || (renewedReclaim() ? localStorage.getItem(`capture402-reclaim-wallet-attempt-${order.id}`) === order.reclaimGeneration : localStorage.getItem('capture402-reclaim-wallet-attempt') === order?.id);
 const signedOffer = () => !!order && localStorage.getItem('capture402-wallet-attempt') === order.id;
-const canReplace = () => !!order && !stale && (!uncertain() || continued()) && order.status !== 'pending' && order.remaining === 0 &&
-  !(signedOffer() && order.status === 'draft') && (expiredDraft() || ['closed','rejected','abandoned'].includes(order.status));
+const isolatedAuthorize=()=>authorizeIsolationMatches(order?.authorizeIsolation,order);
+const canReplace = () => !!order && !stale && (isolatedAuthorize() || (!uncertain() || continued()) && order.status !== 'pending' && order.remaining === 0 &&
+  !(signedOffer() && order.status === 'draft') && (expiredDraft() || ['closed','rejected','abandoned'].includes(order.status)));
 const setStatus = (message, error = false) => { $('action-status').hidden = !message; $('action-status').textContent = message; $('action-status').classList.toggle('connection-error', error); };
 const safeOperatorTransport = () => { try { assertDevnetPolicy(config); return location.protocol === 'https:' && config.configured === true; } catch { return false; } };
 const clockNow = () => anchor.clock + Math.floor((Date.now() - anchor.at) / 1000);
@@ -74,7 +75,7 @@ function render() {
   for (const key of ['authorized','captured','remaining','refunded']) $(key).textContent = (order?.[key] ?? 0).toLocaleString('en-US', { maximumFractionDigits: 6 });
   $('refundable').textContent = order?.refundableBaseUnits !== undefined ? (Number(order.refundableBaseUnits) / 1_000_000).toLocaleString('en-US', { maximumFractionDigits: 6 }) : '0';
   const state = order?.status ?? 'idle';
-  $('payment-state').textContent = continued() ? 'Hold reclaimed · original refusal archived' : recoveryAllowed() ? 'Historical capture evidence retained · payer reclaim separate' : uncertain() ? 'Unknown response · locked' : stale ? 'RPC unavailable · paused' : ({ idle:'Awaiting authorization', abandoned:'Expired unfunded draft archived', draft:'Unsigned offer', active:'Finalized', closed:'Hold closed', pending:'Pending · inspect signatures', rejected:'Authorization refused' })[state] ?? state;
+  $('payment-state').textContent = stale ? 'RPC unavailable · paused' : isolatedAuthorize() ? 'Expired authorization preserved · new order available' : continued() ? 'Hold reclaimed · original refusal archived' : recoveryAllowed() ? 'Historical capture evidence retained · payer reclaim separate' : uncertain() ? 'Unknown response · locked' : ({ idle:'Awaiting authorization', abandoned:'Expired unfunded draft archived', draft:'Unsigned offer', active:'Finalized', closed:'Hold closed', pending:'Pending · inspect signatures', rejected:'Authorization refused' })[state] ?? state;
   $('payment-state').classList.toggle('live', !stale && !uncertain() && ['active','closed'].includes(state));
   $('released-copy').hidden = !(order?.released > 0); $('released-copy').textContent = order?.released > 0 ? `${order.released} test tokens released to payer` : 'No tokens released yet.';
   const reason = authorizeReason(); $('authorize').disabled = !!reason; $('authorize-reason').textContent = reason || 'Ready: sign the exact 100 test-token offer. Settlement must finalize.';
@@ -93,7 +94,7 @@ function render() {
   $('reclaim').textContent = renewedReclaim() ? 'Request payer signature for retained draft' : recoveryAllowed() ? 'Resume payer reclaim · preserve original refusal evidence' : 'Reclaim remaining hold';
   $('reclaim-description').textContent = localStorage.getItem('capture402-reclaim-uncertain') === order?.id ? 'Separate reclaim outcome UNKNOWN; retain its original signature and stop.' : order?.reclaimDraftState === 'expired-or-unavailable' ? 'Retained unsigned draft expired or unavailable. Explicit preparation requires fresh canonical finalized expiry and custody proof; nothing is signed.' : order?.reclaimDraftState === 'stopped' ? 'Reclaim consent or attempt retained; further signing and preparation stopped.' : recoveryAllowed() ? 'Reviewed source-bound pre-dispatch evidence; fresh payer consent reclaims the expired hold. Original latch remains archived; this is a new operation.' : uncertain() ? 'Original response unknown; inspect its signatures.' : stale ? 'Fresh finalized RPC state unavailable.' : !payerMatches ? 'Connect the original payer wallet to reclaim.' : order?.actionReasons?.reclaim || 'Ready for payer-direct reclaim; the facilitator is not used.';
   document.querySelectorAll('[data-scenario]').forEach(b => { b.classList.toggle('selected', b.dataset.scenario === scenario); b.disabled = busy || !!order && !canReplace(); });
-  $('new-budget').hidden = !order || stale || uncertain() && !continued() || busy || order.status === 'pending' || order.remaining > 0 || signedOffer() && order.status === 'draft' || !(expiredDraft() || ['closed','rejected','abandoned'].includes(order.status));
+  $('new-budget').hidden = busy || !canReplace();
   $('abandon-authorize').hidden = diagnosticOnly || busy || stale || uncertain() || !order?.authorizeAbandonEligible || !!localStorage.getItem(`capture402-signed-${order?.id}`);
   $('new-budget').textContent = expiredDraft() ? 'Replace expired unsigned offer explicitly' : 'Prepare a new offer explicitly';
   const balanceText = (role, fallback) => { const b = order?.balances?.[role]; return b ? `${role === 'payer' ? 'Payer' : 'Merchant'} test-mint balance: ${b.amount === null ? 'unavailable' : b.amount} ${b.reason}` : fallback; };
@@ -128,7 +129,7 @@ async function run(fn, renewalMessage = '', refreshAfter = true) {
     await fn(); if(refreshAfter) await refresh();
     const preparedRenewal = renewalMessage && recoveryAllowed() && renewedReclaim() && order.reclaimDraftState === 'ready' && !reclaimAttempted() && order.status !== 'pending' && order.remaining > 0 && order.actions?.reclaim &&
       localStorage.getItem('capture402-reclaim-uncertain') !== order.id;
-    setStatus(preparedRenewal ? renewalMessage : order?.status === 'abandoned' ? 'Selected expired unfunded authorization archived; no funds moved. Prepare a new offer separately.' : continued() ? 'Payer reclaim finalized. Historical capture evidence retained; a new scenario may be explicitly prepared.' : recoveryAllowed() && !reclaimAttempted() && order.status !== 'pending' && localStorage.getItem('capture402-reclaim-uncertain') !== order.id ? order.reclaimDraftState === 'expired-or-unavailable' ? 'Historical capture evidence retained. Unsigned reclaim expired or unavailable; explicit preparation requires fresh finalized proof.' : 'Historical capture evidence retained. Separate payer reclaim requires fresh consent and a finalized receipt.' : uncertain() || order?.status === 'pending' ? 'Original operation pending or unknown. All new operations stopped; inspect original signatures.' : 'Original state refreshed. Only finalized receipts confirm settlement.');
+    setStatus(preparedRenewal ? renewalMessage : isolatedAuthorize() ? 'Successful authorization effect excluded for the expired original. Outcome UNKNOWN and reserve retained; explicitly prepare one new offer.' : order?.status === 'abandoned' ? 'Selected expired unfunded authorization archived; no funds moved. Prepare a new offer separately.' : continued() ? 'Payer reclaim finalized. Historical capture evidence retained; a new scenario may be explicitly prepared.' : recoveryAllowed() && !reclaimAttempted() && order.status !== 'pending' && localStorage.getItem('capture402-reclaim-uncertain') !== order.id ? order.reclaimDraftState === 'expired-or-unavailable' ? 'Historical capture evidence retained. Unsigned reclaim expired or unavailable; explicit preparation requires fresh finalized proof.' : 'Historical capture evidence retained. Separate payer reclaim requires fresh consent and a finalized receipt.' : uncertain() || order?.status === 'pending' ? 'Original operation pending or unknown. All new operations stopped; inspect original signatures.' : 'Original state refreshed. Only finalized receipts confirm settlement.');
   }
   catch (error) { setStatus(error.message + (diagnosticOnly && signingReport() ? '\n\n' + JSON.stringify(signingReport(),null,2) : ''), true); try { await refresh(); } catch { stale = true; accessId = ''; } }
   finally { busy = false; render(); }
@@ -182,6 +183,7 @@ $('connect-wallet').onclick = () => { showWallets(); $('wallet-dialog').showModa
 $('close-wallet').onclick = () => $('wallet-dialog').close();
 async function prepareOffer() {
   if (!connection?.account) throw new Error('Connect the payer wallet first.');
+  if(isolatedAuthorize())localStorage.setItem(`capture402-isolation-archive-${order.id}`,JSON.stringify({originalLatch:localStorage.getItem('capture402-uncertain'),originalWalletAttempt:localStorage.getItem('capture402-wallet-attempt'),evidence:order.authorizeIsolation,acknowledgedAt:new Date().toISOString()}));
   const { response, data } = await request('/api/orders', { method:'POST', headers:{ 'Content-Type':'application/json' }, body:JSON.stringify({ payer:connection.account.address, scenario }) }, [402]);
   const header = response.headers.get('PAYMENT-REQUIRED');
   if (!header || !data.order || !data.unsigned) throw new Error(data.error || 'No real unsigned budget offer could be prepared.');

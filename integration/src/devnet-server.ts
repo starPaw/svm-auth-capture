@@ -42,7 +42,7 @@ async function main(): Promise<void> {
   const e2e = feePayer.address === '5mkvwgKeWMYrFppGm8ugLzQC9Wff4vduqWphsGhQNigX' || requireEnv('SAC006_FACILITATOR_KEYPAIR_PATH').includes('/capture402-e2e/');
   if (e2e) requireE2eRuntimeRpc(rpcUrl,record);
 
-  const ledger = new RpcLedger({ deployment: record, network: record.network.caip2, genesisHash: record.network.genesisHash, rpcUrl });
+  const ledger = new RpcLedger({ deployment: record, network: record.network.caip2, genesisHash: record.network.genesisHash, rpcUrl, rpcMinIntervalMs:e2e?250:0 });
   await ledger.verifyGenesis();
 
   // The exact co-signed bytes, signature, and blockhash of every broadcast are written here first.

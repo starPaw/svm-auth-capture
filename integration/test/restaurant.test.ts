@@ -1,10 +1,10 @@
 // Local HTTP → real facilitator → accepted SBF. No Devnet submissions or mocked payment engine.
-import { mkdtempSync, readdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, writeFileSync,renameSync,existsSync,chmodSync,statSync,unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from 'node:crypto';
 import { EXPIRED_A_POLICY } from '../src/authorize-abandon.ts';
-import { getBase64Encoder, getTransactionDecoder, partiallySignTransaction, type Address } from "@solana/kit";
+import { getBase64Encoder, getTransactionDecoder, partiallySignTransaction, getSignatureFromTransaction, getCompiledTransactionMessageDecoder, getBase64EncodedWireTransaction, type Address } from "@solana/kit";
 import { getMintToInstruction, getTransferInstruction } from "@solana-program/token";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { demoSponsorComputeBounds } from "../src/demo-compute.js";
@@ -12,6 +12,8 @@ import { createRestaurantApp, DEMO_BUDGET, DEMO_UNIT, RestaurantOrders, type Res
 import { createPresentationApp } from "../src/restaurant-server.js";
 import { OperationStore } from "../src/operation-store.js";
 import { FileSubmissionJournal } from "../src/submission-journal.js";
+import { messageHash } from '../src/submission-journal.ts';
+import { PENDING_A_ISOLATION,prepareUnknownAuthorizeIsolation,persistUnknownAuthorizeIsolation,authorizeIsolationEvidence,type IsolationPolicy } from '../src/unknown-authorize-isolation.ts';
 import { createDurableFile } from "../src/durable-file.js";
 import { encodeTransaction, reclaimInstruction, refundInstruction } from "../src/transactions.js";
 import { decodeHeader, encodeHeader, type PaymentRequired } from "../src/http-transport.js";
@@ -58,6 +60,101 @@ async function expectAction(s: Session, a: string) {
   expect(body, JSON.stringify(body)).toMatchObject({ receipt: { success: true } }); expect(r.status).toBe(200);
   expect(decodeHeader(r.headers.get("PAYMENT-RESPONSE")!)).toMatchObject({ success: true, transaction: body.receipt.transaction });
 }
+describe('selected UNKNOWN authorize effect isolation',()=>{
+  async function fixture(landed=false) {
+    c.network='solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1';
+    Reflect.set(c.ledger,'network',c.network);Reflect.set(h.facilitator,'network',c.network);
+    c.getLatestBlockhash=async()=>({...h.lifetime(),contextSlot:1n,blockhashSlot:1n,commitment:'finalized' as const,network:c.network,genesisHash:'EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG'});
+    const journalDir=join(dir,'facilitator-journal'),journal=new FileSubmissionJournal(journalDir);
+    Reflect.set(h.facilitator,'journal',journal);
+    vi.spyOn(c.ledger,'submit').mockImplementation(async tx=>{
+      if(landed)h.ok(h.svm.sendTransaction(tx));
+      h.ledger.submissions.push({signature:getSignatureFromTransaction(tx),status:'unknown',transaction:tx});
+      return{kind:'submitted'};
+    });
+    const s=await offer(),path=c.orders.path(s.id);
+    const consent=JSON.stringify({unsignedSha256:createHash('sha256').update(s.unsigned).digest('hex')});
+    expect((await app.request(`${origin}/api/orders/${s.id}/wallet-consent`,{method:'POST',headers:{cookie:s.cookie,origin,'content-type':'application/json'},body:consent})).status).toBe(200);
+    expect((await authorize(s)).status).toBe(402);
+    const order=c.orders.read(s.id),signature=order.events[0]!.transaction,journalPath=join(journalDir,`${signature}.json`),entry=JSON.parse(readFileSync(journalPath,'utf8'));
+    const sha=(p:string)=>createHash('sha256').update(readFileSync(p)).digest('hex');
+    const policy:IsolationPolicy={...PENDING_A_ISOLATION,order:s.id,payment:order.payment,payer:order.payer,signature,
+      orderSha256:sha(path),consentSha256:sha(`${path}.wallet-consent.lock`),busySha256:sha(`${path}.busy`),actionSha256:sha(`${path}.authorize.lock`),
+      journalSha256:sha(journalPath),messageHash:entry.messageHash,signedWireSha256:createHash('sha256').update(Buffer.from(entry.transactionBase64,'base64')).digest('hex')};
+    h.setTime(NOW+190n);h.svm.expireBlockhash();
+    c.ledger.getFinalizedBlockhashStatus=async()=>({kind:'ok',valid:false,slot:5n});
+    c.ledger.getAccountAtLeast=async address=>({kind:'ok',slot:6n,account:await h.ledger.getAccount(address)});
+    c.ledger.getClockAtLeast=async()=>({kind:'ok',commitment:'finalized',slot:7n,unixTimestamp:NOW+190n});
+    const reader={getSignatureStatus:(signature:string)=>c.ledger.getSignatureStatus(signature),
+      getAccountAtLeast:(address:Address,slot:bigint)=>c.ledger.getAccountAtLeast(address,slot),
+      getFinalizedBlockhashStatus:(hash:string,slot:bigint)=>c.ledger.getFinalizedBlockhashStatus!(hash,slot),
+      getClockAtLeast:(slot:bigint)=>c.ledger.getClockAtLeast!(slot,Date.now()+1000),
+      findSignaturesByMessage:async()=>({kind:'ok' as const,signatures:[],truncated:false}),isBlockhashValid:async()=>({kind:'ok' as const,valid:false,slot:5n})};
+    const args={policy,ordersDir:c.orders.dir,journalDirs:[journalDir,c.reclaimJournal instanceof FileSubmissionJournal?c.reclaimJournal.dir:''],programId:c.programId,server:c.server.address,mint:c.asset,funder:c.feePayer,network:c.network,reader};
+    return{s,path,policy,journalPath,args,original:readFileSync(path),consent:readFileSync(`${path}.wallet-consent.lock`),busy:statSync(`${path}.busy`),prepare:()=>prepareUnknownAuthorizeIsolation(args)};
+  }
+  test('one new offer preserves UNKNOWN originals, reservations and exclusive successor; old operations stay locked',async()=>{
+    const f=await fixture(),record=await f.prepare();
+    expect(record).toMatchObject({originalOutcome:'unknown',reserveDisposition:'retained',proof:{kind:'expired-no-successful-authorize-effect'}});
+    const archiveSha256=persistUnknownAuthorizeIsolation(f.policy,f.path,record);
+    c.authorizeIsolationPolicy={...f.policy,archiveSha256};app=createRestaurantApp(c);
+    const v=await view(f.s);expect(v).toMatchObject({status:'pending',authorizeIsolation:{originalOutcome:'unknown',reserveRetained:true}});
+    expect(v.actions.beer).toBe(false);expect(c.orders.busy(f.s.id)).toBe(true);
+    const prepare=()=>app.request(`${origin}/api/orders`,{method:'POST',headers:{cookie:f.s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({payer:h.payer.address})});
+    const results=await Promise.all([prepare(),prepare()]);expect(results.map(r=>r.status).sort()).toEqual([402,409]);
+    expect(readFileSync(f.path)).toEqual(f.original);expect(readFileSync(`${f.path}.wallet-consent.lock`)).toEqual(f.consent);
+    expect(statSync(`${f.path}.busy`).ino).toBe(f.busy.ino);expect(JSON.parse(readFileSync(f.journalPath,'utf8')).attempts).toHaveLength(1);
+    expect(h.ledger.submissions).toHaveLength(1);expect(await h.ledger.getAccount(f.policy.payment as never)).toBeNull();
+    expect((await authorize(f.s)).status).toBe(409);expect((await prepare()).status).toBe(409);
+  });
+  test.each(['active','unavailable','stale-account','weak-status','known-success','landed','changed-consent','duplicate-action','invalid-signature','inode-drift'])(
+    'UNKNOWN isolation refuses %s without modifying originals or making a submission',async fault=>{
+    const f=await fixture(fault==='landed');
+    if(fault==='active')f.args.reader.getFinalizedBlockhashStatus=async()=>({kind:'ok',valid:true,slot:5n});
+    if(fault==='unavailable')f.args.reader.getFinalizedBlockhashStatus=async()=>({kind:'unavailable',detail:'synthetic unavailable'}) as never;
+    if(fault==='stale-account')f.args.reader.getAccountAtLeast=async address=>({kind:'ok',slot:4n,account:await h.ledger.getAccount(address)});
+    if(['weak-status','known-success'].includes(fault))f.args.reader.getSignatureStatus=async()=>({kind:'found',commitment:fault==='weak-status'?'confirmed':'finalized',slot:1n,err:null}) as never;
+    if(fault==='changed-consent')writeFileSync(`${f.path}.wallet-consent.lock`,'{}');
+    if(fault==='duplicate-action'){const order=c.orders.read(f.s.id);order.events.push({...order.events[0]!,action:'beer'});c.orders.write(order);f.policy.orderSha256=createHash('sha256').update(readFileSync(f.path)).digest('hex');}
+    if(fault==='invalid-signature'){const j=JSON.parse(readFileSync(f.journalPath,'utf8')),bytes=Buffer.from(j.transactionBase64,'base64');bytes[1]=(bytes[1]??0)^1;j.transactionBase64=bytes.toString('base64');writeFileSync(f.journalPath,JSON.stringify(j));f.policy.journalSha256=createHash('sha256').update(readFileSync(f.journalPath)).digest('hex');f.policy.signedWireSha256=createHash('sha256').update(bytes).digest('hex');}
+    if(fault==='inode-drift')f.args.reader.getClockAtLeast=async()=>{const raw=readFileSync(f.path);writeFileSync(`${f.path}.swap`,raw);renameSync(`${f.path}.swap`,f.path);return{kind:'ok',commitment:'finalized',slot:7n,unixTimestamp:NOW+190n};};
+    await expect(f.prepare()).rejects.toThrow();expect(existsSync(`${f.path}.authorize-isolation.lock`)).toBe(false);expect(h.ledger.submissions).toHaveLength(1);expect(c.orders.busy(f.s.id)).toBe(true);
+  });
+  test.each(['cloned-record','changed-proof','changed-original','changed-journal','replaced-journal'])('isolation writer rejects %s without a producer capability/custody match',async fault=>{
+    const f=await fixture();let record=await f.prepare();
+    if(fault==='cloned-record')record=JSON.parse(JSON.stringify(record));
+    if(fault==='changed-proof')record.proof.clockSlot='999';
+    if(fault==='changed-original')writeFileSync(`${f.path}.busy`,'beer');
+    if(fault==='changed-journal')writeFileSync(f.journalPath,'{}');
+    if(fault==='replaced-journal'){writeFileSync(`${f.journalPath}.swap`,readFileSync(f.journalPath),{mode:0o600});renameSync(`${f.journalPath}.swap`,f.journalPath);}
+    expect(()=>persistUnknownAuthorizeIsolation(f.policy,f.path,record)).toThrow();expect(existsSync(`${f.path}.authorize-isolation.lock`)).toBe(false);
+  });
+  test('partial archive, archive digest drift and active original hash forbid a new order',async()=>{
+    const f=await fixture(),record=await f.prepare(),archiveSha256=persistUnknownAuthorizeIsolation(f.policy,f.path,record);
+    c.authorizeIsolationPolicy={...f.policy,archiveSha256};app=createRestaurantApp(c);
+    chmodSync(`${f.path}.authorize-isolation.lock`,0o600);expect(()=>authorizeIsolationEvidence(c.authorizeIsolationPolicy,c.orders.read(f.s.id),f.path)).toThrow();
+    chmodSync(`${f.path}.authorize-isolation.lock`,0o400);c.authorizeIsolationPolicy.archiveSha256='0'.repeat(64);expect(()=>authorizeIsolationEvidence(c.authorizeIsolationPolicy,c.orders.read(f.s.id),f.path)).toThrow();
+    c.authorizeIsolationPolicy.archiveSha256=archiveSha256;
+    f.args.reader.getFinalizedBlockhashStatus=async()=>({kind:'ok',valid:true,slot:5n});c.ledger.getFinalizedBlockhashStatus=f.args.reader.getFinalizedBlockhashStatus;
+    expect((await app.request(`${origin}/api/orders`,{method:'POST',headers:{cookie:f.s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({payer:h.payer.address})})).status).toBe(409);
+  });
+  test.each(['','.wallet-consent.lock','.busy','.authorize.lock'])('missing original custody file %s cannot be mistaken for an absent previous session',async suffix=>{
+    const f=await fixture(),record=await f.prepare(),archiveSha256=persistUnknownAuthorizeIsolation(f.policy,f.path,record);
+    c.authorizeIsolationPolicy={...f.policy,archiveSha256};app=createRestaurantApp(c);
+    unlinkSync(`${f.path}${suffix}`); // Adversarial fixture only.
+    expect((await app.request(`${origin}/api/orders`,{method:'POST',headers:{cookie:f.s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({payer:h.payer.address})})).status).toBe(409);
+    expect(existsSync(`${f.path}.authorize-successor.lock`)).toBe(false);expect(h.ledger.submissions).toHaveLength(1);
+  });
+});
+test('one original signature observation is shared within a response, never across HTTP requests',async()=>{
+  const s=await offer();expect((await authorize(s)).status).toBe(200);
+  const lookup=vi.spyOn(c.ledger,'getSignatureStatus');
+  await view(s);expect(lookup).toHaveBeenCalledTimes(1);lookup.mockClear();
+  await view(s);expect(lookup).toHaveBeenCalledTimes(1);lookup.mockClear();
+  expect((await app.request(`${origin}/api/orders/${s.id}/actions/beer`,{headers:{authorization:`Bearer ${merchantToken}`}})).status).toBe(200);
+  expect(lookup).toHaveBeenCalledTimes(1);lookup.mockResolvedValue({kind:'not-found'});
+  expect((await app.request(`${origin}/api/orders/${s.id}`,{headers:{cookie:s.cookie}})).status).toBe(409);
+});
 describe("read-only discovery and same-origin order preparation", () => {
   test.each(["", "?payer=invalid&scenario=invalid", "?payer=public-wallet&scenario=normal"])("GET /resource%s only discovers x402 requirements", async query => {
     const reads = vi.spyOn(c.orders, "read"), writes = vi.spyOn(c.orders, "create");

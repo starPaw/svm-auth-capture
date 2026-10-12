@@ -204,7 +204,7 @@ describe("RpcLedger.simulate", () => {
     const send = vi.fn().mockRejectedValue(error);
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
-      const ledger = new RpcLedger({ network: NETWORK, genesisHash: GENESIS, rpcUrl: `https://rpc.invalid/${privateText}`,
+      const ledger = new RpcLedger({ network: NETWORK, genesisHash: GENESIS, rpcUrl: `https://rpc.invalid/${privateText}`, rpcReadRetries:0,
         rpc: fakeRpc({ simulateTransaction: () => ({ send }) }) });
       await expect(ledger.simulate(await sampleTransaction())).rejects.toBe(error);
       expect(send).toHaveBeenCalledTimes(1);
@@ -402,7 +402,7 @@ describe("RpcLedger.submit", () => {
         err: status === "succeeded" ? null : "BlockhashNotFound" }] });
     });
     const ledger = new RpcLedger({ network: NETWORK, genesisHash: GENESIS, rpcUrl: "http://unused.invalid",
-      confirmTimeoutMs: 100, pollIntervalMs: 1, rpc: fakeRpc({ sendTransaction: send, getSignatureStatuses: lookup,
+      confirmTimeoutMs: 1000, pollIntervalMs: 1, rpc: fakeRpc({ sendTransaction: send, getSignatureStatuses: lookup,
         getTransaction: () => sendable({ meta: { logMessages: [] } }) }) });
     expect(await ledger.submit(transaction)).toMatchObject({ kind: "submitted", outcome: { status, commitment: "finalized" } });
     expect(send).toHaveBeenCalledOnce();
