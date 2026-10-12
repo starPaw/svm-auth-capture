@@ -146,7 +146,7 @@ describe("malformed fields are rejected", () => {
   test("numeric slot instead of a decimal string", () => rejects((r) => (r.deployment.deployment_slot = 508146249), /deployment_slot/));
   test("abbreviated transaction signature", () => rejects((r) => (r.deployment.transactions[0].signature = "4S1sEL2c"), /signature/));
   test("non-UTC observation time", () => rejects((r) => (r.verification.observed_at = "2026-10-06 16:06:48"), /observed_at/));
-  test.each(["../secrets.json", "/etc/passwd", "..\\secrets.json", "C:/" + "Users/x/key.json", "https://example.com/evidence", "./", "snapshots//account.json", "snapshots/\u0000account.json"])("evidence path %# escaping the directory", (bad) =>
+  test.each(["../secrets.json", "/etc/passwd", "..\\secrets.json", "C:/test/key.json", "https://example.com/evidence", "./", "snapshots//account.json", "snapshots/\u0000account.json"])("evidence path %# escaping the directory", (bad) =>
     rejects((r) => r.verification.evidence_paths.push(bad), /evidence_paths/),
   );
 });
