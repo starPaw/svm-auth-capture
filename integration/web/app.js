@@ -11,6 +11,8 @@ const storedId = () => localStorage.getItem('capture402-order');
 const uncertain = () => !!order && localStorage.getItem('capture402-uncertain') === order.id;
 const recoveryAllowed = () => !!order && recoveryMatches(order.b3Recovery,order,localStorage.getItem('capture402-uncertain'));
 const continued = () => recoveryAllowed() && order.b3Recovery.continued === true && order.remaining === 0 && localStorage.getItem('capture402-reclaim-uncertain') !== order.id;
+const renewedReclaim = () => !!order?.reclaimGeneration && localStorage.getItem(`capture402-reclaim-renewed-${order.id}`) === order.reclaimGeneration;
+const reclaimAttempted = () => renewedReclaim() ? localStorage.getItem(`capture402-reclaim-wallet-attempt-${order.id}`) === order.reclaimGeneration : localStorage.getItem('capture402-reclaim-wallet-attempt') === order?.id;
 const signedOffer = () => !!order && localStorage.getItem('capture402-wallet-attempt') === order.id;
 const canReplace = () => !!order && !stale && (!uncertain() || continued()) && order.status !== 'pending' && order.remaining === 0 &&
   !(signedOffer() && order.status === 'draft') && (expiredDraft() || ['closed','rejected'].includes(order.status));
@@ -86,7 +88,8 @@ function render() {
   if (!safeOperatorTransport()) $('operator-status').textContent = 'Operator-only controls require HTTPS on the configured Devnet demo.';
   $('reclaim-box').hidden = !order || order.remaining <= 0;
   const payerMatches = order?.payer === connection?.account?.address;
-  $('reclaim').disabled = diagnosticOnly || busy || stale || uncertain() && !recoveryAllowed() || localStorage.getItem('capture402-reclaim-wallet-attempt') === order?.id || localStorage.getItem('capture402-reclaim-uncertain') === order?.id || !payerMatches || !order?.actions?.reclaim;
+  $('reclaim').disabled = diagnosticOnly || busy || stale || uncertain() && !recoveryAllowed() || reclaimAttempted() || localStorage.getItem('capture402-reclaim-uncertain') === order?.id || !payerMatches || !order?.actions?.reclaim;
+  $('renew-reclaim').hidden = !order || !!order.reclaimGeneration || busy || stale || !payerMatches || uncertain() && !recoveryAllowed() || !order.actions?.reclaim || localStorage.getItem('capture402-reclaim-wallet-attempt') !== order.id || !!localStorage.getItem(`capture402-reclaim-signed-${order.id}`) || localStorage.getItem('capture402-reclaim-uncertain') === order.id;
   $('reclaim').textContent = recoveryAllowed() ? 'Resume payer reclaim · preserve original refusal evidence' : 'Reclaim remaining hold';
   $('reclaim-description').textContent = recoveryAllowed() ? 'Reviewed source-bound pre-dispatch evidence; fresh payer consent reclaims the expired hold. Original latch remains archived; this is a new operation.' : uncertain() ? 'Original response unknown; inspect its signatures.' : stale ? 'Fresh finalized RPC state unavailable.' : !payerMatches ? 'Connect the original payer wallet to reclaim.' : order?.actionReasons?.reclaim || 'Ready for payer-direct reclaim; the facilitator is not used.';
   document.querySelectorAll('[data-scenario]').forEach(b => { b.classList.toggle('selected', b.dataset.scenario === scenario); b.disabled = busy || !!order && !canReplace(); });
@@ -218,6 +221,16 @@ for (const button of document.querySelectorAll('[data-action]')) button.onclick 
     if (!data.receipt?.success) throw new Error('Merchant operation refused or pending. Inspect original signatures and finalized state.');
   });
 };
+$('renew-reclaim').onclick = () => {
+  if($('renew-reclaim').hidden) return;
+  return run(async () => {
+    const {data}=await request(`/api/orders/${order.id}/reclaim-renewal`,{method:'POST'});
+    const hash=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(data.unsigned))),b=>b.toString(16).padStart(2,'0')).join('');
+    if(data.payer!==order.payer || data.proof?.kind!=='expired-no-reclaim-effect') throw Error('Renewal proof differs; nothing signed.');
+    localStorage.setItem(`capture402-reclaim-renewed-${order.id}`,hash);
+    setStatus('Expired original consent archived after finalized no-effect proof. Fresh reclaim prepared; sign separately when ready.');
+  });
+};
 $('reclaim').onclick = () => {
   if ($('reclaim').disabled) return;
   return run(async () => {
@@ -227,8 +240,10 @@ $('reclaim').onclick = () => {
     const unsignedSha256=await signingPreflight(data.unsigned,'reclaim');
     await request(`/api/orders/${order.id}/wallet-consent?operation=reclaim`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({unsignedSha256})});
     localStorage.setItem('capture402-reclaim-wallet-attempt',order.id);
+    if(renewedReclaim()) localStorage.setItem(`capture402-reclaim-wallet-attempt-${order.id}`,unsignedSha256);
     const signed = await walletSign(connection, data.unsigned, config);
-    localStorage.setItem(`capture402-reclaim-signed-${order.id}`,signed);
+    localStorage.setItem(`capture402-reclaim-signed-${order.id}-${unsignedSha256}`,signed);
+    if(!localStorage.getItem(`capture402-reclaim-signed-${order.id}`)) localStorage.setItem(`capture402-reclaim-signed-${order.id}`,signed);
     await signingPreflight(data.unsigned,'reclaim');
     if (recovery) {
       localStorage.setItem('capture402-reclaim-uncertain',order.id);
