@@ -25,6 +25,7 @@ beforeEach(async () => {
   h.ok(await h.direct([getMintToInstruction({ mint: h.mint, token: await h.payerAta(), mintAuthority: h.setup, amount: 1_000_000_000n })]));
   dir = mkdtempSync(join(tmpdir(), "capture402-restaurant-"));
   const ledger = Object.assign(h.ledger, {
+    offerBlockhashValid: async (hash:string) => hash === h.lifetime().blockhash,
     getSignatureStatus: async (signature: string) => {
       const s = h.ledger.submissions.find(s => s.signature === signature);
       return s && s.status !== "unknown" ? { kind: "found" as const, commitment: "finalized" as const, slot: 1n, err: s.status === "failed" ? "failed" : null } : { kind: "not-found" as const };
@@ -340,7 +341,7 @@ describe("restaurant budget lifecycle", () => {
     const consent=await app.request(`${origin}/api/orders/${a.s.id}/wallet-consent?operation=reclaim`,{method:'POST',headers:{cookie:a.s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({unsignedSha256:createHash('sha256').update(renewed.unsigned).digest('hex')})});expect(consent.status).toBe(200);
     expect((await app.request(`${origin}/api/orders/${a.s.id}/reclaim`,{headers:{cookie:a.s.cookie}})).status).toBe(409);
     const result=await app.request(`${origin}/api/orders/${a.s.id}/reclaim`,{method:'POST',headers:{cookie:a.s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({transaction:await sign(renewed.unsigned)})});
-    expect(result.status).toBe(200);expect(h.state(c.orders.read(a.s.id).payment).held).toBe(0n);expect(h.ledger.submissions).toHaveLength(2);
+    expect(result.status).toBe(200);expect(h.state(c.orders.read(a.s.id).payment).held).toBe(0n);expect((await view(a.s)).remaining).toBe(0);expect(h.ledger.submissions).toHaveLength(2);
     expect(readFileSync(a.consentPath,'utf8')).toBe(a.originalConsent);expect(c.orders.read(a.s.id).events[0]).toEqual(originalEvents[0]);
   });
   test.each(['valid','unavailable','stale-expiry','stale-payment','stale-clock','before-deadline','missing-origin','signed-wire','extra-instruction','pending','unknown-authorize','partial-archive','missing-account'])('renewal refuses %s without mutating the original draft/consent or sending',async failure=>{
@@ -366,6 +367,99 @@ describe("restaurant budget lifecycle", () => {
     if(failure==='partial-archive')createDurableFile(`${c.orders.path(a.s.id)}.reclaim-renewal.lock`,JSON.stringify({newUnsigned:'incomplete'}));
     const bytes=readFileSync(c.orders.path(a.s.id)),consent=readFileSync(a.consentPath);
     expect((await a.renew()).status).toBe(409);expect(readFileSync(c.orders.path(a.s.id))).toEqual(bytes);expect(readFileSync(a.consentPath)).toEqual(consent);expect(h.ledger.submissions).toHaveLength(1);
+  });
+  test('repeated expiry before consent appends immutable archives, survives restart and signs only the current generation',async()=>{
+    const a=await expiredReclaimConsent(),path=c.orders.path(a.s.id),original=readFileSync(a.consentPath),events=c.orders.read(a.s.id).events;
+    let draft=await (await a.renew()).json() as any;
+    const first=readFileSync(`${path}.reclaim-renewal.lock`);
+    for(let i=0;i<3;i++) {
+      const previous=draft.unsigned;
+      h.svm.expireBlockhash();
+      draft=await (await a.renew()).json() as any;
+      expect(draft.unsigned).toBeTypeOf('string');expect(draft.unsigned).not.toBe(previous);
+      const file=`${path}.reclaim-renewal-${createHash('sha256').update(previous).digest('hex')}.lock`;
+      const archive=JSON.parse(readFileSync(file,'utf8'));
+      expect(archive).toMatchObject({oldUnsigned:previous,oldConsent:null,proof:{consentSha256:null},newUnsigned:draft.unsigned});
+      expect(readFileSync(`${path}.reclaim-renewal.lock`)).toEqual(first);
+      expect(readFileSync(a.consentPath)).toEqual(original);
+      app=createRestaurantApp({...c,orders:new RestaurantOrders(c.orders.dir)});
+      const same=await app.request(`${origin}/api/orders/${a.s.id}/reclaim`,{headers:{cookie:a.s.cookie}});
+      expect((await same.json() as any).unsigned).toBe(draft.unsigned);
+    }
+    expect(c.orders.read(a.s.id).events).toEqual(events);expect(h.ledger.submissions).toHaveLength(1);
+    const consent=await app.request(`${origin}/api/orders/${a.s.id}/wallet-consent?operation=reclaim`,{method:'POST',headers:{cookie:a.s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({unsignedSha256:createHash('sha256').update(draft.unsigned).digest('hex')})});
+    expect(consent.status).toBe(200);
+    expect((await app.request(`${origin}/api/orders/${a.s.id}/signing-preflight?operation=reclaim`,{headers:{cookie:a.s.cookie}})).status).toBe(409);
+    const dispatch=await app.request(`${origin}/api/orders/${a.s.id}/signing-preflight?operation=reclaim&phase=dispatch`,{headers:{cookie:a.s.cookie}});
+    expect(dispatch.status).toBe(200);expect(await dispatch.json()).toMatchObject({phase:'dispatch',fresh:false,unsignedSha256:createHash('sha256').update(draft.unsigned).digest('hex')});
+    const result=await app.request(`${origin}/api/orders/${a.s.id}/reclaim`,{method:'POST',headers:{cookie:a.s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({transaction:await sign(draft.unsigned)})});
+    expect(result.status).toBe(200);expect(h.state(c.orders.read(a.s.id).payment).held).toBe(0n);expect((await view(a.s)).remaining).toBe(0);
+  });
+  test.each(['used-consent','unknown','stale-expiry','stale-payment','stale-clock','identity','signed','dispatch','journal','partial-archive','busy-restart'])('repeat preparation refuses %s and retains all archives',async failure=>{
+    const a=await expiredReclaimConsent(),path=c.orders.path(a.s.id);
+    const draft=await (await a.renew()).json() as any;
+    if(failure==='used-consent') {
+      const r=await app.request(`${origin}/api/orders/${a.s.id}/wallet-consent?operation=reclaim`,{method:'POST',headers:{cookie:a.s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({unsignedSha256:createHash('sha256').update(draft.unsigned).digest('hex')})});expect(r.status).toBe(200);
+    }
+    h.svm.expireBlockhash();
+    if(failure==='stale-expiry')c.ledger.getFinalizedBlockhashStatus=async()=>({kind:'ok',valid:false,slot:1n});
+    if(failure==='stale-payment')c.ledger.getAccountAtLeast=async(address)=>({kind:'ok',slot:4n,account:await h.ledger.getAccount(address)});
+    if(failure==='stale-clock')c.ledger.getClockAtLeast=async()=>({kind:'ok',commitment:'finalized',slot:4n,unixTimestamp:NOW+150n});
+    const order=c.orders.read(a.s.id);
+    if(failure==='unknown')order.status='pending';
+    if(failure==='identity')order.required.accepts[0]!.extra!.refundDeadline=1;
+    if(failure==='signed')order.reclaimUnsigned=await sign(draft.unsigned);
+    if(failure==='dispatch')createDurableFile(`${path}.reclaim.lock`,'retained-attempt');
+    if(failure==='journal')vi.spyOn(c.reclaimJournal,'findByMessageHash').mockReturnValue([{} as any]);
+    if(failure==='partial-archive')createDurableFile(`${path}.reclaim-renewal-${createHash('sha256').update(draft.unsigned).digest('hex')}.lock`,'{');
+    if(failure==='busy-restart') {c.orders.reserve(a.s.id,'reclaim');app=createRestaurantApp({...c,orders:new RestaurantOrders(c.orders.dir)});}
+    c.orders.write(order);
+    const archive=readFileSync(`${path}.reclaim-renewal.lock`),before=readFileSync(path);
+    expect((await a.renew()).status).toBe(409);expect(readFileSync(path)).toEqual(before);expect(readFileSync(`${path}.reclaim-renewal.lock`)).toEqual(archive);expect(h.ledger.submissions).toHaveLength(1);
+  });
+  test('archive-before-publication failure blocks every entry point across restart',async()=>{
+    const a=await expiredReclaimConsent();await a.renew();h.svm.expireBlockhash();
+    const before=readFileSync(c.orders.path(a.s.id));
+    const write=vi.spyOn(c.orders,'write').mockImplementationOnce(()=>{throw Error('injected crash before atomic publication');});
+    expect((await a.renew()).status).toBe(409);write.mockRestore();
+    expect(readFileSync(c.orders.path(a.s.id))).toEqual(before);
+    app=createRestaurantApp({...c,orders:new RestaurantOrders(c.orders.dir)});
+    expect((await a.renew()).status).toBe(409);
+    for(const suffix of ['', '/reclaim','/signing-preflight?operation=reclaim'])expect((await app.request(`${origin}/api/orders/${a.s.id}${suffix}`,{headers:{cookie:a.s.cookie}})).status).toBe(409);
+    expect(h.ledger.submissions).toHaveLength(1);
+  });
+  test('repeat preparation serializes with consent and other preparers',async()=>{
+    const a=await expiredReclaimConsent();const draft=await (await a.renew()).json() as any;h.svm.expireBlockhash();
+    let entered!:()=>void,release!:(v:any)=>void;const started=new Promise<void>(r=>entered=r),waiting=new Promise<any>(r=>release=r);
+    c.ledger.getFinalizedBlockhashStatus=async()=>{entered();return waiting;};
+    const first=a.renew();await started;
+    expect((await a.renew()).status).toBe(409);
+    const consent=await app.request(`${origin}/api/orders/${a.s.id}/wallet-consent?operation=reclaim`,{method:'POST',headers:{cookie:a.s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({unsignedSha256:createHash('sha256').update(draft.unsigned).digest('hex')})});expect(consent.status).toBe(409);
+    release({kind:'ok',valid:false,slot:5n});expect((await first).status).toBe(200);expect(h.ledger.submissions).toHaveLength(1);
+  });
+  test('dispatch preflight requires exact durable consent and still rejects expired, pending or mismatched consent',async()=>{
+    const a=await expiredReclaimConsent(),draft=await (await a.renew()).json() as any;
+    const preflight=()=>app.request(`${origin}/api/orders/${a.s.id}/signing-preflight?operation=reclaim&phase=dispatch`,{headers:{cookie:a.s.cookie}});
+    expect((await preflight()).status).toBe(409);
+    const marker=`${c.orders.path(a.s.id)}.reclaim-consent-${createHash('sha256').update(draft.unsigned).digest('hex')}.lock`;
+    createDurableFile(marker,JSON.stringify({order:a.s.id,unsignedSha256:'wrong'}));
+    expect((await preflight()).status).toBe(409);
+    const fs=await import('node:fs');fs.writeFileSync(marker,JSON.stringify({order:a.s.id,unsignedSha256:createHash('sha256').update(draft.unsigned).digest('hex')}));
+    expect((await preflight()).status).toBe(200);
+    const order=c.orders.read(a.s.id);order.status='pending';c.orders.write(order);expect((await preflight()).status).toBe(409);
+    order.status='active';c.orders.write(order);h.svm.expireBlockhash();expect((await preflight()).status).toBe(409);
+    expect(h.ledger.submissions).toHaveLength(1);
+  });
+  test('renewed signed wire without durable fresh consent cannot dispatch',async()=>{
+    const a=await expiredReclaimConsent(),draft=await (await a.renew()).json() as any;
+    const result=await app.request(`${origin}/api/orders/${a.s.id}/reclaim`,{method:'POST',headers:{cookie:a.s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({transaction:await sign(draft.unsigned)})});
+    expect(result.status).toBe(409);expect(h.ledger.submissions).toHaveLength(1);expect(c.orders.attempted(a.s.id,'reclaim')).toBe(false);
+  });
+  test('expired retained generation cannot get consent or signing preflight',async()=>{
+    const a=await expiredReclaimConsent(),draft=await (await a.renew()).json() as any;h.svm.expireBlockhash();
+    const consent=await app.request(`${origin}/api/orders/${a.s.id}/wallet-consent?operation=reclaim`,{method:'POST',headers:{cookie:a.s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({unsignedSha256:createHash('sha256').update(draft.unsigned).digest('hex')})});expect(consent.status).toBe(409);
+    expect((await app.request(`${origin}/api/orders/${a.s.id}/signing-preflight?operation=reclaim`,{headers:{cookie:a.s.cookie}})).status).toBe(409);
+    expect((await view(a.s)).reclaimDraftState).toBe('expired-or-unavailable');
   });
   test('a dispatched original reclaim attempt cannot enter consent renewal',async()=>{
     const a=await expiredReclaimConsent();

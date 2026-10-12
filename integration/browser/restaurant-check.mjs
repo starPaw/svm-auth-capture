@@ -24,6 +24,7 @@ const origin = `https://127.0.0.1:${server.address().port}`;
 let browser;
 const report = { scope:'Local HTTPS DOM fixtures; no Devnet, wallet signing or economic E2E claim.', browser:'', checks:[], viewports:[], requests:[] };
 let lastActionBody, nextActionPreflight, definitiveResponse = false;
+let renewalSequence=0;
 let state, rpcFailure = false, posts = 0, gets = 0, loseResponse = false, delayPreflight = false, missingAuthority = false;
 const secret = 'local-browser-fixture-credential-' + 'x'.repeat(32);
 const id = 'a'.repeat(32);
@@ -46,7 +47,7 @@ try {
       return route.fulfill({ status:402, contentType:'application/json', headers:{'PAYMENT-REQUIRED':Buffer.from(JSON.stringify(next.required)).toString('base64')}, body:JSON.stringify({order:next.id,unsigned:next.unsigned,required:next.required}) });
     }
     if(path.endsWith('/reclaim-renewal') && req.method()==='POST') {
-      posts++;const unsigned='renewed-DOM-fixture-never-signed';state={...state,reclaimGeneration:createHash('sha256').update(unsigned).digest('hex')};
+      posts++;const unsigned='renewed-DOM-fixture-never-signed-'+(++renewalSequence);state={...state,reclaimGeneration:createHash('sha256').update(unsigned).digest('hex'),reclaimDraftState:'ready',reclaimPreparation:false};
       return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({unsigned,payer:state.payer,proof:{kind:'expired-no-reclaim-effect'}})});
     }
     if (path.includes('/actions/')) {
@@ -189,7 +190,7 @@ try {
   assert(await page.evaluate(()=>JSON.parse(localStorage.getItem('capture402-request-'+localStorage.getItem('capture402-order'))).path.endsWith('/actions/beer')));
   check('Exact pre-dispatch body/header releases only its fresh latch and retains source-bound request metadata');
   const recovery={order:id,payer:info.merchant,payment:info.programId,policySha256:'a'.repeat(64),originalEvidenceSha256:'b'.repeat(64),classification:'source-bound-pre-dispatch-refusal',continued:false};
-  const expiredHeld={...held(),captureDeadline:Math.floor(Date.now()/1000)-1,actions:{...held().actions,reclaim:true},b3Recovery:recovery};
+  const expiredHeld={...held(),captureDeadline:Math.floor(Date.now()/1000)-1,actions:{...held().actions,reclaim:true},reclaimPreparation:true,b3Recovery:recovery};
   await load(expiredHeld,true);await page.locator('#connect-wallet').click();await page.locator('#wallet-list button').first().click();
   await page.evaluate(()=>localStorage.setItem('capture402-uncertain',localStorage.getItem('capture402-order')));
   await page.locator('#refresh').click();await page.waitForFunction(()=>!document.getElementById('reclaim').disabled);
@@ -204,19 +205,33 @@ try {
   assert.equal(posts,1);assert.equal(await page.evaluate(()=>window.fixtureSigns||0),0);
   assert.equal(await page.evaluate(()=>localStorage.getItem('capture402-uncertain')),id);
   assert.equal(await page.evaluate(()=>localStorage.getItem('capture402-reclaim-wallet-attempt')),id);
+  assert.equal(await page.locator('#action-status').textContent(),'Previous reclaim wire archived after finalized no-effect proof. Fresh unsigned draft prepared; request signature separately.');
+  check('Successful reviewed renewal preserves its no-effect preparation message after refresh, without claiming a finalized reclaim');
   check('Explicit renewal prepares one unsigned draft without wallet signing or clearing original latch/consent');
   await page.reload();await page.waitForFunction(()=>document.getElementById('payment-id').querySelector('a'));
   await page.locator('#connect-wallet').click();await page.locator('#wallet-list button').first().click();
   await page.waitForFunction(()=>!document.getElementById('reclaim').disabled);
   assert(await page.locator('#renew-reclaim').isHidden());
-  check('Retained renewed generation survives navigation and cannot expose a second renewal');
+  check('Retained valid generation survives navigation without offering replacement');
+  const firstGeneration=state.reclaimGeneration;
+  state={...state,reclaimDraftState:'expired-or-unavailable',reclaimPreparation:true};
+  await page.locator('#refresh').click();await page.waitForFunction(()=>document.getElementById('reclaim').disabled && !document.getElementById('renew-reclaim').hidden);
+  assert((await page.locator('#reclaim-description').textContent()).includes('expired or unavailable'));
+  assert.equal(await page.evaluate(()=>window.fixtureSigns||0),0);
+  check('Expired unsigned generation disables signing and exposes explicit proof-gated preparation');
+  await page.locator('#renew-reclaim').click();await page.waitForFunction(()=>!document.getElementById('reclaim').disabled);
+  assert.notEqual(state.reclaimGeneration,firstGeneration);assert.equal(posts,2);assert.equal(await page.evaluate(()=>window.fixtureSigns||0),0);
+  check('Explicit repeated preparation changes generation without wallet signing or dispatch');
+  state={...state,reclaimDraftState:'stopped',reclaimPreparation:false};
   await page.evaluate(id=>localStorage.setItem('capture402-reclaim-wallet-attempt-'+id,localStorage.getItem('capture402-reclaim-renewed-'+id)),id);
-  await page.locator('#refresh').click();await page.waitForFunction(()=>document.getElementById('reclaim').disabled);
+  await page.locator('#refresh').click();await page.waitForFunction(()=>document.getElementById('reclaim').disabled && document.getElementById('action-status').textContent.includes('All new operations stopped'));
   assert(await page.locator('#renew-reclaim').isHidden());
+  assert((await page.locator('#action-status').textContent()).includes('All new operations stopped'));
   check('New generation wallet attempt locks further signing while old generation remains preserved');
   state=expiredHeld;await page.evaluate(id=>{localStorage.setItem('capture402-reclaim-uncertain',id);localStorage.removeItem('capture402-reclaim-renewed-'+id);},id);
-  await page.locator('#refresh').click();await page.waitForFunction(()=>document.getElementById('reclaim').disabled);
+  await page.locator('#refresh').click();await page.waitForFunction(()=>document.getElementById('reclaim').disabled && document.getElementById('action-status').textContent.includes('All new operations stopped'));
   assert(await page.locator('#renew-reclaim').isHidden());
+  assert((await page.locator('#action-status').textContent()).includes('All new operations stopped'));
   check('UNKNOWN distinct reclaim response cannot use expiry-consent UI renewal');
   await load(expiredHeld,true);await page.locator('#connect-wallet').click();await page.locator('#wallet-list button').first().click();
   await page.evaluate(()=>localStorage.setItem('capture402-uncertain',localStorage.getItem('capture402-order')));
@@ -232,6 +247,45 @@ try {
   assert(!(await page.locator('[data-scenario=cancelled]').isDisabled()));await page.locator('[data-scenario=cancelled]').click();await page.locator('#new-budget').click();
   await page.waitForFunction(()=>localStorage.getItem('capture402-order')==='b'.repeat(32));assert.equal(posts,1);
   check('Closed original hold permits explicit selection of the next scenario before a separately unsigned offer');
+  // Exercise actual app.js orchestration through both preflights. The wallet module
+  // and HTTP backend are explicit non-economic stubs; no real signature is created.
+  const flow=await context.newPage(),sequence=[];
+  const flowUnsigned='unsigned-flow-fixture-never-signed';
+  const flowHash=createHash('sha256').update(flowUnsigned).digest('hex');
+  let flowState={...expiredHeld,reclaimGeneration:flowHash,reclaimDraftState:'ready',reclaimPreparation:false};
+  await flow.route('**/wallet.js',route=>route.fulfill({contentType:'text/javascript',body:`
+    const wallet={name:'Flow fixture wallet; no cryptography'};
+    export const wallets=()=>[wallet];export const onWallets=()=>()=>{};
+    export const connect=async()=>({wallet,account:{address:${JSON.stringify(info.merchant)}}});
+    export const walletSign=async()=>{window.fixtureSigns=(window.fixtureSigns||0)+1;return 'signed-flow-stub-not-a-transaction';};
+    export const encodeEnvelope=x=>btoa(JSON.stringify(x));export const decodeEnvelope=x=>JSON.parse(atob(x));
+    export const signingReport=()=>undefined;export const assertDevnetPolicy=()=>{};
+  `}));
+  await flow.route('**/api/orders**',async route=>{
+    const req=route.request(),u=new URL(req.url());
+    if(u.pathname.endsWith('/signing-preflight')) {
+      const dispatch=u.searchParams.get('phase')==='dispatch';sequence.push(dispatch?'dispatch-preflight':'consent-preflight');
+      assert.equal(dispatch,sequence.includes('consent'));
+      return route.fulfill({contentType:'application/json',body:JSON.stringify({id,operation:'reclaim',phase:dispatch?'dispatch':'consent',fresh:!dispatch,unsignedSha256:flowHash})});
+    }
+    if(u.pathname.endsWith('/wallet-consent')) {sequence.push('consent');assert.equal(req.postDataJSON().unsignedSha256,flowHash);return route.fulfill({contentType:'application/json',body:'{"reserved":true}'});}
+    if(u.pathname.endsWith('/reclaim') && req.method()==='GET')return route.fulfill({contentType:'application/json',body:JSON.stringify({unsigned:flowUnsigned,payer:info.merchant})});
+    if(u.pathname.endsWith('/reclaim') && req.method()==='POST') {
+      sequence.push('dispatch');assert.equal(req.postDataJSON().transaction,'signed-flow-stub-not-a-transaction');
+      flowState={...flowState,status:'closed',remaining:0,heldBaseUnits:'0',reclaimDraftState:'stopped',b3Recovery:{...recovery,continued:true},events:[...flowState.events,{action:'reclaim',status:'finalized',amount:100,at:new Date().toISOString(),label:'Fixture reclaimed',signature:'flow-receipt-not-onchain',chainStatus:{kind:'found',commitment:'finalized',err:null}}]};
+      return route.fulfill({contentType:'application/json',body:JSON.stringify({receipt:{success:true,transaction:'flow-receipt-not-onchain'}})});
+    }
+    return route.fulfill({contentType:'application/json',body:JSON.stringify(flowState)});
+  });
+  await flow.goto(origin+'/customer');await flow.evaluate(id=>{localStorage.clear();localStorage.setItem('capture402-order',id);localStorage.setItem('capture402-uncertain',id);},id);
+  await flow.reload();await flow.waitForFunction(()=>document.getElementById('payment-id').querySelector('a'));
+  await flow.locator('#connect-wallet').click();await flow.locator('#wallet-list button').first().click();await flow.locator('#reclaim').click();
+  await flow.waitForFunction(()=>document.getElementById('action-status').textContent.includes('Payer reclaim finalized'));
+  assert.deepEqual(sequence,['consent-preflight','consent','dispatch-preflight','dispatch']);assert.equal(await flow.evaluate(()=>window.fixtureSigns),1);
+  assert.equal(await flow.evaluate(()=>localStorage.getItem('capture402-uncertain')),id);assert.equal(await flow.evaluate(()=>localStorage.getItem('capture402-reclaim-uncertain')),null);
+  assert(await flow.locator('#new-budget').isVisible());
+  check('Actual UI sequence separates consent and post-sign dispatch preflight, dispatches once and retains historical capture evidence');
+  await flow.close();
   assert.equal(errors.length,0,errors.join('\n'));
   check('No browser page errors or external runtime requests');
   writeFileSync(join(output,'restaurant-browser-report.json'),JSON.stringify(report,null,2));

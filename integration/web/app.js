@@ -11,8 +11,8 @@ const storedId = () => localStorage.getItem('capture402-order');
 const uncertain = () => !!order && localStorage.getItem('capture402-uncertain') === order.id;
 const recoveryAllowed = () => !!order && recoveryMatches(order.b3Recovery,order,localStorage.getItem('capture402-uncertain'));
 const continued = () => recoveryAllowed() && order.b3Recovery.continued === true && order.remaining === 0 && localStorage.getItem('capture402-reclaim-uncertain') !== order.id;
-const renewedReclaim = () => !!order?.reclaimGeneration && localStorage.getItem(`capture402-reclaim-renewed-${order.id}`) === order.reclaimGeneration;
-const reclaimAttempted = () => renewedReclaim() ? localStorage.getItem(`capture402-reclaim-wallet-attempt-${order.id}`) === order.reclaimGeneration : localStorage.getItem('capture402-reclaim-wallet-attempt') === order?.id;
+const renewedReclaim = () => !!order?.reclaimGeneration;
+const reclaimAttempted = () => order?.reclaimDraftState === 'stopped' || (renewedReclaim() ? localStorage.getItem(`capture402-reclaim-wallet-attempt-${order.id}`) === order.reclaimGeneration : localStorage.getItem('capture402-reclaim-wallet-attempt') === order?.id);
 const signedOffer = () => !!order && localStorage.getItem('capture402-wallet-attempt') === order.id;
 const canReplace = () => !!order && !stale && (!uncertain() || continued()) && order.status !== 'pending' && order.remaining === 0 &&
   !(signedOffer() && order.status === 'draft') && (expiredDraft() || ['closed','rejected'].includes(order.status));
@@ -74,7 +74,7 @@ function render() {
   for (const key of ['authorized','captured','remaining','refunded']) $(key).textContent = (order?.[key] ?? 0).toLocaleString('en-US', { maximumFractionDigits: 6 });
   $('refundable').textContent = order?.refundableBaseUnits !== undefined ? (Number(order.refundableBaseUnits) / 1_000_000).toLocaleString('en-US', { maximumFractionDigits: 6 }) : '0';
   const state = order?.status ?? 'idle';
-  $('payment-state').textContent = continued() ? 'Hold reclaimed · original refusal archived' : uncertain() ? 'Unknown response · locked' : stale ? 'RPC unavailable · paused' : ({ idle:'Awaiting authorization', draft:'Unsigned offer', active:'Finalized', closed:'Hold closed', pending:'Pending · inspect signatures', rejected:'Authorization refused' })[state] ?? state;
+  $('payment-state').textContent = continued() ? 'Hold reclaimed · original refusal archived' : recoveryAllowed() ? 'Historical capture evidence retained · payer reclaim separate' : uncertain() ? 'Unknown response · locked' : stale ? 'RPC unavailable · paused' : ({ idle:'Awaiting authorization', draft:'Unsigned offer', active:'Finalized', closed:'Hold closed', pending:'Pending · inspect signatures', rejected:'Authorization refused' })[state] ?? state;
   $('payment-state').classList.toggle('live', !stale && !uncertain() && ['active','closed'].includes(state));
   $('released-copy').hidden = !(order?.released > 0); $('released-copy').textContent = order?.released > 0 ? `${order.released} test tokens released to payer` : 'No tokens released yet.';
   const reason = authorizeReason(); $('authorize').disabled = !!reason; $('authorize-reason').textContent = reason || 'Ready: sign the exact 100 test-token offer. Settlement must finalize.';
@@ -88,10 +88,10 @@ function render() {
   if (!safeOperatorTransport()) $('operator-status').textContent = 'Operator-only controls require HTTPS on the configured Devnet demo.';
   $('reclaim-box').hidden = !order || order.remaining <= 0;
   const payerMatches = order?.payer === connection?.account?.address;
-  $('reclaim').disabled = diagnosticOnly || busy || stale || uncertain() && !recoveryAllowed() || reclaimAttempted() || localStorage.getItem('capture402-reclaim-uncertain') === order?.id || !payerMatches || !order?.actions?.reclaim;
-  $('renew-reclaim').hidden = !order || !!order.reclaimGeneration || busy || stale || !payerMatches || uncertain() && !recoveryAllowed() || !order.actions?.reclaim || localStorage.getItem('capture402-reclaim-wallet-attempt') !== order.id || !!localStorage.getItem(`capture402-reclaim-signed-${order.id}`) || localStorage.getItem('capture402-reclaim-uncertain') === order.id;
-  $('reclaim').textContent = recoveryAllowed() ? 'Resume payer reclaim · preserve original refusal evidence' : 'Reclaim remaining hold';
-  $('reclaim-description').textContent = recoveryAllowed() ? 'Reviewed source-bound pre-dispatch evidence; fresh payer consent reclaims the expired hold. Original latch remains archived; this is a new operation.' : uncertain() ? 'Original response unknown; inspect its signatures.' : stale ? 'Fresh finalized RPC state unavailable.' : !payerMatches ? 'Connect the original payer wallet to reclaim.' : order?.actionReasons?.reclaim || 'Ready for payer-direct reclaim; the facilitator is not used.';
+  $('reclaim').disabled = diagnosticOnly || busy || stale || uncertain() && !recoveryAllowed() || reclaimAttempted() || renewedReclaim() && order.reclaimDraftState !== 'ready' || localStorage.getItem('capture402-reclaim-uncertain') === order?.id || !payerMatches || !order?.actions?.reclaim;
+  $('renew-reclaim').hidden = !order?.reclaimPreparation || diagnosticOnly || busy || stale || !payerMatches || uncertain() && !recoveryAllowed() || renewedReclaim() && reclaimAttempted() || !!localStorage.getItem(`capture402-reclaim-signed-${order.id}`) || localStorage.getItem('capture402-reclaim-uncertain') === order.id;
+  $('reclaim').textContent = renewedReclaim() ? 'Request payer signature for retained draft' : recoveryAllowed() ? 'Resume payer reclaim · preserve original refusal evidence' : 'Reclaim remaining hold';
+  $('reclaim-description').textContent = localStorage.getItem('capture402-reclaim-uncertain') === order?.id ? 'Separate reclaim outcome UNKNOWN; retain its original signature and stop.' : order?.reclaimDraftState === 'expired-or-unavailable' ? 'Retained unsigned draft expired or unavailable. Explicit preparation requires fresh canonical finalized expiry and custody proof; nothing is signed.' : order?.reclaimDraftState === 'stopped' ? 'Reclaim consent or attempt retained; further signing and preparation stopped.' : recoveryAllowed() ? 'Reviewed source-bound pre-dispatch evidence; fresh payer consent reclaims the expired hold. Original latch remains archived; this is a new operation.' : uncertain() ? 'Original response unknown; inspect its signatures.' : stale ? 'Fresh finalized RPC state unavailable.' : !payerMatches ? 'Connect the original payer wallet to reclaim.' : order?.actionReasons?.reclaim || 'Ready for payer-direct reclaim; the facilitator is not used.';
   document.querySelectorAll('[data-scenario]').forEach(b => { b.classList.toggle('selected', b.dataset.scenario === scenario); b.disabled = busy || !!order && !canReplace(); });
   $('new-budget').hidden = !order || stale || uncertain() && !continued() || busy || order.status === 'pending' || order.remaining > 0 || signedOffer() && order.status === 'draft' || !(expiredDraft() || ['closed','rejected'].includes(order.status));
   $('new-budget').textContent = expiredDraft() ? 'Replace expired unsigned offer explicitly' : 'Prepare a new offer explicitly';
@@ -121,9 +121,14 @@ async function refresh() {
   const selectedNext = order?.id === data.id && canReplace() ? scenario : data.scenario;
   stale = false; order = data; scenario = selectedNext; anchor = { clock: data.now, at: Date.now() }; render();
 }
-async function run(fn) {
+async function run(fn, renewalMessage = '', refreshAfter = true) {
   if (busy || reading) return; busy = true; render(); setStatus('Waiting for the original result. No automatic retry.');
-  try { await fn(); await refresh(); setStatus(uncertain() || order?.status === 'pending' ? 'Original operation pending or unknown. All new operations stopped; inspect original signatures.' : 'Original state refreshed. Only finalized receipts confirm settlement.'); }
+  try {
+    await fn(); if(refreshAfter) await refresh();
+    const preparedRenewal = renewalMessage && recoveryAllowed() && renewedReclaim() && order.reclaimDraftState === 'ready' && !reclaimAttempted() && order.status !== 'pending' && order.remaining > 0 && order.actions?.reclaim &&
+      localStorage.getItem('capture402-reclaim-uncertain') !== order.id;
+    setStatus(preparedRenewal ? renewalMessage : continued() ? 'Payer reclaim finalized. Historical capture evidence retained; a new scenario may be explicitly prepared.' : recoveryAllowed() && !reclaimAttempted() && order.status !== 'pending' && localStorage.getItem('capture402-reclaim-uncertain') !== order.id ? order.reclaimDraftState === 'expired-or-unavailable' ? 'Historical capture evidence retained. Unsigned reclaim expired or unavailable; explicit preparation requires fresh finalized proof.' : 'Historical capture evidence retained. Separate payer reclaim requires fresh consent and a finalized receipt.' : uncertain() || order?.status === 'pending' ? 'Original operation pending or unknown. All new operations stopped; inspect original signatures.' : 'Original state refreshed. Only finalized receipts confirm settlement.');
+  }
   catch (error) { setStatus(error.message + (diagnosticOnly && signingReport() ? '\n\n' + JSON.stringify(signingReport(),null,2) : ''), true); try { await refresh(); } catch { stale = true; accessId = ''; } }
   finally { busy = false; render(); }
 }
@@ -155,10 +160,10 @@ async function submitOriginal(path, init, allowed = []) {
   }
   return result;
 }
-async function signingPreflight(unsigned, operation) {
-  const {data} = await request(`/api/orders/${order.id}/signing-preflight?operation=${operation}`);
+async function signingPreflight(unsigned, operation, dispatch = false) {
+  const {data} = await request(`/api/orders/${order.id}/signing-preflight?operation=${operation}${dispatch ? '&phase=dispatch' : ''}`);
   const hash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(unsigned))),b=>b.toString(16).padStart(2,'0')).join('');
-  if (data.id !== order.id || data.operation !== operation || data.fresh !== true || data.unsignedSha256 !== hash) throw new Error('Fresh original offer evidence differs; nothing signed.');
+  if (data.id !== order.id || data.operation !== operation || data.phase !== (dispatch ? 'dispatch' : 'consent') || data.fresh !== !dispatch || data.unsignedSha256 !== hash) throw new Error('Original consent/dispatch preflight evidence differs; signing or submission stopped.');
   return hash;
 }
 function showWallets() {
@@ -228,8 +233,10 @@ $('renew-reclaim').onclick = () => {
     const hash=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(data.unsigned))),b=>b.toString(16).padStart(2,'0')).join('');
     if(data.payer!==order.payer || data.proof?.kind!=='expired-no-reclaim-effect') throw Error('Renewal proof differs; nothing signed.');
     localStorage.setItem(`capture402-reclaim-renewed-${order.id}`,hash);
-    setStatus('Expired original consent archived after finalized no-effect proof. Fresh reclaim prepared; sign separately when ready.');
-  });
+    // Use the published response immediately. Optional balance/status refresh must not
+    // consume the owner's signing window. Preflight and durable consent still recheck.
+    order={...order,reclaimGeneration:hash,reclaimDraftState:'ready',reclaimPreparation:false};
+  }, 'Previous reclaim wire archived after finalized no-effect proof. Fresh unsigned draft prepared; request signature separately.', false);
 };
 $('reclaim').onclick = () => {
   if ($('reclaim').disabled) return;
@@ -244,7 +251,7 @@ $('reclaim').onclick = () => {
     const signed = await walletSign(connection, data.unsigned, config);
     localStorage.setItem(`capture402-reclaim-signed-${order.id}-${unsignedSha256}`,signed);
     if(!localStorage.getItem(`capture402-reclaim-signed-${order.id}`)) localStorage.setItem(`capture402-reclaim-signed-${order.id}`,signed);
-    await signingPreflight(data.unsigned,'reclaim');
+    await signingPreflight(data.unsigned,'reclaim',true);
     if (recovery) {
       localStorage.setItem('capture402-reclaim-uncertain',order.id);
       const {data:result} = await request(`/api/orders/${order.id}/reclaim`, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({transaction:signed})},[409]);
