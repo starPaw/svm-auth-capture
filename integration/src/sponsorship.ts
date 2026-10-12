@@ -17,6 +17,7 @@
 import type { Address } from "@solana/kit";
 import type { MiddlewareHandler } from "hono";
 import type { Ledger } from "./ledger.ts";
+import type { AdmissionJournal } from './admission-journal.ts';
 
 export type SponsorshipGuardConfig = {
   ledger: Ledger;
@@ -25,6 +26,7 @@ export type SponsorshipGuardConfig = {
   maxAttempts: number;
   /** Minimum sponsor lamport balance required before authorizing another attempt. */
   minLamportsBalance: bigint;
+  admission?: AdmissionJournal;
 };
 
 export class SponsorshipGuard {
@@ -40,7 +42,7 @@ export class SponsorshipGuard {
   }
 
   get attemptCount(): number {
-    return this.attempts;
+    return this.config.admission?.summary().used ?? this.attempts;
   }
 
   /**
@@ -50,6 +52,14 @@ export class SponsorshipGuard {
    * balance floor denies the attempt, which never reaches the facilitator.
    */
   async check(): Promise<string | undefined> {
+    if (this.config.admission) {
+      try { this.config.admission.reserve(); }
+      catch { return 'durable sponsorship admission unavailable or exhausted'; }
+      try {
+        const balance = (await this.config.ledger.getAccount(this.config.feePayer))?.lamports ?? 0n;
+        return balance < this.config.minLamportsBalance ? 'sponsor balance below configured floor' : undefined;
+      } catch { return 'sponsor balance unavailable'; }
+    }
     if (this.attempts >= this.config.maxAttempts) {
       return `sponsorship attempt cap reached (${this.config.maxAttempts})`;
     }

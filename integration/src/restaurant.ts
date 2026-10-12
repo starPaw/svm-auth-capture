@@ -22,15 +22,18 @@ import { messageHash, submissionOutcome, type SubmissionJournal } from "./submis
 import type { ChainReader } from "./reconciliation.ts";
 import type { Ledger } from "./ledger.ts";
 import { Reason, type PaymentRequirements, type SettleResponse } from "./types.ts";
+import type { AdmissionJournal } from './admission-journal.ts';
+import { b3RecoveryEvidence, type B3Recovery } from './b3-recovery.ts';
+import type { RpcLedger } from './rpc-ledger.ts';
 
 export const DEMO_UNIT = 1_000_000n;
 export const DEMO_BUDGET = 100n * DEMO_UNIT;
-export const SCENARIOS = ["normal", "refund", "cancelled", "unavailable"] as const;
+export const SCENARIOS = ["normal", "refund", "cancelled", "unavailable", "partial-reclaim", "atomic"] as const;
 type Scenario = typeof SCENARIOS[number];
-type Action = "authorize" | "beer" | "salmon" | "finish" | "void" | "refund" | "reclaim";
+type Action = "authorize" | "beer" | "salmon" | "finish" | "void" | "refund" | "reclaim" | "atomic";
 type Event = { lifetimeObservation?: LifetimeObservation; action: Action; label: string; amount: string; at: string; status: "prepared" | "pending" | "finalized" | "rejected"; transaction: string; transactionBase64: string; receipt?: SettleResponse };
 type Order = { authorizeLifetime?: LifetimeObservation; id: string; capabilityHash: string; payer: Address; payment: Address; scenario: Scenario; required: PaymentRequired; unsigned: string; createdAt: number; status: "draft" | "active" | "closed" | "pending" | "rejected"; events: Event[]; reclaimUnsigned?: string; reclaimLifetime?: { blockhash: string; lastValidBlockHeight: string; blockhashSlot?: string } };
-export type RestaurantConfig = ResourceServerConfig & { ledger: Ledger & Pick<ChainReader, "getSignatureStatus" | "getAccountAtLeast">; orders: RestaurantOrders; reclaimJournal: SubmissionJournal; origin: string; merchantToken?: string };
+export type RestaurantConfig = ResourceServerConfig & { ledger: Ledger & Pick<ChainReader, "getSignatureStatus" | "getAccountAtLeast"> & {offerBlockhashValid?: (hash: string) => Promise<boolean>; getClockAtLeast?:RpcLedger['getClockAtLeast']}; orders: RestaurantOrders; reclaimJournal: SubmissionJournal; origin: string; merchantToken?: string; orderAdmission?: AdmissionJournal; b3Recovery?:B3Recovery };
 
 export class RestaurantOrders {
   readonly dir: string;
@@ -63,8 +66,8 @@ const decode = (wire: string): Transaction => decoder.decode(getBase64Encoder().
 const digest = (s: string) => createHash("sha256").update(s).digest("hex");
 const equalMessage = (a: Transaction, b: Transaction) => Buffer.from(a.messageBytes).equals(Buffer.from(b.messageBytes));
 const money = (n: bigint) => Number(n) / Number(DEMO_UNIT);
-const labels: Record<Action, string> = { authorize: "Budget authorized", beer: "Beer + Ribs", salmon: "Salmon", finish: "Order finished · remainder released", void: "Order cancelled · hold released", refund: "Consumed budget refunded", reclaim: "Payer reclaimed unused budget" };
-const merchantActions = ["beer", "salmon", "finish", "void", "refund"] as const;
+const labels: Record<Action, string> = { authorize: "Budget authorized", beer: "Beer + Ribs", salmon: "Salmon", finish: "Order finished · remainder released", void: "Order cancelled · hold released", refund: "Consumed budget refunded", reclaim: "Payer reclaimed unused budget", atomic:"Atomic capture 40 + release 60" };
+const merchantActions = ["beer", "salmon", "finish", "void", "refund", "atomic"] as const;
 class RestaurantRefusal extends Error {}
 const refundAmount = (order: Order, p: Payment) => order.scenario === "normal" ? 10n * DEMO_UNIT : p.refundable;
 
@@ -95,6 +98,9 @@ function actionReasons(c: RestaurantConfig, order: Order, p: Payment | null, now
     }
     if (now >= p.captureDeadline) return "Onchain capture deadline expired; payer reclaim may be eligible.";
     if (p.held <= 0n) return "No remaining hold.";
+    if (a === 'atomic') return order.scenario !== 'atomic' || p.held !== DEMO_BUDGET || p.refundable !== 0n ? 'Atomic scenario requires the original 100/0 hold.' : '';
+    if (order.scenario === 'atomic') return 'Use the single atomic capture 40 + release 60 action.';
+    if (order.scenario === 'partial-reclaim' && a !== 'beer') return 'Partial capture scenario permits capture 40, then payer reclaim after the real deadline.';
     if (a === "beer") {
       if (order.scenario === "cancelled") return "Cancelled scenario permits explicit void only.";
       return p.held < 40n * DEMO_UNIT ? "Remaining hold is below 40 test tokens." : "";
@@ -140,6 +146,18 @@ export async function restaurantSnapshot(c: RestaurantConfig, order: Order): Pro
   if (!p || snapshot.account.owner !== c.programId || p.payer !== order.payer || p.server !== c.server.address || p.mint !== c.asset || p.maximum !== DEMO_BUDGET || String(p.captureDeadline) !== String(order.required.accepts[0]!.extra!.captureDeadline) || String(p.refundDeadline) !== String(order.required.accepts[0]!.extra!.refundDeadline)) throw new Error("payment identity differs from this order");
   return p;
 }
+async function orderClock(c: RestaurantConfig,order:Order): Promise<bigint> {
+  if (!c.ledger.getClockAtLeast) return c.now(); // Local ledger fixture implements its own Clock.
+  let slot=0n;
+  for(const e of order.events) if(e.transaction) {
+    const status=await c.ledger.getSignatureStatus(e.transaction);
+    if(e.status==='finalized' && (status.kind!=='found' || status.commitment!=='finalized' || status.err!==null)) throw Error('original finalized Clock fence unavailable');
+    if(status.kind==='found' && status.commitment==='finalized' && status.slot>slot)slot=status.slot;
+  }
+  const clock=await c.ledger.getClockAtLeast(slot,Date.now()+10_000);
+  if(clock.kind!=='ok' || clock.commitment!=='finalized' || clock.slot<slot)throw Error('finalized Clock evidence unavailable');
+  return clock.unixTimestamp;
+}
 
 export function createRestaurantApp(c: RestaurantConfig): Hono {
   if (c.amount !== DEMO_BUDGET) throw new Error("restaurant budget must be exactly 100 six-decimal demo USDC");
@@ -179,9 +197,9 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
   }
   async function view(order: Order) {
     const p = await restaurantSnapshot(c, order);
-    const now = await c.now();
+    const now = await orderClock(c,order);
     const blocked = order.status === "pending" || c.orders.busy(order.id);
-    const captured = order.events.filter(e => e.status === "finalized" && ["beer", "salmon"].includes(e.action)).reduce((s,e) => s + BigInt(e.amount), 0n);
+    const captured = order.events.filter(e => e.status === "finalized" && ["beer", "salmon", "atomic"].includes(e.action)).reduce((s,e) => s + BigInt(e.amount), 0n);
     const refunded = order.events.filter(e => e.status === "finalized" && e.action === "refund").reduce((s,e) => s + BigInt(e.amount), 0n);
     const reasons = actionReasons(c, order, p, now, blocked);
     const balances = { payer: await tokenBalance(c, order.payer), merchant: await tokenBalance(c, c.server.address) };
@@ -193,6 +211,7 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
       captureDeadline: Number(order.required.accepts[0]!.extra!.captureDeadline), refundDeadline: Number(order.required.accepts[0]!.extra!.refundDeadline), now: Number(now),
       actions: Object.fromEntries(Object.entries(reasons).map(([action, reason]) => [action, !reason])), actionReasons: reasons, balances,
       events: await Promise.all(order.events.map(async e => ({ action: e.action, label: e.label, amount: money(BigInt(e.amount)), at: e.at, status: e.status, signature: e.transaction, ...(e.transaction ? { chainStatus: await publicSignatureStatus(e.transaction) } : {}) }))),
+      ...(b3RecoveryEvidence(c.b3Recovery,order,c.orders.path(order.id),blocked) ? {b3Recovery:b3RecoveryEvidence(c.b3Recovery,order,c.orders.path(order.id),blocked)} : {}),
       ...(order.status === "draft" ? { required: order.required, unsigned: order.unsigned } : {}),
     };
   }
@@ -224,7 +243,7 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
         const old = owned(previous.split(".")[0]!, previous);
         const p = await restaurantSnapshot(c, old);
         if (c.orders.busy(old.id) || old.status === "pending" || (p && p.held > 0n)) return ctx.json({ error: "finish or reconcile the existing budget before opening another" }, 409);
-        if (old.status === "draft" && (old.events.length !== 0 || await c.now() < BigInt(old.required.accepts[0]!.extra!.captureDeadline as number))) return ctx.json({ error: "Original unsigned offer is still valid or has an attempt; inspect it before replacement." }, 409);
+        if (old.status === "draft" && (existsSync(`${c.orders.path(old.id)}.wallet-consent.lock`) || old.events.length !== 0 || await c.now() < BigInt(old.required.accepts[0]!.extra!.captureDeadline as number))) return ctx.json({ error: "Original unsigned offer is still valid or has an attempt; inspect it before replacement." }, 409);
       } catch (e) { if (!(e instanceof Error) || !e.message.includes("ENOENT")) throw e; }
     }
     const id = randomBytes(16).toString("hex"); const capability = `${id}.${randomBytes(32).toString("hex")}`;
@@ -234,12 +253,34 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
     const required: PaymentRequired = { x402Version: 2, resource: { url: `${c.origin}/resource`, description: "Pivovar Marina · 100 test-token Devnet budget", mimeType: "application/json" }, accepts: [requirements] };
     const tx = await buildDemoTransaction({ feePayer: c.feePayer, signers: [], lifetime: await c.getLatestBlockhash(), instructions: [await authorizeInstruction({ programId: c.programId, payer, server: c.server.address, mint: c.asset, funder: c.feePayer, salt, maximum: DEMO_BUDGET, captureDeadline: BigInt(requirements.extra!.captureDeadline as number), refundDeadline: BigInt(requirements.extra!.refundDeadline as number) })] }, c.ledger);
     const order: Order = { id, capabilityHash: digest(capability), payer, payment: await paymentAddress(c.programId, payer, salt), scenario: scenario as Scenario, required, unsigned: encodeTransaction(tx), authorizeLifetime: transactionObservation(tx), createdAt: Number(await c.now()), status: "draft", events: [] };
+    c.orderAdmission?.reserve(); // Durable cap before offer publication/wallet signing; never refunded.
     c.orders.create(order);
     setCookie(ctx, cookieName, capability, { httpOnly: true, secure: secured, sameSite: "Strict", path: "/", maxAge: 86400 });
     ctx.header(PAYMENT_REQUIRED_HEADER, encodeHeader(required));
     return ctx.json({ order: id, required, unsigned: order.unsigned }, 402);
   });
   app.get("/api/orders/:id", async ctx => ctx.json(await view(owned(ctx.req.param("id"), getCookie(ctx, cookieName)))));
+  app.get('/api/orders/:id/signing-preflight', async ctx => {
+    const order = owned(ctx.req.param('id'),getCookie(ctx,cookieName));
+    const reclaim = ctx.req.query('operation') === 'reclaim';
+    const unsigned = reclaim ? order.reclaimUnsigned : order.unsigned;
+    const p = await restaurantSnapshot(c,order);
+    if (!unsigned || c.orders.busy(order.id) || order.status === 'pending' ||
+      (reclaim ? !p || !!actionReasons(c,order,p,await orderClock(c,order),false).reclaim : order.status !== 'draft' || order.events.length !== 0 || p !== null || await orderClock(c,order) >= BigInt(order.required.accepts[0]!.extra!.captureDeadline as number))) {
+      return ctx.json({error:'Original offer is not eligible for fresh consent.'},409);
+    }
+    const message = getCompiledTransactionMessageDecoder().decode(decode(unsigned).messageBytes);
+    if (!c.ledger.offerBlockhashValid || !await c.ledger.offerBlockhashValid(message.lifetimeToken)) return ctx.json({error:'Original blockhash expired or unavailable; no replacement is automatic.'},409);
+    return ctx.json({id:order.id,operation:reclaim?'reclaim':'authorize',unsignedSha256:digest(unsigned),fresh:true});
+  });
+  app.post('/api/orders/:id/wallet-consent',async ctx => {
+    const order = owned(ctx.req.param('id'),getCookie(ctx,cookieName));
+    const body = await ctx.req.json();
+    if (Object.keys(body).sort().join() !== 'unsignedSha256' || body.unsignedSha256 !== digest(order.unsigned) || order.status !== 'draft' || order.events.length || c.orders.busy(order.id) ||
+      await c.now() >= BigInt(order.required.accepts[0]!.extra!.captureDeadline as number)) return ctx.json({error:'Original consent state differs.'},409);
+    createDurableFile(`${c.orders.path(order.id)}.wallet-consent.lock`,JSON.stringify({order:order.id,unsignedSha256:body.unsignedSha256}));
+    return ctx.json({reserved:true});
+  });
   app.post("/resource", async ctx => {
     const order = owned(ctx.req.query("order") ?? "", getCookie(ctx, cookieName));
     if (order.status !== "draft") return ctx.json({ error: "budget already submitted; inspect the original payment" }, 409);
@@ -281,19 +322,19 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
     try {
       const p = await restaurantSnapshot(c, order);
       // No new consent while an earlier attempt is unresolved.
-      const now = await c.now();
+      const now = await orderClock(c,order);
       const reason = actionReasons(c, order, p, now, order.status === "pending")[action];
       if (reason) throw new RestaurantRefusal(reason);
       if (!p) throw new RestaurantRefusal("Original finalized payment unavailable.");
-      const amount = action === "beer" ? 40n * DEMO_UNIT : action === "salmon" ? 25n * DEMO_UNIT : action === "refund" ? refundAmount(order, p) : p.held;
+      const amount = action === "beer" || action === 'atomic' ? 40n * DEMO_UNIT : action === "salmon" ? 25n * DEMO_UNIT : action === "refund" ? refundAmount(order, p) : p.held;
       if (action === "refund") {
         const balance = await tokenBalance(c, p.server);
         if (balance.amount === null || balance.amount < money(amount)) throw new RestaurantRefusal(balance.reason || "Merchant test-token balance cannot fund this refund.");
       }
       const stored = { programId: c.programId, payment: order.payment, payer: p.payer, server: p.server, mint: p.mint };
-      const ix = action === "beer" || action === "salmon" ? await captureInstruction(stored, amount, false, p.held, p.refundable) : action === "refund" ? await refundInstruction(stored, amount, p.held, p.refundable) : await voidInstruction(stored, p.held, p.refundable);
+      const ix = action === "beer" || action === "salmon" || action === 'atomic' ? await captureInstruction(stored, amount, action === 'atomic', p.held, p.refundable) : action === "refund" ? await refundInstruction(stored, amount, p.held, p.refundable) : await voidInstruction(stored, p.held, p.refundable);
       const tx = await buildDemoTransaction({ feePayer: c.feePayer, signers: [c.server], lifetime: await c.getLatestBlockhash(), instructions: [ix] }, c.ledger);
-      const scheme = action === "beer" || action === "salmon" ? capturePayload(order.payment, tx, amount, false, p.held, p.refundable) : action === "refund" ? refundPayload(order.payment, tx, amount, p.held, p.refundable) : voidPayload(order.payment, tx, p.held, p.refundable);
+      const scheme = action === "beer" || action === "salmon" || action === 'atomic' ? capturePayload(order.payment, tx, amount, action === 'atomic', p.held, p.refundable) : action === "refund" ? refundPayload(order.payment, tx, amount, p.held, p.refundable) : voidPayload(order.payment, tx, p.held, p.refundable);
       const event: Event = { action, label: labels[action], amount: amount.toString(), at: new Date().toISOString(), status: "prepared", transaction: "", transactionBase64: encodeTransaction(tx), lifetimeObservation: transactionObservation(tx) };
       c.orders.prepare(order, event); prepared = true;
       const req = order.required.accepts[0]!;
@@ -324,7 +365,7 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
     try {
       order = c.orders.read(order.id);
       const p = await restaurantSnapshot(c, order);
-      if (!p || p.held === 0n || (await c.now()) < p.captureDeadline || order.status === "pending") return ctx.json({ error: "reclaim is not eligible yet" }, 409);
+      if (!p || p.held === 0n || (await orderClock(c,order)) < p.captureDeadline || order.status === "pending") return ctx.json({ error: "reclaim is not eligible yet" }, 409);
       const lifetime = await c.getLatestBlockhash();
       const tx = await buildDemoTransaction({ feePayer: p.payer, signers: [], lifetime, instructions: [await reclaimInstruction({ programId: c.programId, payment: order.payment, payer: p.payer, server: p.server, mint: p.mint })] }, c.ledger);
       order.reclaimLifetime = { blockhash: lifetime.blockhash, lastValidBlockHeight: lifetime.lastValidBlockHeight.toString(), ...(lifetime.blockhashSlot === undefined ? {} : { blockhashSlot: lifetime.blockhashSlot.toString() }) };
@@ -339,7 +380,7 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
     c.orders.reserve(order.id, "reclaim");
     order = c.orders.read(order.id);
     const p = await restaurantSnapshot(c, order);
-    if (!p || p.held === 0n || (await c.now()) < p.captureDeadline || order.status === "pending") { c.orders.unlock(order.id); return ctx.json({ error: "reclaim no longer eligible" }, 409); }
+    if (!p || p.held === 0n || (await orderClock(c,order)) < p.captureDeadline || order.status === "pending") { c.orders.unlock(order.id); return ctx.json({ error: "reclaim no longer eligible" }, 409); }
     // A concurrent preparation may have replaced the unsigned draft before this reservation.
     // Never associate its lifetime evidence with another signed wire.
     if (!order.reclaimUnsigned || !equalMessage(tx, decode(order.reclaimUnsigned)) || order.reclaimLifetime && order.reclaimLifetime.blockhash !== m.lifetimeToken) {
@@ -356,6 +397,7 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
     const failed = result.kind === "not-submitted" || result.kind === "submitted" && result.outcome?.commitment === "finalized" && result.outcome.status === "failed";
     const receipt: SettleResponse = { success, transaction: sig, network: c.network, payer: order.payer, ...(success ? {} : { errorReason: failed ? "invalid_transaction_state" : "settlement_pending" }) };
     await recordResult(order, event, receipt, success ? "succeeded" : failed ? "rejected" : "unresolved");
+    ctx.header(PAYMENT_RESPONSE_HEADER,encodeHeader(receipt));
     return ctx.json({ receipt }, success ? 200 : 409);
   });
   return app;

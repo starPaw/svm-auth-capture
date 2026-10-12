@@ -99,7 +99,8 @@ describe("RpcLedger.verifyGenesis", () => {
       rpc: fakeRpc({ getGenesisHash: () => sendable("Wrong1111111111111111111111111111111111111") }),
     });
     const error = await ledger.verifyGenesis().catch((e: Error) => e);
-    expect(String(error)).toMatch(/https:\/\/devnet\.example-rpc\.com \(credentials redacted\)/);
+    expect(String(error)).toMatch(/genesis mismatch/);
+    expect(String(error)).not.toContain('devnet.example-rpc.com');
     expect(String(error)).not.toContain("secret-key-value");
     expect(redactRpcUrl("https://user:pw@rpc.example/v1?x=1")).toBe("https://rpc.example (credentials redacted)");
     expect(redactRpcUrl("https://api.devnet.solana.com")).toBe("https://api.devnet.solana.com");
@@ -858,7 +859,7 @@ describe("RpcLedger versioned message history", () => {
     const started = Date.now();
     const result = await ledger.findSignaturesByMessage(PROGRAM_ID, new Uint8Array(original.messageBytes));
     const ms = Date.now() - started;
-    expect(result).toMatchObject({ kind: "unavailable", detail: "RPC request did not complete before its deadline" });
+    expect(result).toMatchObject({ kind: "unavailable", detail: "RPC evidence unavailable" });
     expect(reads).toEqual([otherSignature, signature]);
     expect(signals[1]!.aborted).toBe(true);
     expect(ms).toBeGreaterThanOrEqual(120);
@@ -1007,7 +1008,7 @@ describe("RpcLedger ChainReader", () => {
       pollIntervalMs: 1,
       rpc: fakeRpc({ getAccountInfo: () => ({ send: () => Promise.reject(new Error("Minimum context slot has not been reached")) }) }),
     });
-    expect(await stuck.getAccountAtLeast(PROGRAM_ID, 90n)).toEqual({ kind: "unavailable", detail: "Minimum context slot has not been reached" });
+    expect(await stuck.getAccountAtLeast(PROGRAM_ID, 90n)).toEqual({ kind: "unavailable", detail: "RPC evidence unavailable" });
   });
 });
 

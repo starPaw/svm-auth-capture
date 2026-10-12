@@ -34,27 +34,34 @@ function protectedPath(path: string, mode?: number): void {
   }
 }
 const digest = (path: string) => createHash('sha256').update(readFileSync(path)).digest('hex');
-export function rpcBackend(record: ReturnType<typeof loadDeploymentRecord>): ProvisionBackend {
-  const rpc = createSolanaRpc(RPC);
-  const ledger = new RpcLedger({ deployment: record, network: record.network.caip2, genesisHash: record.network.genesisHash, rpcUrl: RPC, confirmTimeoutMs: 90_000 });
+export function rpcBackend(record: ReturnType<typeof loadDeploymentRecord>, endpoint = RPC): ProvisionBackend {
+  const rpc = createSolanaRpc(endpoint);
+  const ledger = new RpcLedger({ deployment: record, network: record.network.caip2, genesisHash: record.network.genesisHash, rpcUrl: endpoint, confirmTimeoutMs: 90_000 });
+  // Every quote, account and finality read belongs to this verified network/program.
+  // P2 retains its original default; application runtime supplies its approved endpoint.
+  let verified: Promise<void> | undefined;
+  const ready = () => verified ??= ledger.verifyGenesis();
   const sendOptions = () => ({ abortSignal: AbortSignal.timeout(15_000) });
   return {
     async genesis() { return await rpc.getGenesisHash().send(sendOptions()); },
     async snapshot(addresses, minSlot = 0n) {
+      await ready();
       const result = await rpc.getMultipleAccounts(addresses, { encoding: 'base64', commitment: 'finalized', minContextSlot: minSlot }).send(sendOptions());
       if (typeof result.context.slot !== 'bigint' || result.context.slot < minSlot || result.value.length !== addresses.length) throw Error('finalized snapshot mismatch');
       return { slot: result.context.slot, accounts: result.value.map(a => a ? { owner: a.owner, lamports: a.lamports, executable: a.executable, data: new Uint8Array(getBase64Encoder().encode(a.data[0])) } : null) };
     },
-    async rent(size) { return await rpc.getMinimumBalanceForRentExemption(BigInt(size), { commitment: 'finalized' }).send(sendOptions()); },
-    async latest() { return (await rpc.getLatestBlockhash({commitment:'finalized'}).send(sendOptions())).value; },
+    async rent(size) { await ready(); return await rpc.getMinimumBalanceForRentExemption(BigInt(size), { commitment: 'finalized' }).send(sendOptions()); },
+    async latest() { await ready(); return (await rpc.getLatestBlockhash({commitment:'finalized'}).send(sendOptions())).value; },
     async fee(transaction) {
+      await ready();
       const message = getBase64Decoder().decode(transaction.messageBytes);
       const result = await rpc.getFeeForMessage(message as Parameters<typeof rpc.getFeeForMessage>[0], { commitment: 'finalized' }).send(sendOptions());
       if (result.value === null) throw Error('fee quote unavailable');
       return result.value;
     },
-    async submit(tx) { return await ledger.submit(tx); },
+    async submit(tx) { await ready(); return await ledger.submit(tx); },
     async finalized(signature) {
+      await ready();
       if (!isSignature(signature)) throw Error('invalid original signature');
       const result = await rpc.getTransaction(signature as Signature, { commitment: 'finalized', encoding: 'base64', maxSupportedTransactionVersion: 0 }).send(sendOptions());
       if (!result || !result.meta) return null;

@@ -42,7 +42,7 @@ const CLOCK_SYSVAR = "SysvarC1ock11111111111111111111111111111111" as Address;
 const base64Encoder = getBase64Encoder();
 const decodeBase64 = (data: string): Uint8Array => new Uint8Array(base64Encoder.encode(data));
 const transactionDecoder = getTransactionDecoder();
-const describe = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+const describe = (_error: unknown): string => 'RPC evidence unavailable';
 
 /** Bounded history scan for `findSignaturesByMessage`; a demo payment PDA sees a handful of transactions. */
 const MESSAGE_SEARCH_LIMIT = 50;
@@ -248,7 +248,7 @@ export class RpcLedger implements Ledger, ChainReader {
   async verifyGenesis(): Promise<void> {
     const observed = await this.request((abortSignal) => this.rpc.getGenesisHash().send({ abortSignal }));
     if (observed !== this.genesisHash) {
-      throw new Error(`RpcLedger genesis mismatch at ${redactRpcUrl(this.rpcUrl)}: configured ${this.genesisHash}, observed ${observed}`);
+      throw new Error('RpcLedger genesis mismatch; endpoint and provider response details withheld');
     }
     if (this.deployment) await this.verifyLiveDeployment(this.deployment);
   }
@@ -276,7 +276,7 @@ export class RpcLedger implements Ledger, ChainReader {
   }
 
   async now(): Promise<bigint> {
-    const { value } = await this.request((abortSignal) => this.rpc.getAccountInfo(CLOCK_SYSVAR, { encoding: "base64" }).send({ abortSignal }));
+    const { value } = await this.request((abortSignal) => this.rpc.getAccountInfo(CLOCK_SYSVAR, { encoding: "base64", commitment: "finalized" }).send({ abortSignal }));
     if (!value) throw new Error("RpcLedger.now: Clock sysvar account not found");
     return decodeClockUnixTimestamp(decodeBase64(value.data[0]));
   }
@@ -357,6 +357,13 @@ export class RpcLedger implements Ledger, ChainReader {
     // The pinned SDK transforms numeric InstructionError fields to bigint. A failed
     // simulation must remain a refusal, rather than throwing during error reporting.
     return { ok: false, error: JSON.stringify(value.err, (_key, v) => typeof v === "bigint" ? v.toString() : v), logs: [...(value.logs ?? [])] };
+  }
+
+  async offerBlockhashValid(blockhash: string): Promise<boolean> {
+    const { context, value } = await this.request(abortSignal => this.rpc.isBlockhashValid(blockhash as Blockhash,
+      { commitment:'finalized' }).send({abortSignal}));
+    if (!validSlot(context?.slot) || typeof value !== 'boolean') throw Error('offer lifetime evidence unavailable');
+    return value;
   }
 
   async submit(transaction: Transaction): Promise<SubmitResult> {

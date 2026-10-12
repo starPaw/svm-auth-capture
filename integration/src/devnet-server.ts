@@ -18,6 +18,8 @@ import { createGatewayApp } from "./gateway.ts";
 import { redactRpcUrl, RpcLedger } from "./rpc-ledger.ts";
 import { SponsorshipGuard } from "./sponsorship.ts";
 import { FileSubmissionJournal } from "./submission-journal.ts";
+import { AdmissionJournal } from './admission-journal.ts';
+import { requireE2eRuntimeRpc } from './e2e-runtime-policy.ts';
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -37,6 +39,8 @@ async function main(): Promise<void> {
   const record = loadDeploymentRecord(requireEnv("SAC006_DEPLOYMENT_RECORD_PATH"));
   const rpcUrl = requireEnv("SOLANA_RPC_URL");
   const feePayer = await loadFeePayer(requireEnv("SAC006_FACILITATOR_KEYPAIR_PATH"));
+  const e2e = feePayer.address === '5mkvwgKeWMYrFppGm8ugLzQC9Wff4vduqWphsGhQNigX' || requireEnv('SAC006_FACILITATOR_KEYPAIR_PATH').includes('/capture402-e2e/');
+  if (e2e) requireE2eRuntimeRpc(rpcUrl,record);
 
   const ledger = new RpcLedger({ deployment: record, network: record.network.caip2, genesisHash: record.network.genesisHash, rpcUrl });
   await ledger.verifyGenesis();
@@ -44,12 +48,14 @@ async function main(): Promise<void> {
   // The exact co-signed bytes, signature, and blockhash of every broadcast are written here first.
   const journal = new FileSubmissionJournal(requireEnv("SAC006_FACILITATOR_JOURNAL_DIR"));
   // Binding to the E2E sponsor prevents a missing/renamed environment profile bypass.
-  let sponsorBudget;
-  if (feePayer.address === '5mkvwgKeWMYrFppGm8ugLzQC9Wff4vduqWphsGhQNigX' || requireEnv('SAC006_FACILITATOR_KEYPAIR_PATH').includes('/capture402-e2e/')) {
+  let sponsorBudget, admission;
+  if (e2e) {
     const directory = '/var/lib/capture402-e2e/facilitator/campaign-budget';
     const policy = JSON.parse(readFileSync(`${directory}/policy.json`,'utf8')) as CampaignPolicy;
-    if (policy.sponsor !== feePayer.address || policy.browser !== '93PtawNdAfDn7oTjRrbrJJMSgaFTjGS3wjtkrZSNGn74' || policy.genesisHash !== record.network.genesisHash || rpcUrl !== 'https://api.devnet.solana.com') throw Error('E2E campaign policy/runtime mismatch');
-    sponsorBudget = campaignSponsorship(new CampaignBudget(directory,policy),rpcBackend(record));
+    if (policy.sponsor !== feePayer.address || policy.browser !== '93PtawNdAfDn7oTjRrbrJJMSgaFTjGS3wjtkrZSNGn74' || policy.genesisHash !== record.network.genesisHash) throw Error('E2E campaign policy/runtime mismatch');
+    requireE2eRuntimeRpc(rpcUrl,record);
+    sponsorBudget = campaignSponsorship(new CampaignBudget(directory,policy),rpcBackend(record,rpcUrl));
+    admission = new AdmissionJournal(requireEnv('SAC006_E2E_RELAY_ADMISSION_DIR'),'relay-attempts',Number(requireEnv('SAC006_SPONSOR_MAX_ATTEMPTS')));
   }
   const facilitator = new Facilitator({ network: record.network.caip2, programId: record.programId, feePayer, ledger, journal, sponsorBudget, observationKey: requireEnv("SAC006_BEARER_TOKEN"), ...demoSponsorComputeBounds() });
   const sponsorship = new SponsorshipGuard({
@@ -57,6 +63,7 @@ async function main(): Promise<void> {
     feePayer: feePayer.address,
     maxAttempts: Number(process.env.SAC006_SPONSOR_MAX_ATTEMPTS ?? "50"),
     minLamportsBalance: BigInt(process.env.SAC006_SPONSOR_MIN_LAMPORTS ?? "10000000"), // 0.01 SOL
+    admission,
   });
   const app = createGatewayApp(facilitator, {
     bearerToken: requireEnv("SAC006_BEARER_TOKEN"),
@@ -71,12 +78,12 @@ async function main(): Promise<void> {
   const hostname = process.env.SAC006_HOST ?? "127.0.0.1";
   serve({ fetch: app.fetch, port, hostname }, (info) => {
     console.log(`SAC-006 facilitator listening on http://${hostname}:${info.port}`);
-    console.log(`network=${facilitator.network} program=${record.programId} rpc=${redactRpcUrl(rpcUrl)}`);
+    console.log(`network=${facilitator.network} program=${record.programId} rpc=${e2e ? 'verified-owner-selected-private-provider' : redactRpcUrl(rpcUrl)}`);
     console.log(`deployment record sha256=${record.sha256} (${ACCEPTED_DEPLOYMENT_RECORD.path} at ${ACCEPTED_DEPLOYMENT_RECORD.revision})`);
   });
 }
 
-main().catch((error) => {
-  console.error(error instanceof Error ? (error.stack ?? error.message) : String(error));
+main().catch(() => {
+  console.error('Facilitator startup stopped; verify private configuration and accepted Devnet identity.');
   process.exitCode = 1;
 });
