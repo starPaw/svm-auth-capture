@@ -249,8 +249,12 @@ http {
     expect((await https(path,'POST',{cookie,origin:'https://attacker.invalid'})).status).toBe(403);
     expect((await https(path,'POST',{cookie,origin})).status).toBe(409);expect(h.ledger.submissions).toHaveLength(0);
   });
-  test('selected authorize abandonment exposes only POST with original cookie and Origin',async()=>{
+  test('selected authorize abandonment stays private on stable and POST-only on development',async()=>{
     const path=`/api/orders/${'a'.repeat(32)}/abandon-authorize`,before=upstream.length;
+    if(environment==='stable') {
+      for(const method of ['GET','POST','PUT','DELETE'])expect((await https(path,method,{origin})).status).toBe(404);
+      expect(upstream).toHaveLength(before);expect(h.ledger.submissions).toHaveLength(0);return;
+    }
     for(const method of ['GET','PUT','DELETE'])expect((await https(path,method)).status).toBe(405);
     expect(upstream).toHaveLength(before);
     expect((await https(path,'POST',{origin:'https://attacker.invalid'})).status).toBe(403);
