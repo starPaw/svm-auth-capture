@@ -7,6 +7,7 @@ import { request } from "node:https";
 import { createServer, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createHash } from 'node:crypto';
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { serve, type ServerType } from "@hono/node-server";
@@ -27,7 +28,7 @@ const devFragment = readFileSync(devFragmentPath, "utf8");
 
 test("the development proxy routes only to its restaurant and never retries payment requests", () => {
   expect([...devFragment.matchAll(/proxy_pass\s+(\S+);/g)].map(match => match[1]))
-    .toEqual(Array(5).fill("http://127.0.0.1:18888"));
+    .toEqual(Array(7).fill("http://127.0.0.1:18888"));
   expect(devFragment).toContain("proxy_next_upstream off;");
   expect(devFragment).toContain("location / { return 404; }");
 });
@@ -85,6 +86,16 @@ basicConstraints=critical,CA:TRUE
     const port = (reservation.address() as AddressInfo).port;
     await new Promise<void>((resolve, reject) => reservation.close(error => error ? reject(error) : resolve()));
     origin = `https://127.0.0.1:${port}`;
+    // Explicit fixture-only isolation permits real nginx tests on a host with accepted
+    // live fixed-port services. Never bind/reload those services or edit their files.
+    let backendPort:number=upstreamPort,includePath=testedFragmentPath;
+    if(process.env.SAC006_TEST_NGINX_ISOLATED_PORTS==='1') {
+      const reserved=createServer();reserved.listen(0,'127.0.0.1');await once(reserved,'listening');backendPort=(reserved.address() as AddressInfo).port;
+      await new Promise<void>((resolve,reject)=>reserved.close(error=>error?reject(error):resolve()));
+      const original=readFileSync(testedFragmentPath,'utf8'),rendered=original.replaceAll(`http://127.0.0.1:${upstreamPort}`,`http://127.0.0.1:${backendPort}`);
+      includePath=join(dir,'fixture-routes.conf');writeFileSync(includePath,rendered);
+      console.info(JSON.stringify({fixtureOnlyPortRewrite:true,sourceSha256:createHash('sha256').update(original).digest('hex'),renderedSha256:createHash('sha256').update(rendered).digest('hex')}));
+    }
     writeFileSync(join(dir, "nginx.conf"), `daemon off;
 master_process off;
 pid "${dir}/nginx.pid";
@@ -99,7 +110,7 @@ http {
     server_name localhost;
     ssl_certificate "${dir}/certificate.pem";
     ssl_certificate_key "${dir}/key.pem";
-    include "${testedFragmentPath}";
+    include "${includePath}";
   }
 }
 `);
@@ -129,7 +140,7 @@ http {
     const app = createPresentationApp({ programId: config.programId, network: config.network, configured: true }, createRestaurantApp(config));
     // Use the fragment's actual fixed upstream; fail if the port is occupied.
     await new Promise<void>((resolve, reject) => {
-      backend = serve({ port: upstreamPort, hostname: "127.0.0.1", fetch: req => {
+      backend = serve({ port: backendPort, hostname: "127.0.0.1", fetch: req => {
         upstream.push({ path: new URL(req.url).pathname, method: req.method, headers: req.headers });
         return app.fetch(req);
       } }, () => resolve());
@@ -164,7 +175,7 @@ http {
       expect(root.headers["x-robots-tag"]).toBe("noindex, nofollow");
       expect(root.headers["cache-control"]).toBe("no-store");
     }
-    for (const [name, mime] of [["homepage.css", "text/css"], ["homepage.js", "text/javascript"]]) {
+    for (const [name, mime] of [["homepage.css", "text/css"], ["homepage.js", "text/javascript"], ['receipt-state.js','text/javascript']]) {
       const asset = await https(`/assets/${name}`); expect(asset.status).toBe(200);
       expect(asset.headers["content-type"]).toBe(`${mime}; charset=utf-8`);
       const before = upstream.length;
@@ -219,6 +230,25 @@ http {
     expect(readdirSync(config.orders.dir).sort()).toEqual(files);
     expect(h.ledger.simulated).toHaveLength(simulations); expect(h.ledger.submissions).toHaveLength(0);
   });
+  test('exact signing preflight/consent routes preserve cookie, Origin and method boundaries without economics',async()=>{
+    const prepared=await https('/api/orders','POST',{origin,'content-type':'application/json'},JSON.stringify({payer:h.payer.address}));
+    const body=JSON.parse(prepared.body),cookie=prepared.headers['set-cookie']![0]!.split(';')[0]!;
+    config.ledger.offerBlockhashValid=async()=>true;
+    const preflight=`/api/orders/${body.order}/signing-preflight`,consent=`/api/orders/${body.order}/wallet-consent`;
+    const before=upstream.length;expect((await https(preflight,'POST',{cookie,origin})).status).toBe(405);expect((await https(consent,'GET',{cookie})).status).toBe(405);expect(upstream).toHaveLength(before);
+    const fresh=await https(preflight+'?operation=authorize','GET',{cookie});expect(fresh.status).toBe(200);
+    const unsignedSha256=createHash('sha256').update(body.unsigned).digest('hex');expect(JSON.parse(fresh.body)).toMatchObject({id:body.order,unsignedSha256,fresh:true});
+    expect((await https(consent,'POST',{cookie,origin:'https://attacker.invalid','content-type':'application/json'},JSON.stringify({unsignedSha256}))).status).toBe(403);
+    expect((await https(consent,'POST',{cookie,origin,'content-type':'application/json'},JSON.stringify({unsignedSha256}))).status).toBe(200);
+    expect(h.ledger.submissions).toHaveLength(0);
+  });
+  test('atomic action crosses only the existing authenticated operator boundary',async()=>{
+    const prepared=await https('/api/orders','POST',{origin,'content-type':'application/json'},JSON.stringify({payer:h.payer.address,scenario:'atomic'}));
+    const {order}=JSON.parse(prepared.body),path=`/api/orders/${order}/actions/atomic`;
+    expect((await https(path,'POST',{origin})).status).toBe(401);
+    const access=await https(path,'GET',{authorization:`Bearer ${config.merchantToken}`});expect(access.status).toBe(200);expect(JSON.parse(access.body)).toMatchObject({id:order,operatorAccess:true,actions:{atomic:false}});
+    expect(h.ledger.submissions).toHaveLength(0);
+  });
 
   test.each(["GET", "HEAD", "PUT", "PATCH", "DELETE", "OPTIONS"])("%s /api/orders returns 405 before reaching the backend", async method => {
     const before = upstream.length;
@@ -226,7 +256,7 @@ http {
     expect(upstream).toHaveLength(before);
   });
 
-  test.each(["/api/orders/", "/api/orders-other", "/api/private", "/api/orders/invalid", `/api/orders/${"a".repeat(32)}/actions/unrelated`, `/api/orders/${"a".repeat(32)}/reclaim/`, "/assets/private.js", "/settle", "/verify", "/supported", "/json/list", "/.git/config"])("%s remains private or outside the allowlist", async path => {
+  test.each(["/api/orders/", "/api/orders-other", "/api/private", "/api/orders/invalid", `/api/orders/${"a".repeat(32)}/actions/unrelated`, `/api/orders/${"a".repeat(32)}/reclaim/`, `/api/orders/${'a'.repeat(32)}/wallet-consent/extra`, `/api/orders/${'a'.repeat(32)}/signing-preflight/`, "/assets/private.js", "/settle", "/verify", "/supported", "/json/list", "/.git/config"])("%s remains private or outside the allowlist", async path => {
     const before = upstream.length;
     for (const method of ["GET", "POST"]) expect((await https(path, method, { origin })).status).toBe(404);
     expect(upstream).toHaveLength(before);
