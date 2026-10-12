@@ -247,6 +247,45 @@ try {
   assert(!(await page.locator('[data-scenario=cancelled]').isDisabled()));await page.locator('[data-scenario=cancelled]').click();await page.locator('#new-budget').click();
   await page.waitForFunction(()=>localStorage.getItem('capture402-order')==='b'.repeat(32));assert.equal(posts,1);
   check('Closed original hold permits explicit selection of the next scenario before a separately unsigned offer');
+  // Exercise actual app.js orchestration through both preflights. The wallet module
+  // and HTTP backend are explicit non-economic stubs; no real signature is created.
+  const flow=await context.newPage(),sequence=[];
+  const flowUnsigned='unsigned-flow-fixture-never-signed';
+  const flowHash=createHash('sha256').update(flowUnsigned).digest('hex');
+  let flowState={...expiredHeld,reclaimGeneration:flowHash,reclaimDraftState:'ready',reclaimPreparation:false};
+  await flow.route('**/wallet.js',route=>route.fulfill({contentType:'text/javascript',body:`
+    const wallet={name:'Flow fixture wallet; no cryptography'};
+    export const wallets=()=>[wallet];export const onWallets=()=>()=>{};
+    export const connect=async()=>({wallet,account:{address:${JSON.stringify(info.merchant)}}});
+    export const walletSign=async()=>{window.fixtureSigns=(window.fixtureSigns||0)+1;return 'signed-flow-stub-not-a-transaction';};
+    export const encodeEnvelope=x=>btoa(JSON.stringify(x));export const decodeEnvelope=x=>JSON.parse(atob(x));
+    export const signingReport=()=>undefined;export const assertDevnetPolicy=()=>{};
+  `}));
+  await flow.route('**/api/orders**',async route=>{
+    const req=route.request(),u=new URL(req.url());
+    if(u.pathname.endsWith('/signing-preflight')) {
+      const dispatch=u.searchParams.get('phase')==='dispatch';sequence.push(dispatch?'dispatch-preflight':'consent-preflight');
+      assert.equal(dispatch,sequence.includes('consent'));
+      return route.fulfill({contentType:'application/json',body:JSON.stringify({id,operation:'reclaim',phase:dispatch?'dispatch':'consent',fresh:!dispatch,unsignedSha256:flowHash})});
+    }
+    if(u.pathname.endsWith('/wallet-consent')) {sequence.push('consent');assert.equal(req.postDataJSON().unsignedSha256,flowHash);return route.fulfill({contentType:'application/json',body:'{"reserved":true}'});}
+    if(u.pathname.endsWith('/reclaim') && req.method()==='GET')return route.fulfill({contentType:'application/json',body:JSON.stringify({unsigned:flowUnsigned,payer:info.merchant})});
+    if(u.pathname.endsWith('/reclaim') && req.method()==='POST') {
+      sequence.push('dispatch');assert.equal(req.postDataJSON().transaction,'signed-flow-stub-not-a-transaction');
+      flowState={...flowState,status:'closed',remaining:0,heldBaseUnits:'0',reclaimDraftState:'stopped',b3Recovery:{...recovery,continued:true},events:[...flowState.events,{action:'reclaim',status:'finalized',amount:100,at:new Date().toISOString(),label:'Fixture reclaimed',signature:'flow-receipt-not-onchain',chainStatus:{kind:'found',commitment:'finalized',err:null}}]};
+      return route.fulfill({contentType:'application/json',body:JSON.stringify({receipt:{success:true,transaction:'flow-receipt-not-onchain'}})});
+    }
+    return route.fulfill({contentType:'application/json',body:JSON.stringify(flowState)});
+  });
+  await flow.goto(origin+'/customer');await flow.evaluate(id=>{localStorage.clear();localStorage.setItem('capture402-order',id);localStorage.setItem('capture402-uncertain',id);},id);
+  await flow.reload();await flow.waitForFunction(()=>document.getElementById('payment-id').querySelector('a'));
+  await flow.locator('#connect-wallet').click();await flow.locator('#wallet-list button').first().click();await flow.locator('#reclaim').click();
+  await flow.waitForFunction(()=>document.getElementById('action-status').textContent.includes('Payer reclaim finalized'));
+  assert.deepEqual(sequence,['consent-preflight','consent','dispatch-preflight','dispatch']);assert.equal(await flow.evaluate(()=>window.fixtureSigns),1);
+  assert.equal(await flow.evaluate(()=>localStorage.getItem('capture402-uncertain')),id);assert.equal(await flow.evaluate(()=>localStorage.getItem('capture402-reclaim-uncertain')),null);
+  assert(await flow.locator('#new-budget').isVisible());
+  check('Actual UI sequence separates consent and post-sign dispatch preflight, dispatches once and retains historical capture evidence');
+  await flow.close();
   assert.equal(errors.length,0,errors.join('\n'));
   check('No browser page errors or external runtime requests');
   writeFileSync(join(output,'restaurant-browser-report.json'),JSON.stringify(report,null,2));

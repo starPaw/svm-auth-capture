@@ -278,11 +278,16 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
   app.get('/api/orders/:id/signing-preflight', async ctx => {
     const order = owned(ctx.req.param('id'),getCookie(ctx,cookieName));
     const reclaim = ctx.req.query('operation') === 'reclaim';
+    const dispatch = reclaim && ctx.req.query('phase') === 'dispatch';
     const unsigned = reclaim ? order.reclaimUnsigned : order.unsigned;
     const p = await restaurantSnapshot(c,order);
     if (reclaim) {
       const generation=retainedReclaimGeneration(order);
-      if (existsSync(`${c.orders.path(order.id)}.${generation ? `reclaim-consent-${digest(unsigned ?? '')}` : 'reclaim-consent'}.lock`)) return ctx.json({error:'Retained consent already used; signing stopped.'},409);
+      const marker=`${c.orders.path(order.id)}.${generation ? `reclaim-consent-${digest(unsigned ?? '')}` : 'reclaim-consent'}.lock`;
+      if(dispatch) {
+        const consent=existsSync(marker) ? JSON.parse(readFileSync(marker,'utf8')) : undefined;
+        if(!unsigned || !consent || Object.keys(consent).sort().join()!=='order,unsignedSha256' || consent.order!==order.id || consent.unsignedSha256!==digest(unsigned)) return ctx.json({error:'Exact retained consent required for dispatch preflight.'},409);
+      } else if(existsSync(marker)) return ctx.json({error:'Retained consent already used; signing stopped.'},409);
     }
     if (!unsigned || c.orders.busy(order.id) || order.status === 'pending' ||
       (reclaim ? !p || !!actionReasons(c,order,p,await orderClock(c,order),false).reclaim : order.status !== 'draft' || order.events.length !== 0 || p !== null || await orderClock(c,order) >= BigInt(order.required.accepts[0]!.extra!.captureDeadline as number))) {
@@ -290,7 +295,7 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
     }
     const message = getCompiledTransactionMessageDecoder().decode(decode(unsigned).messageBytes);
     if (!c.ledger.offerBlockhashValid || !await c.ledger.offerBlockhashValid(message.lifetimeToken)) return ctx.json({error:'Original blockhash expired or unavailable; no replacement is automatic.'},409);
-    return ctx.json({id:order.id,operation:reclaim?'reclaim':'authorize',unsignedSha256:digest(unsigned),fresh:true});
+    return ctx.json({id:order.id,operation:reclaim?'reclaim':'authorize',phase:dispatch?'dispatch':'consent',unsignedSha256:digest(unsigned),fresh:!dispatch});
   });
   app.post('/api/orders/:id/wallet-consent',async ctx => {
     let order = owned(ctx.req.param('id'),getCookie(ctx,cookieName));

@@ -389,6 +389,9 @@ describe("restaurant budget lifecycle", () => {
     expect(c.orders.read(a.s.id).events).toEqual(events);expect(h.ledger.submissions).toHaveLength(1);
     const consent=await app.request(`${origin}/api/orders/${a.s.id}/wallet-consent?operation=reclaim`,{method:'POST',headers:{cookie:a.s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({unsignedSha256:createHash('sha256').update(draft.unsigned).digest('hex')})});
     expect(consent.status).toBe(200);
+    expect((await app.request(`${origin}/api/orders/${a.s.id}/signing-preflight?operation=reclaim`,{headers:{cookie:a.s.cookie}})).status).toBe(409);
+    const dispatch=await app.request(`${origin}/api/orders/${a.s.id}/signing-preflight?operation=reclaim&phase=dispatch`,{headers:{cookie:a.s.cookie}});
+    expect(dispatch.status).toBe(200);expect(await dispatch.json()).toMatchObject({phase:'dispatch',fresh:false,unsignedSha256:createHash('sha256').update(draft.unsigned).digest('hex')});
     const result=await app.request(`${origin}/api/orders/${a.s.id}/reclaim`,{method:'POST',headers:{cookie:a.s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({transaction:await sign(draft.unsigned)})});
     expect(result.status).toBe(200);expect(h.state(c.orders.read(a.s.id).payment).held).toBe(0n);expect((await view(a.s)).remaining).toBe(0);
   });
@@ -433,6 +436,19 @@ describe("restaurant budget lifecycle", () => {
     expect((await a.renew()).status).toBe(409);
     const consent=await app.request(`${origin}/api/orders/${a.s.id}/wallet-consent?operation=reclaim`,{method:'POST',headers:{cookie:a.s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({unsignedSha256:createHash('sha256').update(draft.unsigned).digest('hex')})});expect(consent.status).toBe(409);
     release({kind:'ok',valid:false,slot:5n});expect((await first).status).toBe(200);expect(h.ledger.submissions).toHaveLength(1);
+  });
+  test('dispatch preflight requires exact durable consent and still rejects expired, pending or mismatched consent',async()=>{
+    const a=await expiredReclaimConsent(),draft=await (await a.renew()).json() as any;
+    const preflight=()=>app.request(`${origin}/api/orders/${a.s.id}/signing-preflight?operation=reclaim&phase=dispatch`,{headers:{cookie:a.s.cookie}});
+    expect((await preflight()).status).toBe(409);
+    const marker=`${c.orders.path(a.s.id)}.reclaim-consent-${createHash('sha256').update(draft.unsigned).digest('hex')}.lock`;
+    createDurableFile(marker,JSON.stringify({order:a.s.id,unsignedSha256:'wrong'}));
+    expect((await preflight()).status).toBe(409);
+    const fs=await import('node:fs');fs.writeFileSync(marker,JSON.stringify({order:a.s.id,unsignedSha256:createHash('sha256').update(draft.unsigned).digest('hex')}));
+    expect((await preflight()).status).toBe(200);
+    const order=c.orders.read(a.s.id);order.status='pending';c.orders.write(order);expect((await preflight()).status).toBe(409);
+    order.status='active';c.orders.write(order);h.svm.expireBlockhash();expect((await preflight()).status).toBe(409);
+    expect(h.ledger.submissions).toHaveLength(1);
   });
   test('renewed signed wire without durable fresh consent cannot dispatch',async()=>{
     const a=await expiredReclaimConsent(),draft=await (await a.renew()).json() as any;

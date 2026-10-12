@@ -127,7 +127,7 @@ async function run(fn, renewalMessage = '', refreshAfter = true) {
     await fn(); if(refreshAfter) await refresh();
     const preparedRenewal = renewalMessage && recoveryAllowed() && renewedReclaim() && order.reclaimDraftState === 'ready' && !reclaimAttempted() && order.status !== 'pending' && order.remaining > 0 && order.actions?.reclaim &&
       localStorage.getItem('capture402-reclaim-uncertain') !== order.id;
-    setStatus(preparedRenewal ? renewalMessage : recoveryAllowed() && !reclaimAttempted() && order.status !== 'pending' && localStorage.getItem('capture402-reclaim-uncertain') !== order.id ? order.reclaimDraftState === 'expired-or-unavailable' ? 'Historical capture evidence retained. Unsigned reclaim expired or unavailable; explicit preparation requires fresh finalized proof.' : 'Historical capture evidence retained. Separate payer reclaim requires fresh consent and a finalized receipt.' : uncertain() || order?.status === 'pending' ? 'Original operation pending or unknown. All new operations stopped; inspect original signatures.' : 'Original state refreshed. Only finalized receipts confirm settlement.');
+    setStatus(preparedRenewal ? renewalMessage : continued() ? 'Payer reclaim finalized. Historical capture evidence retained; a new scenario may be explicitly prepared.' : recoveryAllowed() && !reclaimAttempted() && order.status !== 'pending' && localStorage.getItem('capture402-reclaim-uncertain') !== order.id ? order.reclaimDraftState === 'expired-or-unavailable' ? 'Historical capture evidence retained. Unsigned reclaim expired or unavailable; explicit preparation requires fresh finalized proof.' : 'Historical capture evidence retained. Separate payer reclaim requires fresh consent and a finalized receipt.' : uncertain() || order?.status === 'pending' ? 'Original operation pending or unknown. All new operations stopped; inspect original signatures.' : 'Original state refreshed. Only finalized receipts confirm settlement.');
   }
   catch (error) { setStatus(error.message + (diagnosticOnly && signingReport() ? '\n\n' + JSON.stringify(signingReport(),null,2) : ''), true); try { await refresh(); } catch { stale = true; accessId = ''; } }
   finally { busy = false; render(); }
@@ -160,10 +160,10 @@ async function submitOriginal(path, init, allowed = []) {
   }
   return result;
 }
-async function signingPreflight(unsigned, operation) {
-  const {data} = await request(`/api/orders/${order.id}/signing-preflight?operation=${operation}`);
+async function signingPreflight(unsigned, operation, dispatch = false) {
+  const {data} = await request(`/api/orders/${order.id}/signing-preflight?operation=${operation}${dispatch ? '&phase=dispatch' : ''}`);
   const hash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(unsigned))),b=>b.toString(16).padStart(2,'0')).join('');
-  if (data.id !== order.id || data.operation !== operation || data.fresh !== true || data.unsignedSha256 !== hash) throw new Error('Fresh original offer evidence differs; nothing signed.');
+  if (data.id !== order.id || data.operation !== operation || data.phase !== (dispatch ? 'dispatch' : 'consent') || data.fresh !== !dispatch || data.unsignedSha256 !== hash) throw new Error('Original consent/dispatch preflight evidence differs; signing or submission stopped.');
   return hash;
 }
 function showWallets() {
@@ -251,7 +251,7 @@ $('reclaim').onclick = () => {
     const signed = await walletSign(connection, data.unsigned, config);
     localStorage.setItem(`capture402-reclaim-signed-${order.id}-${unsignedSha256}`,signed);
     if(!localStorage.getItem(`capture402-reclaim-signed-${order.id}`)) localStorage.setItem(`capture402-reclaim-signed-${order.id}`,signed);
-    await signingPreflight(data.unsigned,'reclaim');
+    await signingPreflight(data.unsigned,'reclaim',true);
     if (recovery) {
       localStorage.setItem('capture402-reclaim-uncertain',order.id);
       const {data:result} = await request(`/api/orders/${order.id}/reclaim`, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({transaction:signed})},[409]);
