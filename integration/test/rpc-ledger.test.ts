@@ -1265,21 +1265,33 @@ describe("recovery finalized Clock with caller's common deadline", () => {
     expect(await l.getClockAtLeast(60n, Date.now() + 200)).toMatchObject({ kind: "unavailable" });
   });
   test("timeout aborts the transport and never resets the common deadline", async () => {
-    let signal: AbortSignal | undefined;
-    const read = vi.fn(() => ({ send: (options: { abortSignal: AbortSignal }) => { signal = options.abortSignal; return new Promise(() => {}); } }));
-    const l = create(fakeRpc({ getAccountInfo: read })), deadline = Date.now() + 25;
-    expect(await l.getClockAtLeast(0n, deadline)).toMatchObject({ kind: "unavailable" });
-    expect(signal?.aborted).toBe(true);
-    expect(await l.getClockAtLeast(0n, deadline)).toMatchObject({ kind: "unavailable" });
-    expect(read).toHaveBeenCalledTimes(1);
+    vi.useFakeTimers();
+    try {
+      let signal: AbortSignal | undefined;
+      const read = vi.fn(() => ({ send: (options: { abortSignal: AbortSignal }) => { signal = options.abortSignal; return new Promise(() => {}); } }));
+      const l = create(fakeRpc({ getAccountInfo: read })), deadline = Date.now() + 25;
+      const original=l.getClockAtLeast(0n,deadline);
+      await vi.advanceTimersByTimeAsync(25);
+      expect(await original).toMatchObject({kind:'unavailable'});
+      expect(signal?.aborted).toBe(true);
+      expect(Date.now()).toBe(deadline);
+      expect(await l.getClockAtLeast(0n,deadline)).toMatchObject({kind:'unavailable'});
+      expect(read).toHaveBeenCalledTimes(1);
+    } finally {vi.useRealTimers();}
   });
   test("Clock uses deadline consumed by status; no second RPC or proof", async () => {
-    const clock = vi.fn();
-    const l = create(fakeRpc({ getSignatureStatuses: () => ({ send: () => new Promise(() => {}) }), getAccountInfo: clock }));
-    const deadline = Date.now() + 20;
-    const reader = l.recoveryReader(deadline);
-    expect(await reader.getSignatureStatus("1".repeat(64))).toMatchObject({ kind: "unavailable" });
-    expect(await reader.getClockAtLeast(0n)).toMatchObject({ kind: "unavailable" }); expect(clock).not.toHaveBeenCalled();
+    vi.useFakeTimers();
+    try {
+      const clock=vi.fn();
+      const l=create(fakeRpc({getSignatureStatuses:()=>({send:()=>new Promise(()=>{})}),getAccountInfo:clock}));
+      const deadline=Date.now()+20,reader=l.recoveryReader(deadline);
+      const original=reader.getSignatureStatus('1'.repeat(64));
+      await vi.advanceTimersByTimeAsync(20);
+      expect(await original).toMatchObject({kind:'unavailable'});
+      expect(Date.now()).toBe(deadline);
+      expect(await reader.getClockAtLeast(0n)).toMatchObject({kind:'unavailable'});
+      expect(clock).not.toHaveBeenCalled();
+    } finally {vi.useRealTimers();}
   });
 });
 
