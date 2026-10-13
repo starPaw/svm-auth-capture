@@ -38,7 +38,7 @@ type Scenario = typeof SCENARIOS[number];
 type Action = "authorize" | "beer" | "salmon" | "finish" | "void" | "refund" | "reclaim" | "atomic";
 type Event = { lifetimeObservation?: LifetimeObservation; action: Action; label: string; amount: string; at: string; status: "prepared" | "pending" | "finalized" | "rejected"; transaction: string; transactionBase64: string; receipt?: SettleResponse };
 type Order = { authorizeLifetime?: LifetimeObservation; id: string; capabilityHash: string; payer: Address; payment: Address; scenario: Scenario; required: PaymentRequired; unsigned: string; createdAt: number; status: "draft" | "active" | "closed" | "pending" | "rejected"; events: Event[]; reclaimUnsigned?: string; reclaimLifetime?: { blockhash: string; lastValidBlockHeight: string; blockhashSlot?: string } };
-export type RestaurantConfig = ResourceServerConfig & { ledger: Ledger & Pick<ChainReader, "getSignatureStatus"> & Pick<RpcLedger,"getAccountAtLeast"> & {offerBlockhashValid?: (hash: string) => Promise<boolean>; getClockAtLeast?:RpcLedger['getClockAtLeast']; getFinalizedBlockhashStatus?:RpcLedger['getFinalizedBlockhashStatus']}; orders: RestaurantOrders; reclaimJournal: SubmissionJournal; origin: string; merchantToken?: string; orderAdmission?: AdmissionJournal; b3Recovery?:B3Recovery; authorizeAbandonPolicy?:AuthorizeAbandonPolicy; authorizeIsolationPolicy?:InstalledIsolationPolicy };
+export type RestaurantConfig = ResourceServerConfig & { ledger: Ledger & Pick<ChainReader, "getSignatureStatus"> & Pick<RpcLedger,"getAccountAtLeast"> & {offerBlockhashValid?: (hash: string) => Promise<boolean>; getClockAtLeast?:RpcLedger['getClockAtLeast']; getFinalizedBlockhashStatus?:RpcLedger['getFinalizedBlockhashStatus']}; orders: RestaurantOrders; reclaimJournal: SubmissionJournal; origin: string; merchantToken?: string; orderAdmission?: AdmissionJournal; b3Recovery?:B3Recovery; authorizeAbandonPolicy?:AuthorizeAbandonPolicy; authorizeAbandonPolicies?:readonly AuthorizeAbandonPolicy[]; authorizeIsolationPolicy?:InstalledIsolationPolicy };
 
 export class RestaurantOrders {
   readonly dir: string;
@@ -216,6 +216,11 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
     return currentReclaimGeneration(c.orders.path(order.id),order,
       wire=>c.reclaimJournal.findByMessageHash(messageHash(decode(wire).messageBytes)).length > 0);
   }
+  function abandonPolicy(order:Order) {
+    const policies=[...(c.authorizeAbandonPolicies??[]),...(c.authorizeAbandonPolicy?[c.authorizeAbandonPolicy]:[])].filter(p=>p.order===order.id);
+    if(policies.length>1) throw Error('Duplicate selected abandonment policy');
+    return policies[0];
+  }
   async function view(order: Order) {
     // One fresh observation per original signature in this response, shared by
     // the payment/Clock fences and receipts. Nothing is cached across requests.
@@ -230,7 +235,7 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
     const balances = { payer: await tokenBalance(c, order.payer), merchant: await tokenBalance(c, c.server.address) };
     if (!reasons.refund && (balances.merchant.amount === null || balances.merchant.amount < money(refundAmount(order, p!)))) reasons.refund = balances.merchant.reason || "Merchant test-token balance cannot fund this refund.";
     const path=c.orders.path(order.id);
-    const abandoned=abandonmentEvidence(c.authorizeAbandonPolicy,order,path);
+    const abandoned=abandonmentEvidence(abandonPolicy(order),order,path);
     const isolated=authorizeIsolationEvidence(c.authorizeIsolationPolicy,order,path);
     if(isolated && p)throw Error('Isolated original now has a payment; continuation stopped.');
     if(abandoned && p) throw Error('Abandoned identity now has a payment; continuation stopped.');
@@ -246,7 +251,7 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
       reclaimPreparation: !blocked && !reasons.reclaim && existsSync(`${path}.reclaim-consent.lock`) && !consentUsed && !order.events.some(e=>e.action==='reclaim') && (!generation || draftValid === false),
       authorizeAbandoned: abandoned,
       authorizeIsolation:isolated && !successorReserved ? isolated : undefined,
-      authorizeAbandonEligible: !blocked && !p && !abandoned && now>=BigInt(order.required.accepts[0]!.extra!.refundDeadline as number) && !!abandonmentCustody(c.authorizeAbandonPolicy,order,path),
+      authorizeAbandonEligible: !blocked && !p && !abandoned && now>=BigInt(order.required.accepts[0]!.extra!.refundDeadline as number) && !!abandonmentCustody(abandonPolicy(order),order,path),
       status: blocked || successorReserved ? "pending" : abandoned ? 'abandoned' : p ? p.held === 0n ? "closed" : "active" : order.status,
       authorized: p ? money(p.maximum) : 0, captured: money(captured), remaining: p ? money(p.held) : 0, refunded: money(refunded), released: p ? money(p.maximum - p.held - captured) : 0,
       heldBaseUnits: p?.held.toString(), refundableBaseUnits: p?.refundable.toString(),
@@ -285,7 +290,7 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
       {
         const old = owned(previous.split(".")[0]!, previous);
         const p = await restaurantSnapshot(c, old);
-        const abandoned=abandonmentEvidence(c.authorizeAbandonPolicy,old,c.orders.path(old.id));
+        const abandoned=abandonmentEvidence(abandonPolicy(old),old,c.orders.path(old.id));
         const isolated=authorizeIsolationEvidence(c.authorizeIsolationPolicy,old,c.orders.path(old.id));
         if(isolated) {
           if(payer!==old.payer)return ctx.json({error:'Selected original payer required for its one explicit successor.'},409);
@@ -298,11 +303,12 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
           if(status.kind==='found' && (status.commitment!=='finalized' || status.err===null))throw Error('Original signature contradicts isolation; inspect it.');
         }
         if(abandoned || isolated) {
+          if(payer!==old.payer)return ctx.json({error:'Original payer required for its one explicit successor.'},409);
           if(p || existsSync(`${c.orders.path(old.id)}.authorize-successor.lock`)) return ctx.json({error:'Original successor or payment already reserved; inspect it without replacement.'},409);
           abandonedPredecessor=old.id;
         }
         if (!isolated && (c.orders.busy(old.id) || old.status === "pending") || (p && p.held > 0n)) return ctx.json({ error: "finish or reconcile the existing budget before opening another" }, 409);
-        if (old.status === "draft" && !abandonmentEvidence(c.authorizeAbandonPolicy,old,c.orders.path(old.id)) && (existsSync(`${c.orders.path(old.id)}.wallet-consent.lock`) || old.events.length !== 0 || await c.now() < BigInt(old.required.accepts[0]!.extra!.captureDeadline as number))) return ctx.json({ error: "Original unsigned offer is still valid or has an attempt; inspect it before replacement." }, 409);
+        if (old.status === "draft" && !abandoned && (existsSync(`${c.orders.path(old.id)}.wallet-consent.lock`) || old.events.length !== 0 || await c.now() < BigInt(old.required.accepts[0]!.extra!.captureDeadline as number))) return ctx.json({ error: "Original unsigned offer is still valid or has an attempt; inspect it before replacement." }, 409);
       }
     }
     const id = randomBytes(16).toString("hex"); const capability = `${id}.${randomBytes(32).toString("hex")}`;
@@ -376,7 +382,7 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
     c.orders.reserve(order.id,'authorize');
     try {
       order=c.orders.read(order.id);
-      const path=c.orders.path(order.id),custody=abandonmentCustody(c.authorizeAbandonPolicy,order,path);
+      const path=c.orders.path(order.id),policy=abandonPolicy(order),custody=abandonmentCustody(policy,order,path);
       if(!custody || existsSync(`${path}.authorize-abandon.lock`) || !c.ledger.getFinalizedBlockhashStatus || !c.ledger.getClockAtLeast ||
         c.store.list().some(e=>e.authorize?.payment===order.payment || e.terminal?.payment===order.payment) ||
         c.reclaimJournal.findByMessageHash(messageHash(decode(order.unsigned).messageBytes)).length) return ctx.json({error:'Selected original custody is not an unused draft; preserve it.'},409);
@@ -385,7 +391,7 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
         reader:{getAccountAtLeast:(...args)=>c.ledger.getAccountAtLeast(...args),getFinalizedBlockhashStatus:(...args)=>c.ledger.getFinalizedBlockhashStatus!(...args),getClockAtLeast:(...args)=>c.ledger.getClockAtLeast!(...args)}});
       // The one fsynced immutable classification is the entire commit. The original
       // order, wire, deadlines and consent are never mutated. Partial files block.
-      createDurableFile(`${path}.authorize-abandon.lock`,JSON.stringify({schema:1,policySha256:sha256(JSON.stringify(c.authorizeAbandonPolicy)),...custody,proof}));
+      createDurableFile(`${path}.authorize-abandon.lock`,JSON.stringify({schema:1,policySha256:sha256(JSON.stringify(policy)),...custody,proof}));
       return ctx.json({abandoned:true,proof});
     } finally {c.orders.unlock(order.id);}
   });
