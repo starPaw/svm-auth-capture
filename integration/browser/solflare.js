@@ -23,5 +23,9 @@ export async function connectSolflareDevnet(changed) {
       const signed = await sdk.signTransaction(VersionedTransaction.deserialize(transaction));
       return [{ signedTransaction: new Uint8Array(signed.serialize()) }];
     },
+    async signMessage({ account: selected, message }) {
+      if(selected.address!==sdk.publicKey?.toBase58())throw new Error('Solflare message signing requires the connected recipient.');
+      return [{signedMessage:new Uint8Array(message),signature:new Uint8Array(await sdk.signMessage(message,'utf8'))}];
+    },
   };
 }

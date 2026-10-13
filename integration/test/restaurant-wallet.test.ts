@@ -15,6 +15,21 @@ beforeAll(async () => {
 afterAll(async () => { await h.close(); Reflect.deleteProperty(globalThis,"window"); });
 const account = () => ({ address:h.payer.address,chains:["solana:devnet"],features:["solana:signTransaction"] });
 describe("Wallet Standard adapter", () => {
+  test('test-token message signing preserves recipient, amount, origin and exact bytes without a transaction',async()=>{
+    Object.assign(window,{location:{origin:'https://demo.test'}});
+    const expiresAt=Math.floor(Date.now()/1000)+600,id='a'.repeat(64);
+    const challenge={recipient:h.payer.address,amount:1000,mint:h.mint,id,expiresAt,
+      message:`Capture402 Devnet test-token request\nOrigin: https://demo.test\nRecipient: ${h.payer.address}\nMint: ${h.mint}\nAmount: 1000 test tokens\nNetwork: Solana Devnet\nRequest: ${id}\nExpires: ${expiresAt}\nNo funds or transaction authority are granted by this message.`};
+    const {signBytes}=await import('@solana/kit');
+    const connection={account:account(),signMessage:async({message}:any)=>[{signedMessage:new Uint8Array(message),signature:new Uint8Array(await signBytes(h.payer.keyPair.privateKey,message))}]};
+    const result=await adapter.walletSignFaucetRequest(connection,challenge,{...adapter.DEVNET_POLICY,mint:h.mint});
+    expect(Buffer.from(result,'base64')).toHaveLength(64);expect(h.ledger.submissions).toHaveLength(0);
+    for(const bad of [{...challenge,recipient:h.outsider.address},{...challenge,amount:1001},{...challenge,message:challenge.message+'changed'},{...challenge,mint:h.outsider.address}]) {
+      await expect(adapter.walletSignFaucetRequest(connection,bad,{...adapter.DEVNET_POLICY,mint:h.mint})).rejects.toThrow();
+    }
+    connection.signMessage=async({message}:any)=>{message[0]^=1;return[{signedMessage:message,signature:new Uint8Array(64)}];};
+    await expect(adapter.walletSignFaucetRequest(connection,challenge,{...adapter.DEVNET_POLICY,mint:h.mint})).rejects.toThrow(/changed/);
+  });
   test("connect identifies a Devnet signer without spending", async () => {
     const wallet = { name:"Local signing fixture",features:{ "standard:connect":{ connect:async()=>({ accounts:[account()] }) } } };
     expect((await adapter.connect(wallet,()=>{})).account.address).toBe(h.payer.address);

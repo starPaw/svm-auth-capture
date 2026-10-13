@@ -118,3 +118,19 @@ export async function walletSign(connection, unsigned, policy = DEVNET_POLICY) {
   if (!present(after.signatures[payerSlot]) || after.signatures.some((s,i)=>i!==payerSlot&&!equal(s,before.signatures[i]))) throw new Error('Wallet may add only the payer signature. Nothing was submitted.');
   return toBase64(signed.signedTransaction);
 }
+export async function walletSignFaucetRequest(connection, challenge, policy = DEVNET_POLICY) {
+  assertDevnetPolicy(policy);
+  const recipient=connection?.account?.address;
+  if(!recipient || challenge?.recipient!==recipient || challenge.amount!==1000 || challenge.mint!==policy.mint ||
+    !/^[a-f0-9]{64}$/.test(challenge.id??'') || !Number.isSafeInteger(challenge.expiresAt) ||
+    challenge.expiresAt<=Math.floor(Date.now()/1000) || challenge.expiresAt>Math.floor(Date.now()/1000)+630)throw new Error('Test-token request differs from fixed policy.');
+  const expected=`Capture402 Devnet test-token request\nOrigin: ${window.location.origin}\nRecipient: ${recipient}\nMint: ${policy.mint}\nAmount: 1000 test tokens\nNetwork: Solana Devnet\nRequest: ${challenge.id}\nExpires: ${challenge.expiresAt}\nNo funds or transaction authority are granted by this message.`;
+  if(challenge.message!==expected)throw new Error('Unexpected wallet message. Nothing signed.');
+  const sign=connection.signMessage??connection.wallet.features['solana:signMessage']?.signMessage;
+  if(!sign)throw new Error('This wallet cannot sign the test-token request message.');
+  const message=new TextEncoder().encode(expected),baseline=new Uint8Array(message);
+  const [signed]=await sign({account:connection.account,message});
+  if(!(signed?.signature instanceof Uint8Array)||signed.signature.length!==64 ||
+    !(signed.signedMessage instanceof Uint8Array)||!equal(baseline,signed.signedMessage) || connection.account.address!==recipient)throw new Error('Wallet message changed or recipient changed. Nothing submitted.');
+  return toBase64(signed.signature);
+}

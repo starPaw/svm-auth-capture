@@ -17,10 +17,13 @@ import { AdmissionJournal } from './admission-journal.ts';
 import { selectedAbandonPolicies } from './authorize-abandon.ts';
 import { PENDING_A_ISOLATION } from './unknown-authorize-isolation.ts';
 import { E2E_SPONSOR, requireE2eRuntimeRpc, trustedRuntimeFile } from './e2e-runtime-policy.ts';
+import { validateFaucetPolicy, type FaucetPolicy } from './devnet-faucet-store.ts';
+import { devnetFaucetProxy } from './devnet-faucet-proxy.ts';
+import { ata } from './program.ts';
 
 export const DEMO_TIMING = { captureSeconds: 150, refundSecondsAfterCapture: 30 } as const;
 const root = fileURLToPath(new URL("../web/", import.meta.url));
-export function createPresentationApp(info: { programId: string; network: string; configured: boolean; reason?: string; sponsor?: string; merchant?: string; mint?: string }, backend?: Hono): Hono {
+export function createPresentationApp(info: { programId: string; network: string; configured: boolean; reason?: string; sponsor?: string; merchant?: string; mint?: string; faucetEnabled?:boolean }, backend?: Hono): Hono {
   const app = new Hono();
   app.use("*", async (c, next) => {
     c.header("X-Content-Type-Options", "nosniff");
@@ -63,6 +66,15 @@ async function main() {
     const mint = await ledger.getAccount(process.env.SAC006_ASSET_MINT as Address);
     if (!mint || mint.owner !== TOKEN_PROGRAM_ADDRESS || mint.data.length !== getMintDecoder().fixedSize || !getMintDecoder().decode(mint.data).isInitialized || getMintDecoder().decode(mint.data).decimals !== 6) throw new Error("restaurant requires an initialized classic SPL mint with six decimals");
     const baseDir = process.env.SAC006_STORE_DIR!;
+    let faucet;
+    const faucetPolicyPath=process.env.SAC006_E2E_FAUCET_POLICY_PATH;
+    if(faucetPolicyPath) {
+      if(!e2e)throw Error('faucet is restricted to the reviewed E2E campaign');
+      const policy=JSON.parse(trustedRuntimeFile(faucetPolicyPath)) as FaucetPolicy;validateFaucetPolicy(policy);
+      if(policy.mint!==process.env.SAC006_ASSET_MINT || policy.mint!=='91wxVDcTEf5kRRRFmkUKohdNLFRAh5tw9YqWxV8FYvJp' ||
+        policy.sponsor!==E2E_SPONSOR || policy.pool!==await ata(policy.sponsor,policy.mint) || policy.origin!==process.env.SAC006_PUBLIC_ORIGIN)throw Error('faucet policy exceeds existing E2E identities');
+      faucet=devnetFaucetProxy(process.env.SAC006_FACILITATOR_URL!,process.env.SAC006_BEARER_TOKEN!);
+    }
     const config: RestaurantConfig = {
       merchantToken: process.env.SAC006_MERCHANT_TOKEN || undefined,
       facilitatorUrl: process.env.SAC006_FACILITATOR_URL!, bearerToken: process.env.SAC006_BEARER_TOKEN!, network: record.network.caip2, programId: record.programId,
@@ -71,6 +83,7 @@ async function main() {
       store: new OperationStore(baseDir), orders: new RestaurantOrders(`${baseDir}-restaurant`), ledger,
       reclaimJournal: new FileSubmissionJournal(process.env.SAC006_RECLAIM_JOURNAL_DIR ?? `${baseDir}-restaurant-reclaim`),
       origin: process.env.SAC006_PUBLIC_ORIGIN ?? "https://capture402.xyz", getLatestBlockhash: () => ledger.latestBlockhash(), now: cachedClusterClock(() => ledger.now()),
+      ...(faucet?{faucet}:{}),
       handler: async () => { throw new Error("restaurant menu uses explicit lifecycle captures"); },
       ...(e2e ? { orderAdmission:new AdmissionJournal(process.env.SAC006_E2E_ORDER_ADMISSION_DIR!,'orders',Number(process.env.SAC006_E2E_MAX_ORDERS)),
         ...(b3Recovery ? {b3Recovery} : {}),
@@ -79,7 +92,7 @@ async function main() {
         now:() => ledger.now() } : {}),
     };
     backend = createRestaurantApp(config); info.configured = true;
-    Object.assign(info, { sponsor: config.feePayer, merchant: server.address, mint: config.asset, reason: undefined });
+    Object.assign(info, { sponsor: config.feePayer, merchant: server.address, mint: config.asset, reason: undefined,...(faucet?{faucetEnabled:true}:{}) });
   }
   console.log(missing.length ? `Restaurant UI available; missing configuration: ${missing.join(", ")}` : "Restaurant backend enabled against accepted Devnet deployment");
   serve({ fetch: createPresentationApp(info, backend).fetch, hostname: process.env.SAC006_HOST ?? "127.0.0.1", port: Number(process.env.SAC006_RESOURCE_PORT ?? 8788) });

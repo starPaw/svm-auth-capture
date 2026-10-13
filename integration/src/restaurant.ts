@@ -4,7 +4,7 @@ import { assertStoreAccess, domainFromEnvironment, withShared, type RecoveryDoma
 // actions. HttpOnly per-order capabilities are application session control, not onchain authority.
 import { transactionObservation, type LifetimeObservation } from "./lifetime-provenance.ts";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { existsSync, readFileSync, unlinkSync, openSync, fsyncSync, closeSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, unlinkSync, openSync, fsyncSync, closeSync } from "node:fs";
 import { join } from "node:path";
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { Hono } from "hono";
@@ -30,6 +30,7 @@ import { proveExpiredReclaimConsent } from './reclaim-consent-renewal.ts';
 import { currentReclaimGeneration, nextReclaimArchive } from './reclaim-generations.ts';
 import { abandonmentCustody, abandonmentEvidence, proveExpiredUnfundedAuthorize, sha256, type AuthorizeAbandonPolicy } from './authorize-abandon.ts';
 import { authorizeIsolationEvidence, type InstalledIsolationPolicy } from './unknown-authorize-isolation.ts';
+import type { FaucetProxy } from './devnet-faucet-proxy.ts';
 
 export const DEMO_UNIT = 1_000_000n;
 export const DEMO_BUDGET = 100n * DEMO_UNIT;
@@ -38,7 +39,7 @@ type Scenario = typeof SCENARIOS[number];
 type Action = "authorize" | "beer" | "salmon" | "finish" | "void" | "refund" | "reclaim" | "atomic";
 type Event = { lifetimeObservation?: LifetimeObservation; action: Action; label: string; amount: string; at: string; status: "prepared" | "pending" | "finalized" | "rejected"; transaction: string; transactionBase64: string; receipt?: SettleResponse };
 type Order = { authorizeLifetime?: LifetimeObservation; id: string; capabilityHash: string; payer: Address; payment: Address; scenario: Scenario; required: PaymentRequired; unsigned: string; createdAt: number; status: "draft" | "active" | "closed" | "pending" | "rejected"; events: Event[]; reclaimUnsigned?: string; reclaimLifetime?: { blockhash: string; lastValidBlockHeight: string; blockhashSlot?: string } };
-export type RestaurantConfig = ResourceServerConfig & { ledger: Ledger & Pick<ChainReader, "getSignatureStatus"> & Pick<RpcLedger,"getAccountAtLeast"> & {offerBlockhashValid?: (hash: string) => Promise<boolean>; getClockAtLeast?:RpcLedger['getClockAtLeast']; getFinalizedBlockhashStatus?:RpcLedger['getFinalizedBlockhashStatus']}; orders: RestaurantOrders; reclaimJournal: SubmissionJournal; origin: string; merchantToken?: string; orderAdmission?: AdmissionJournal; b3Recovery?:B3Recovery; authorizeAbandonPolicy?:AuthorizeAbandonPolicy; authorizeAbandonPolicies?:readonly AuthorizeAbandonPolicy[]; authorizeIsolationPolicy?:InstalledIsolationPolicy };
+export type RestaurantConfig = ResourceServerConfig & { ledger: Ledger & Pick<ChainReader, "getSignatureStatus"> & Pick<RpcLedger,"getAccountAtLeast"> & {offerBlockhashValid?: (hash: string) => Promise<boolean>; getClockAtLeast?:RpcLedger['getClockAtLeast']; getFinalizedBlockhashStatus?:RpcLedger['getFinalizedBlockhashStatus']}; orders: RestaurantOrders; reclaimJournal: SubmissionJournal; origin: string; merchantToken?: string; orderAdmission?: AdmissionJournal; b3Recovery?:B3Recovery; authorizeAbandonPolicy?:AuthorizeAbandonPolicy; authorizeAbandonPolicies?:readonly AuthorizeAbandonPolicy[]; authorizeIsolationPolicy?:InstalledIsolationPolicy; faucet?:FaucetProxy };
 
 export class RestaurantOrders {
   readonly dir: string;
@@ -206,6 +207,42 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
   });
   // SDK/provider errors can embed private credential URLs. Never echo them to the browser.
   app.onError((error, ctx) => ctx.json({ error: error instanceof RestaurantRefusal ? error.message : error.message.includes("ENOENT") ? "order unavailable" : error.message.includes("EEXIST") ? "action reserved; inspect original outcome before any new consent" : "Finalized RPC evidence unavailable or order conflict; refresh and inspect original signatures." }, 409));
+  if(c.faucet) {
+    app.use('/api/faucet/*',async(ctx,next)=>{
+      if(ctx.req.method==='POST') {
+        // A fresh visitor cannot evade the global UNKNOWN stop by using another
+        // wallet or cookie. Only the already reviewed exact historical isolation
+        // is excluded, after authenticating its unchanged original custody.
+        for(const name of readdirSync(c.orders.dir).filter(n=>/^[a-f0-9]{32}\.json$/.test(n))) {
+          const original=c.orders.read(name.slice(0,32));
+          if(original.status==='pending' || c.orders.busy(original.id)) {
+            if(!authorizeIsolationEvidence(c.authorizeIsolationPolicy,original,c.orders.path(original.id)))return ctx.json({error:'Original demo operation pending or unknown; new token claims stopped.'},409);
+          }
+        }
+      }
+      await next();
+    });
+    app.use('*',async(ctx,next)=>{
+      const path=ctx.req.path;
+      if((ctx.req.method==='POST' && (path==='/resource'||path.startsWith('/api/orders'))) ||
+        ctx.req.method==='GET' && /^\/api\/orders\/[^/]+\/(reclaim|signing-preflight)$/.test(path)) {
+        try {
+          const response=await c.faucet!.request('/health','GET');const state=await response.json() as {blocked?:boolean};
+          if(!response.ok || state.blocked!==false)return ctx.json({error:'Original faucet operation pending or unknown; all new economics stopped.'},409);
+        } catch {return ctx.json({error:'Faucet state unavailable; new economics paused. Inspect original receipts.'},503);}
+      }
+      await next();
+    });
+    const forward=async(path:string,method:'GET'|'POST',body?:unknown)=>{
+      try {
+        const response=await c.faucet!.request(path,method,body);
+        return new Response(response.body,{status:response.status,headers:{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'}});
+      } catch {return new Response(JSON.stringify({error:'Test-token response unavailable. Inspect the original request; do not repeat it.'}),{status:503,headers:{'Content-Type':'application/json','Cache-Control':'no-store'}});}
+    };
+    app.post('/api/faucet/challenge',async ctx=>forward('/challenge','POST',await ctx.req.json()));
+    app.post('/api/faucet/claim',async ctx=>forward('/claim','POST',await ctx.req.json()));
+    app.get('/api/faucet/claims/:id',ctx=>forward(`/claims/${ctx.req.param('id')}`,'GET'));
+  }
 
   async function publicSignatureStatus(signature: string, observation?:Awaited<ReturnType<RestaurantConfig['ledger']['getSignatureStatus']>>) {
     const status = observation ?? await originalStatus(c,signature);

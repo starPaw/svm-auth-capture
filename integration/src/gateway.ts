@@ -14,12 +14,14 @@ import { requireBearerToken } from "./auth.ts";
 import type { Facilitator } from "./facilitator.ts";
 import { requireSponsorshipBudget, SponsorshipGuard } from "./sponsorship.ts";
 import { isObject } from "./types.ts";
+import { createDevnetFaucetApp, type DevnetFaucet } from './devnet-faucet.ts';
 
 export type GatewayConfig = {
   bearerToken: string;
   sponsorship: SponsorshipGuard;
   /** The demo's one allowed merchant wallet (`payTo`) and asset mint; anything else is rejected. */
   allowlist: { merchant: Address; mint: Address };
+  faucet?: DevnetFaucet;
 };
 
 /** Rejects a `paymentRequirements.payTo`/`asset` outside the demo's fixed allowlist. */
@@ -46,6 +48,10 @@ export function createGatewayApp(facilitator: Facilitator, config: GatewayConfig
   gateway.use("/settle", requireBearerToken(config.bearerToken));
   gateway.use("/verify", requireAllowlisted(config.allowlist));
   gateway.use("/settle", requireAllowlisted(config.allowlist));
+  if(config.faucet) {
+    gateway.use('/settle',async(c,next)=>{if(config.faucet!.blocked())return c.json({error:'Original faucet operation pending or unknown; new economics stopped.'},409);await next();});
+    gateway.route('/faucet',createDevnetFaucetApp(config.faucet,config.bearerToken));
+  }
   gateway.use("/settle", requireSponsorshipBudget(config.sponsorship));
   gateway.route("/", createApp(facilitator));
   return gateway;
