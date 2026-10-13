@@ -20,6 +20,12 @@ export function stockCredentialDirectory(value: unknown): string {
   if (typeof value !== 'string' || !/^\/run\/credentials\/capture402-e2e-stock-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\.service$/.test(value)) throw Error('stock unit credentials required');
   return value;
 }
+export function validateStockCredential(s: {isFile():boolean;isSymbolicLink():boolean;nlink:number;uid:number;gid:number;mode:number}) {
+  // systemd255 uses root-owned0440 files with a read-only ACL for the service UID.
+  // The stock unit's private credential mount/path is checked separately.
+  if (!s.isFile() || s.isSymbolicLink() || s.nlink!==1 ||
+    !(s.uid===0 && s.gid===0 && (s.mode&0o777)===0o440 || s.uid===989 && s.gid===986 && (s.mode&0o777)===0o400)) throw Error('unsafe unit credential');
+}
 export function validateStockApproval(approved: Record<string,any>, sourceRevision: string, action: string) {
   if (approved.schema !== 1 || approved.sourceRevision !== sourceRevision || !/^[a-f0-9]{40}$/.test(sourceRevision) ||
     approved.sponsor !== '5mkvwgKeWMYrFppGm8ugLzQC9Wff4vduqWphsGhQNigX' ||
@@ -35,9 +41,11 @@ export async function stockOperatorMain(args = process.argv.slice(2)) {
   const action = stockArguments(args), directory = stockCredentialDirectory(process.env.CREDENTIALS_DIRECTORY);
   if (process.getuid?.() !== 989 || process.getgid?.() !== 986 || !/^[a-f0-9]{32}$/.test(process.env.INVOCATION_ID ?? '') ||
     !/^CapEff:\s+0+$/m.test(readFileSync('/proc/self/status','utf8'))) throw Error('existing E2E UID/GID and zero-capability unit required');
+  const mount=lstatSync(directory);
+  if(!mount.isDirectory() || mount.isSymbolicLink() || mount.uid!==0 || mount.gid!==0 || mount.mode&0o022)throw Error('untrusted private unit credential mount');
   const credential = (name: string) => {
     const path = `${directory}/${name}`, s = lstatSync(path);
-    if (!s.isFile() || s.isSymbolicLink() || s.nlink !== 1 || s.uid !== 989 || (s.mode & 0o777) !== 0o400) throw Error('unsafe unit credential');
+    validateStockCredential(s);
     return path;
   };
   const approved = JSON.parse(readFileSync(credential('stock-approval'),'utf8'));

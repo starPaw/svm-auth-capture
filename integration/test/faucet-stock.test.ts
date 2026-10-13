@@ -9,7 +9,7 @@ import { getCreateAccountInstruction } from '@solana-program/system';
 import { getCreateAssociatedTokenIdempotentInstruction, getInitializeMint2Instruction, getMintDecoder, getMintToInstruction, getTokenDecoder, getTokenEncoder } from '@solana-program/token';
 import { FailedTransactionMetadata, LiteSVM } from 'litesvm';
 import { FaucetStockOperator, STOCK_AMOUNT, STOCK_GENESIS, StockStore, type StockPlan } from '../operators/faucet-stock.ts';
-import { stockArguments, stockCredentialDirectory, validateStockApproval } from '../operators/faucet-stock-operator.ts';
+import { stockArguments, stockCredentialDirectory, validateStockApproval, validateStockCredential } from '../operators/faucet-stock-operator.ts';
 import { AdmissionJournal } from '../src/admission-journal.ts';
 import { CampaignBudget } from '../src/campaign-budget.ts';
 import type { FinalizedTransaction } from '../src/campaign-proof.ts';
@@ -206,4 +206,10 @@ test('stock CLI rejects implicit profiles, amounts, retries and foreign credenti
 test.each(['amount','maximumSpend','sponsor','sourceRevision','actions'])('stock action approval rejects changed %s before key access',field=>{
   const source='a'.repeat(40),a:Record<string,any>={schema:1,sourceRevision:source,sponsor:'5mkvwgKeWMYrFppGm8ugLzQC9Wff4vduqWphsGhQNigX',mint:'91wxVDcTEf5kRRRFmkUKohdNLFRAh5tw9YqWxV8FYvJp',browser:'93PtawNdAfDn7oTjRrbrJJMSgaFTjGS3wjtkrZSNGn74',genesisHash:STOCK_GENESIS,campaignReference:'owner-policy-2026-10-12-existing-10-sol-spend-cap-1-sol',amount:'100000000000',maximumSpend:'2139280',admissionMaximum:600,issueApprovalReference:'specific-stock-consent',actions:{issue:'specific-action'}};
   expect(()=>validateStockApproval(a,source,'issue')).not.toThrow();a[field]=field==='actions'?{quote:'quote-only'}:'changed';expect(()=>validateStockApproval(a,source,'issue')).toThrow();
+});
+test('accepts actual systemd255 root-owned read-only ACL credential and rejects writable/foreign custody',()=>{
+  const actual={isFile:()=>true,isSymbolicLink:()=>false,nlink:1,uid:0,gid:0,mode:0o440};
+  expect(()=>validateStockCredential(actual)).not.toThrow();
+  expect(()=>validateStockCredential({...actual,uid:989,gid:986,mode:0o400})).not.toThrow();
+  for(const change of [{mode:0o640},{mode:0o444},{uid:988},{gid:986},{nlink:2},{isSymbolicLink:()=>true}])expect(()=>validateStockCredential({...actual,...change})).toThrow();
 });
