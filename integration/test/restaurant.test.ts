@@ -414,6 +414,8 @@ describe("restaurant budget lifecycle", () => {
       {...UNRECORDED_A_POLICY,consentSha256:'a'.repeat(64)},{...EXPIRED_A_POLICY,extra:true},[EXPIRED_A_POLICY,UNRECORDED_A_POLICY,UNRECORDED_A_POLICY]]) {
       expect(()=>selectedAbandonPolicies(invalid)).toThrow('exceeds selected expired drafts');
     }
+    const legacy=Object.fromEntries(Object.entries(EXPIRED_A_POLICY).sort(([a],[b])=>a.localeCompare(b)));
+    expect(JSON.stringify(selectedAbandonPolicies([legacy,UNRECORDED_A_POLICY])[0])).toBe(JSON.stringify(legacy));
   });
   test.each([false,true])('explicit selected unfunded abandonment with policy list %s retains originals across restart and permits one separate offer',async policyList=>{
     const a=await expiredAuthorizeDraft(policyList);
