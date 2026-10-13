@@ -86,6 +86,18 @@ test("original P2-2 forged MessageEvent cannot establish the bundled SDK connect
   inject({ type: "event", event: { type: "disconnect" } }); expect(changed).toHaveBeenLastCalledWith(null);
   connection.off();
 });
+test('Solflare adapter exposes original recipient message signing through the trusted pinned transport',async()=>{
+  const promise=bundle.connectSolflareDevnet(()=>{});inject(connectMessage(h.payer.address));const connection=await promise;
+  const message=new TextEncoder().encode('Capture402 local message fixture');
+  const signing=connection.signMessage({account:connection.account,message});
+  const call=current().contentWindow!.postMessage.mock.calls.at(-1)![0].data;
+  expect(call.method).toBe('signMessage');
+  const signature=new Uint8Array(64).fill(7);
+  inject({type:'response',id:call.id,result:getBase58Decoder().decode(signature)});
+  const result=await signing;expect(result[0].signedMessage).toEqual(message);expect(result[0].signature).toEqual(signature);
+  await expect(connection.signMessage({account:{address:h.outsider.address},message})).rejects.toThrow(/recipient/);
+  connection.off();
+});
 test("trusted connect/accountChanged/disconnect and full/coordinate resize messages continue to work", async () => {
   await connected();
   const changed = vi.fn(), disconnected = vi.fn(); sdk.on("accountChanged", changed); sdk.on("disconnect", disconnected);

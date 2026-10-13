@@ -295,6 +295,7 @@ try {
     export const wallets=()=>[wallet];export const onWallets=()=>()=>{};
     export const connect=async()=>({wallet,account:{address:${JSON.stringify(info.merchant)}}});
     export const walletSign=async()=>{window.fixtureSigns=(window.fixtureSigns||0)+1;return 'signed-flow-stub-not-a-transaction';};
+    export const walletSignFaucetRequest=async()=>{throw new Error('Faucet is disabled in the reclaim fixture');};
     export const encodeEnvelope=x=>btoa(JSON.stringify(x));export const decodeEnvelope=x=>JSON.parse(atob(x));
     export const signingReport=()=>undefined;export const assertDevnetPolicy=()=>{};
   `}));
@@ -323,6 +324,42 @@ try {
   assert(await flow.locator('#new-budget').isVisible());
   check('Actual UI sequence separates consent and post-sign dispatch preflight, dispatches once and retains historical capture evidence');
   await flow.close();
+  // Separate DOM fixture: no actual wallet, signature, network or token transfer.
+  const faucetContext=await browser.newContext({ignoreHTTPSErrors:true}),faucetPage=await faucetContext.newPage();
+  let faucetPosts=0,faucetReads=0,faucetFinal=false;
+  const faucetId='d'.repeat(64),faucetSignature='1'.repeat(64);
+  const faucetResult=()=>({id:faucetId,recipient:info.merchant,amount:1000,mint:info.mint,status:faucetFinal?'finalized':'unknown',signature:faucetSignature,finalizedSlot:faucetFinal?'10':null});
+  await faucetPage.route('**/wallet.js',route=>route.fulfill({contentType:'text/javascript',body:`
+    const wallet={name:'Faucet DOM fixture; no cryptography'};
+    export const wallets=()=>[wallet];export const onWallets=()=>()=>{};
+    export const connect=async()=>({wallet,account:{address:${JSON.stringify(info.merchant)}}});
+    export const walletSign=async()=>{throw new Error('No transaction signing in faucet DOM fixture');};
+    export const walletSignFaucetRequest=async()=>{window.fixtureMessages=(window.fixtureMessages||0)+1;return 'unsigned-DOM-fixture-not-a-signature';};
+    export const encodeEnvelope=x=>btoa(JSON.stringify(x));export const decodeEnvelope=x=>JSON.parse(atob(x));
+    export const signingReport=()=>undefined;export const assertDevnetPolicy=()=>{};
+  `}));
+  await faucetPage.route('**/api/config',route=>route.fulfill({contentType:'application/json',body:JSON.stringify({...info,faucetEnabled:true})}));
+  await faucetPage.route('**/api/faucet/**',route=>{
+    const req=route.request(),path=new URL(req.url()).pathname;
+    if(path.endsWith('/challenge'))return route.fulfill({contentType:'application/json',body:JSON.stringify({id:faucetId,recipient:info.merchant})});
+    if(path.endsWith('/claim')){faucetPosts++;return route.abort();}
+    faucetReads++;return route.fulfill({contentType:'application/json',body:JSON.stringify(faucetResult())});
+  });
+  await faucetPage.goto(origin+'/customer');await faucetPage.waitForSelector('#faucet-panel',{state:'visible'});
+  assert(await faucetPage.locator('#claim-test-tokens').isDisabled());
+  await faucetPage.locator('#connect-wallet').click();await faucetPage.locator('#wallet-list button').first().click();
+  await faucetPage.locator('#claim-test-tokens').click();
+  await faucetPage.waitForFunction(()=>localStorage.getItem('capture402-faucet-original') && !document.getElementById('refresh-test-tokens').hidden);
+  assert.equal(faucetPosts,1);assert(await faucetPage.locator('#claim-test-tokens').isDisabled());assert(await faucetPage.locator('#authorize').isDisabled());
+  await faucetPage.reload();await faucetPage.waitForFunction(()=>document.getElementById('faucet-status').textContent.includes('UNKNOWN'));
+  assert.equal(faucetPosts,1);assert(faucetReads>=1);assert(await faucetPage.locator('#claim-test-tokens').isDisabled());
+  faucetFinal=true;await faucetPage.locator('#refresh-test-tokens').click();
+  await faucetPage.waitForFunction(()=>document.getElementById('faucet-status').textContent.includes('delivered'));
+  assert.equal(await faucetPage.evaluate(()=>localStorage.getItem('capture402-faucet-original')),null);
+  assert.equal(faucetPosts,1);assert(await faucetPage.locator('#faucet-receipt').isVisible());
+  assert.equal(await faucetPage.locator('#faucet-receipt').getAttribute('href'),`https://explorer.solana.com/tx/${faucetSignature}?cluster=devnet`);
+  check('Faucet DOM: message request, lost response/reload stop, read-only original observation and finalized receipt without a second POST');
+  await faucetContext.close();
   assert.equal(errors.length,0,errors.join('\n'));
   check('No browser page errors or external runtime requests');
   writeFileSync(join(output,'restaurant-browser-report.json'),JSON.stringify(report,null,2));

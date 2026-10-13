@@ -55,6 +55,24 @@ async function authorize(s: Session) {
 }
 const view = async (s: Session) => (await (await app.request(`${origin}/api/orders/${s.id}`, { headers: { cookie: s.cookie } })).json()) as any;
 const action = (s: Session, a: string) => app.request(`${origin}/api/orders/${s.id}/actions/${a}`, { method: "POST", headers: { authorization: `Bearer ${merchantToken}`, origin } });
+test('configured faucet UNKNOWN blocks new order, merchant signing and reclaim preparation while original reads remain available',async()=>{
+  const s=await offer();await authorize(s);const calls:string[]=[];
+  c.faucet={request:async(path)=>{calls.push(path);return new Response(JSON.stringify({blocked:true}),{headers:{'Content-Type':'application/json'}});}};
+  app=createRestaurantApp(c);const count=h.ledger.submissions.length;
+  expect((await action(s,'beer')).status).toBe(409);
+  expect((await app.request(`${origin}/api/orders`,{method:'POST',headers:{origin,'Content-Type':'application/json'},body:JSON.stringify({payer:h.payer.address})})).status).toBe(409);
+  expect((await app.request(`${origin}/api/orders/${s.id}/reclaim`,{headers:{cookie:s.cookie}})).status).toBe(409);
+  expect((await view(s)).id).toBe(s.id);expect(h.ledger.submissions).toHaveLength(count);expect(calls).toEqual(['/health','/health','/health']);
+});
+test('public faucet proxy preserves same-origin and body limits and never forwards private headers',async()=>{
+  const calls:any[]=[];
+  c.faucet={request:async(path,method,body)=>{calls.push({path,method,body});return new Response('{"status":"unknown"}',{headers:{'Content-Type':'application/json','Authorization':'must-not-reach-browser','Set-Cookie':'private-cookie'}});}};
+  app=createRestaurantApp(c);
+  const payload=JSON.stringify({recipient:h.payer.address});
+  expect((await app.request(`${origin}/api/faucet/challenge`,{method:'POST',body:payload})).status).toBe(403);expect(calls).toHaveLength(0);
+  const response=await app.request(`${origin}/api/faucet/challenge`,{method:'POST',headers:{origin,'Content-Type':'application/json'},body:payload});
+  expect(response.status).toBe(200);expect(response.headers.get('Authorization')).toBeNull();expect(response.headers.get('Set-Cookie')).toBeNull();expect(calls).toEqual([{path:'/challenge',method:'POST',body:{recipient:h.payer.address}}]);
+});
 async function expectAction(s: Session, a: string) {
   const r = await action(s, a); const body = await r.json() as any;
   expect(body, JSON.stringify(body)).toMatchObject({ receipt: { success: true } }); expect(r.status).toBe(200);

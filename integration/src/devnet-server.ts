@@ -8,7 +8,7 @@ import { rpcBackend } from '../operators/e2e-provision.ts';
 // gateway applies bearer authentication, a merchant/mint allowlist, and a sponsorship
 // attempt/balance cap in front of every facilitator route (`gateway.ts`), but it must still
 // never be exposed publicly (ARCHITECTURE).
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { serve } from "@hono/node-server";
 import { type Address, createKeyPairSignerFromBytes, type KeyPairSigner } from "@solana/kit";
 import { ACCEPTED_DEPLOYMENT_RECORD, loadDeploymentRecord } from "./deployment-record.ts";
@@ -19,7 +19,10 @@ import { redactRpcUrl, RpcLedger } from "./rpc-ledger.ts";
 import { SponsorshipGuard } from "./sponsorship.ts";
 import { FileSubmissionJournal } from "./submission-journal.ts";
 import { AdmissionJournal } from './admission-journal.ts';
-import { requireE2eRuntimeRpc } from './e2e-runtime-policy.ts';
+import { requireE2eRuntimeRpc, trustedRuntimeFile } from './e2e-runtime-policy.ts';
+import { DevnetFaucetStore, type FaucetPolicy } from './devnet-faucet-store.ts';
+import { DevnetFaucet } from './devnet-faucet.ts';
+import { ata } from './program.ts';
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -48,13 +51,14 @@ async function main(): Promise<void> {
   // The exact co-signed bytes, signature, and blockhash of every broadcast are written here first.
   const journal = new FileSubmissionJournal(requireEnv("SAC006_FACILITATOR_JOURNAL_DIR"));
   // Binding to the E2E sponsor prevents a missing/renamed environment profile bypass.
-  let sponsorBudget, admission;
+  let sponsorBudget, admission, campaignBudget:CampaignBudget|undefined;
   if (e2e) {
     const directory = '/var/lib/capture402-e2e/facilitator/campaign-budget';
     const policy = JSON.parse(readFileSync(`${directory}/policy.json`,'utf8')) as CampaignPolicy;
     if (policy.sponsor !== feePayer.address || policy.browser !== '93PtawNdAfDn7oTjRrbrJJMSgaFTjGS3wjtkrZSNGn74' || policy.genesisHash !== record.network.genesisHash) throw Error('E2E campaign policy/runtime mismatch');
     requireE2eRuntimeRpc(rpcUrl,record);
-    sponsorBudget = campaignSponsorship(new CampaignBudget(directory,policy),rpcBackend(record,rpcUrl));
+    campaignBudget=new CampaignBudget(directory,policy);
+    sponsorBudget = campaignSponsorship(campaignBudget,rpcBackend(record,rpcUrl));
     admission = new AdmissionJournal(requireEnv('SAC006_E2E_RELAY_ADMISSION_DIR'),'relay-attempts',Number(requireEnv('SAC006_SPONSOR_MAX_ATTEMPTS')));
   }
   const facilitator = new Facilitator({ network: record.network.caip2, programId: record.programId, feePayer, ledger, journal, sponsorBudget, observationKey: requireEnv("SAC006_BEARER_TOKEN"), ...demoSponsorComputeBounds() });
@@ -65,9 +69,23 @@ async function main(): Promise<void> {
     minLamportsBalance: BigInt(process.env.SAC006_SPONSOR_MIN_LAMPORTS ?? "10000000"), // 0.01 SOL
     admission,
   });
+  let faucet:DevnetFaucet|undefined;
+  const faucetDirectory='/var/lib/capture402-e2e/facilitator/faucet';
+  const faucetPolicyPath=process.env.SAC006_E2E_FAUCET_POLICY_PATH;
+  if(e2e && existsSync(faucetDirectory) && !faucetPolicyPath)throw Error('existing faucet custody requires its compatible configured reader');
+  if(faucetPolicyPath) {
+    if(!e2e || !campaignBudget || !admission || requireEnv('SAC006_SPONSOR_MAX_ATTEMPTS')!=='600')throw Error('faucet is restricted to the reviewed E2E campaign');
+    const policy=JSON.parse(trustedRuntimeFile(faucetPolicyPath)) as FaucetPolicy;
+    if(policy.sponsor!==feePayer.address || policy.mint!=='91wxVDcTEf5kRRRFmkUKohdNLFRAh5tw9YqWxV8FYvJp' ||
+      policy.mint!==requireEnv('SAC006_ALLOWLIST_MINT') || policy.pool!==await ata(feePayer.address,policy.mint) || policy.origin!=='https://e2e.capture402.xyz')throw Error('faucet policy exceeds existing E2E identities');
+    const store=new DevnetFaucetStore(faucetDirectory,policy);
+    faucet=new DevnetFaucet({store,sponsor:feePayer,ledger,backend:rpcBackend(record,rpcUrl),budget:campaignBudget,admission:sponsorship,
+      latest:()=>ledger.latestBlockhash(),challengeKey:requireEnv('SAC006_BEARER_TOKEN'),bearerToken:requireEnv('SAC006_BEARER_TOKEN')});
+  }
   const app = createGatewayApp(facilitator, {
     bearerToken: requireEnv("SAC006_BEARER_TOKEN"),
     sponsorship,
+    ...(faucet?{faucet}:{}),
     allowlist: {
       merchant: requireEnv("SAC006_ALLOWLIST_MERCHANT") as Address,
       mint: requireEnv("SAC006_ALLOWLIST_MINT") as Address,
