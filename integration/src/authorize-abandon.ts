@@ -14,6 +14,19 @@ export type AuthorizeAbandonPolicy = { schema:1; sourceSha:string; order:string;
 export const EXPIRED_A_POLICY:AuthorizeAbandonPolicy = Object.freeze({schema:1,sourceSha:'16efce98bf2347e21d7883ce997998dc4564e178',
   order:'c0cb6e3f3adc7709a29f542578800b7a',payment:'CrMkRKeJakv8e7SV8qzo7ssDZize5dYUGsFrV8x1ZScV',payer:'93PtawNdAfDn7oTjRrbrJJMSgaFTjGS3wjtkrZSNGn74',
   orderSha256:'b8abf60bb11c10f3b2b78d06ee0e2b148fd86bad98ffa1c1906ccdfe724ad2e0',consentSha256:'48f7b0a5d11ba850e40b2630ac68e831bece0f1c59150f4a8f1fb3a839ba4073'});
+export const UNRECORDED_A_POLICY:AuthorizeAbandonPolicy = Object.freeze({schema:1,sourceSha:'f052a820d1b124c4c20992c651a84bc742a1a94d',
+  order:'7b75e467ac40c39f974cc354c12ce4b8',payment:'DNEM6ymcatP4ADyC1uWMLh5aXKGnamToGnjAgK6AfmA1',payer:'93PtawNdAfDn7oTjRrbrJJMSgaFTjGS3wjtkrZSNGn74',
+  orderSha256:'c5296b427b3ceadd9469dc42a59e6a74fbf9bf9e953a143d2ec92d1b2869975c',consentSha256:'5466e14d799367447eb9f2e7b29959d75548999caf2bf3c227696bc18831189d'});
+// Preserve the original selected policy as well as its immutable archive. A
+// root-trusted list may add only this second exact, never-dispatched A draft.
+export function selectedAbandonPolicies(value:unknown):readonly AuthorizeAbandonPolicy[] {
+  const policies=Array.isArray(value)?value:[value],selected=[EXPIRED_A_POLICY,UNRECORDED_A_POLICY];
+  if(!policies.length || policies.length>selected.length || policies.some(p=>!p || typeof p!=='object' || Array.isArray(p) ||
+    !selected.some(s=>Object.keys(p).sort().join()===Object.keys(s).sort().join() && Object.entries(s).every(([k,v])=>p[k]===v))) ||
+    new Set(policies.map(p=>p.order)).size!==policies.length ||
+    policies.some(p=>p.order===UNRECORDED_A_POLICY.order) && !policies.some(p=>p.order===EXPIRED_A_POLICY.order)) throw Error('Authorize abandonment policy exceeds selected expired drafts');
+  return policies;
+}
 type Draft = {id:string;payment:Address;payer:Address;status:string;unsigned:string;authorizeLifetime?:LifetimeObservation;events:unknown[]};
 export function abandonmentCustody(policy:AuthorizeAbandonPolicy|undefined, order:Draft, path:string) {
   if(!policy || policy.schema!==1 || !/^[a-f0-9]{40}$/.test(policy.sourceSha) || policy.order!==order.id || policy.payment!==order.payment || policy.payer!==order.payer ||

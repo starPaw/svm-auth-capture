@@ -3,7 +3,7 @@ import { mkdtempSync, readdirSync, readFileSync, writeFileSync,renameSync,exists
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from 'node:crypto';
-import { EXPIRED_A_POLICY } from '../src/authorize-abandon.ts';
+import { EXPIRED_A_POLICY,UNRECORDED_A_POLICY,selectedAbandonPolicies } from '../src/authorize-abandon.ts';
 import { getBase64Encoder, getTransactionDecoder, partiallySignTransaction, getSignatureFromTransaction, getCompiledTransactionMessageDecoder, getBase64EncodedWireTransaction, type Address } from "@solana/kit";
 import { getMintToInstruction, getTransferInstruction } from "@solana-program/token";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
@@ -389,7 +389,8 @@ describe("restaurant budget lifecycle", () => {
     const r=await app.request(`${origin}/api/orders`,{method:'POST',headers:{cookie:s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({payer:h.payer.address})});
     expect(r.status).toBe(409);expect(h.ledger.submissions).toHaveLength(0);
   });
-  async function expiredAuthorizeDraft() {
+  async function expiredAuthorizeDraft(policyList=false) {
+    const started=await c.now();
     c.getLatestBlockhash=async()=>({...h.lifetime(),blockhashSlot:1n,commitment:'finalized' as const,network:c.network,genesisHash:'local-genesis'});
     const s=await offer();
     const consent=await app.request(`${origin}/api/orders/${s.id}/wallet-consent`,{method:'POST',headers:{cookie:s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({unsignedSha256:createHash('sha256').update(s.unsigned).digest('hex')})});expect(consent.status).toBe(200);
@@ -397,16 +398,27 @@ describe("restaurant budget lifecycle", () => {
     // First-party lifetime provenance fixture, not a live origin claim.
     stored.authorizeLifetime={version:1,messageHash:(await import('../src/submission-journal.ts')).messageHash(getTransactionDecoder().decode(getBase64Encoder().encode(s.unsigned)).messageBytes),blockhash:h.lifetime().blockhash,lastValidBlockHeight:h.lifetime().lastValidBlockHeight.toString(),contextSlot:'1',commitment:'finalized',network:c.network,genesisHash:'local-genesis'};c.orders.write(stored);
     const original=readFileSync(path,'utf8'),consentBytes=readFileSync(`${path}.wallet-consent.lock`,'utf8');
-    c.authorizeAbandonPolicy={...EXPIRED_A_POLICY,order:s.id,payment:stored.payment,payer:stored.payer,orderSha256:createHash('sha256').update(original).digest('hex'),consentSha256:createHash('sha256').update(consentBytes).digest('hex')};
-    h.setTime(NOW+190n);h.svm.expireBlockhash();
+    const policy={...EXPIRED_A_POLICY,order:s.id,payment:stored.payment,payer:stored.payer,orderSha256:createHash('sha256').update(original).digest('hex'),consentSha256:createHash('sha256').update(consentBytes).digest('hex')};
+    if(policyList){delete c.authorizeAbandonPolicy;c.authorizeAbandonPolicies=[EXPIRED_A_POLICY,policy];}else c.authorizeAbandonPolicy=policy;
+    h.setTime(started+190n);h.svm.expireBlockhash();
     c.ledger.getFinalizedBlockhashStatus=async()=>({kind:'ok',valid:false,slot:5n});
     c.ledger.getAccountAtLeast=async address=>({kind:'ok',slot:6n,account:await h.ledger.getAccount(address)});
-    c.ledger.getClockAtLeast=async()=>({kind:'ok',commitment:'finalized',slot:7n,unixTimestamp:NOW+190n});
+    c.ledger.getClockAtLeast=async()=>({kind:'ok',commitment:'finalized',slot:7n,unixTimestamp:started+190n});
     app=createRestaurantApp(c);
-    return {s,path,original,consentBytes,abandon:()=>app.request(`${origin}/api/orders/${s.id}/abandon-authorize`,{method:'POST',headers:{cookie:s.cookie,origin}})};
+    return {s,path,original,consentBytes,policy,abandon:()=>app.request(`${origin}/api/orders/${s.id}/abandon-authorize`,{method:'POST',headers:{cookie:s.cookie,origin}})};
   }
-  test('explicit selected unfunded abandonment retains original bytes, survives restart and permits only a separate new offer',async()=>{
-    const a=await expiredAuthorizeDraft();
+  test('runtime selector retains the legacy policy and accepts only the two exact selected drafts',()=>{
+    expect(selectedAbandonPolicies(EXPIRED_A_POLICY)).toEqual([EXPIRED_A_POLICY]);
+    expect(selectedAbandonPolicies([EXPIRED_A_POLICY,UNRECORDED_A_POLICY])).toEqual([EXPIRED_A_POLICY,UNRECORDED_A_POLICY]);
+    for(const invalid of [null,[],UNRECORDED_A_POLICY,[UNRECORDED_A_POLICY],[EXPIRED_A_POLICY,EXPIRED_A_POLICY],{...UNRECORDED_A_POLICY,order:'a'.repeat(32)},
+      {...UNRECORDED_A_POLICY,consentSha256:'a'.repeat(64)},{...EXPIRED_A_POLICY,extra:true},[EXPIRED_A_POLICY,UNRECORDED_A_POLICY,UNRECORDED_A_POLICY]]) {
+      expect(()=>selectedAbandonPolicies(invalid)).toThrow('exceeds selected expired drafts');
+    }
+    const legacy=Object.fromEntries(Object.entries(EXPIRED_A_POLICY).sort(([a],[b])=>a.localeCompare(b)));
+    expect(JSON.stringify(selectedAbandonPolicies([legacy,UNRECORDED_A_POLICY])[0])).toBe(JSON.stringify(legacy));
+  });
+  test.each([false,true])('explicit selected unfunded abandonment with policy list %s retains originals across restart and permits one separate offer',async policyList=>{
+    const a=await expiredAuthorizeDraft(policyList);
     const r=await a.abandon();expect(r.status).toBe(200);expect(await r.json()).toMatchObject({abandoned:true,proof:{kind:'expired-unfunded-authorize',originSlot:'1',expirySlot:'5',paymentSlot:'6',clockSlot:'7'}});
     expect(readFileSync(a.path,'utf8')).toBe(a.original);expect(readFileSync(`${a.path}.wallet-consent.lock`,'utf8')).toBe(a.consentBytes);
     const archive=readFileSync(`${a.path}.authorize-abandon.lock`,'utf8');expect(JSON.parse(archive)).toMatchObject({originalOrder:a.original,originalConsent:a.consentBytes});
@@ -414,15 +426,17 @@ describe("restaurant budget lifecycle", () => {
     const v=await view(a.s);expect(v).toMatchObject({status:'abandoned',authorizeAbandoned:{kind:'expired-unfunded-authorize'}});expect(v.unsigned).toBeUndefined();
     expect((await a.abandon()).status).toBe(409);
     expect((await app.request(`${origin}/api/orders/${a.s.id}/signing-preflight?operation=authorize`,{headers:{cookie:a.s.cookie}})).status).toBe(409);
+    const otherPayer=await app.request(`${origin}/api/orders`,{method:'POST',headers:{cookie:a.s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({payer:h.server.address})});
+    expect(otherPayer.status).toBe(409);expect(existsSync(`${a.path}.authorize-successor.lock`)).toBe(false);
     const next=await app.request(`${origin}/api/orders`,{method:'POST',headers:{cookie:a.s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({payer:h.payer.address,scenario:'normal'})});expect(next.status).toBe(402);
     const body=await next.json() as any;expect(body.order).not.toBe(a.s.id);expect(body.required.accepts[0].extra.captureDeadline).toBe(Number(NOW+340n));
     expect(readFileSync(a.path,'utf8')).toBe(a.original);expect(readFileSync(`${a.path}.authorize-abandon.lock`,'utf8')).toBe(archive);expect(h.ledger.submissions).toHaveLength(0);
   });
-  test.each(['no-policy','wrong-order','wrong-identity','order-drift','consent-drift','valid-hash','unavailable','stale-expiry','stale-payment','stale-clock','before-deadline','existing-PDA','pending','event','dispatch-lock','operation-journal','submission-journal','partial-archive','signed-wire','wrong-wire','missing-origin'])('authorize abandonment refuses %s without modifying originals or sending',async failure=>{
-    const a=await expiredAuthorizeDraft();
-    if(failure==='no-policy')delete c.authorizeAbandonPolicy;
-    if(failure==='wrong-order')c.authorizeAbandonPolicy!.order='0'.repeat(32);
-    if(failure==='wrong-identity')c.authorizeAbandonPolicy!.payer=h.server.address;
+  test.each(['no-policy','wrong-order','wrong-identity','order-drift','consent-drift','valid-hash','unavailable','stale-expiry','stale-payment','stale-clock','before-deadline','existing-PDA','pending','event','dispatch-lock','operation-journal','submission-journal','partial-archive','signed-wire','wrong-wire','missing-origin'].flatMap(failure=>[false,true].map(policyList=>[policyList,failure] as const)))('authorize abandonment with policy list %s refuses %s without modifying originals or sending',async (policyList,failure)=>{
+    const a=await expiredAuthorizeDraft(policyList);
+    if(failure==='no-policy'){delete c.authorizeAbandonPolicy;delete c.authorizeAbandonPolicies;}
+    if(failure==='wrong-order')a.policy.order='0'.repeat(32);
+    if(failure==='wrong-identity')a.policy.payer=h.server.address;
     if(failure==='valid-hash')c.ledger.getFinalizedBlockhashStatus=async()=>({kind:'ok',valid:true,slot:5n});
     if(failure==='unavailable')c.ledger.getFinalizedBlockhashStatus=async()=>({kind:'unavailable',detail:'fixture'});
     if(failure==='stale-expiry')c.ledger.getFinalizedBlockhashStatus=async()=>({kind:'ok',valid:false,slot:1n});
@@ -441,9 +455,9 @@ describe("restaurant budget lifecycle", () => {
     if(failure==='order-drift')order.required.accepts[0]!.extra!.captureDeadline=1;
     c.orders.write(order);
     if(['signed-wire','wrong-wire','missing-origin'].includes(failure)) {
-      c.authorizeAbandonPolicy!.orderSha256=createHash('sha256').update(readFileSync(a.path)).digest('hex');
+      a.policy.orderSha256=createHash('sha256').update(readFileSync(a.path)).digest('hex');
       (await import('node:fs')).writeFileSync(`${a.path}.wallet-consent.lock`,JSON.stringify({order:order.id,unsignedSha256:createHash('sha256').update(order.unsigned).digest('hex')}));
-      c.authorizeAbandonPolicy!.consentSha256=createHash('sha256').update(readFileSync(`${a.path}.wallet-consent.lock`)).digest('hex');
+      a.policy.consentSha256=createHash('sha256').update(readFileSync(`${a.path}.wallet-consent.lock`)).digest('hex');
     }
     if(failure==='consent-drift')(await import('node:fs')).writeFileSync(`${a.path}.wallet-consent.lock`,'{}');
     if(failure==='dispatch-lock')createDurableFile(`${a.path}.authorize.lock`,'original');
@@ -451,34 +465,48 @@ describe("restaurant budget lifecycle", () => {
     const before=readFileSync(a.path),consent=readFileSync(`${a.path}.wallet-consent.lock`);
     expect((await a.abandon()).status).toBe(409);expect(readFileSync(a.path)).toEqual(before);expect(readFileSync(`${a.path}.wallet-consent.lock`)).toEqual(consent);expect(h.ledger.submissions).toHaveLength(0);
   });
-  test('partial abandonment archive and busy reservation remain blocked across restart',async()=>{
-    const a=await expiredAuthorizeDraft();createDurableFile(`${a.path}.authorize-abandon.lock`,'{"schema":1}');
+  test('two selected classifications retain both archives and fail closed when either selection is lost or duplicated',async()=>{
+    const first=await expiredAuthorizeDraft();expect((await first.abandon()).status).toBe(200);
+    const archive=readFileSync(`${first.path}.authorize-abandon.lock`);
+    const second=await expiredAuthorizeDraft();delete c.authorizeAbandonPolicy;c.authorizeAbandonPolicies=[first.policy,second.policy];
+    app=createRestaurantApp(c);expect((await view(first.s)).status).toBe('abandoned');expect((await view(second.s)).authorizeAbandonEligible).toBe(true);
+    expect((await second.abandon()).status).toBe(200);
+    app=createRestaurantApp({...c,orders:new RestaurantOrders(c.orders.dir)});
+    expect((await view(first.s)).status).toBe('abandoned');expect((await view(second.s)).status).toBe('abandoned');
+    expect(readFileSync(`${first.path}.authorize-abandon.lock`)).toEqual(archive);expect(readFileSync(first.path,'utf8')).toBe(first.original);
+    c.authorizeAbandonPolicies=[second.policy];app=createRestaurantApp(c);
+    expect((await app.request(`${origin}/api/orders/${first.s.id}`,{headers:{cookie:first.s.cookie}})).status).toBe(409);
+    c.authorizeAbandonPolicies=[first.policy,second.policy,second.policy];app=createRestaurantApp(c);
+    expect((await second.abandon()).status).toBe(409);expect(h.ledger.submissions).toHaveLength(0);
+  });
+  test.each([false,true])('partial abandonment archive and busy reservation remain blocked across restart (policy list %s)',async policyList=>{
+    const a=await expiredAuthorizeDraft(policyList);createDurableFile(`${a.path}.authorize-abandon.lock`,'{"schema":1}');
     app=createRestaurantApp({...c,orders:new RestaurantOrders(c.orders.dir)});
     expect((await app.request(`${origin}/api/orders/${a.s.id}`,{headers:{cookie:a.s.cookie}})).status).toBe(409);
     expect((await app.request(`${origin}/api/orders`,{method:'POST',headers:{cookie:a.s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({payer:h.payer.address})})).status).toBe(409);
     expect((await a.abandon()).status).toBe(409);expect(h.ledger.submissions).toHaveLength(0);
   });
-  test('concurrent successor offers reserve exactly one; partial intent blocks after restart',async()=>{
-    const a=await expiredAuthorizeDraft();expect((await a.abandon()).status).toBe(200);
+  test.each([false,true])('concurrent successor offers reserve exactly one; partial intent blocks after restart (policy list %s)',async policyList=>{
+    const a=await expiredAuthorizeDraft(policyList);expect((await a.abandon()).status).toBe(200);
     const next=()=>app.request(`${origin}/api/orders`,{method:'POST',headers:{cookie:a.s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({payer:h.payer.address,scenario:'normal'})});
     const results=await Promise.all([next(),next()]);expect(results.map(r=>r.status).sort()).toEqual([402,409]);
     const intent=JSON.parse(readFileSync(`${a.path}.authorize-successor.lock`,'utf8'));
     expect(intent.previousOrder).toBe(a.s.id);expect(c.orders.read(intent.nextOrder).status).toBe('draft');
     app=createRestaurantApp({...c,orders:new RestaurantOrders(c.orders.dir)});expect((await next()).status).toBe(409);expect((await view(a.s)).status).toBe('pending');expect(h.ledger.submissions).toHaveLength(0);
   });
-  test('partial successor reservation blocks new offer without fabricating a completed successor',async()=>{
-    const a=await expiredAuthorizeDraft();await a.abandon();createDurableFile(`${a.path}.authorize-successor.lock`,'{');
+  test.each([false,true])('partial successor reservation blocks new offer without fabricating a completed successor (policy list %s)',async policyList=>{
+    const a=await expiredAuthorizeDraft(policyList);await a.abandon();createDurableFile(`${a.path}.authorize-successor.lock`,'{');
     app=createRestaurantApp({...c,orders:new RestaurantOrders(c.orders.dir)});
     expect((await view(a.s)).status).toBe('pending');
     expect((await app.request(`${origin}/api/orders`,{method:'POST',headers:{cookie:a.s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({payer:h.payer.address})})).status).toBe(409);expect(h.ledger.submissions).toHaveLength(0);
   });
-  test('retained busy abandonment reservation cannot be reused after restart',async()=>{
-    const a=await expiredAuthorizeDraft();c.orders.reserve(a.s.id,'authorize');
+  test.each([false,true])('retained busy abandonment reservation cannot be reused after restart (policy list %s)',async policyList=>{
+    const a=await expiredAuthorizeDraft(policyList);c.orders.reserve(a.s.id,'authorize');
     app=createRestaurantApp({...c,orders:new RestaurantOrders(c.orders.dir)});
     expect((await a.abandon()).status).toBe(409);expect(c.orders.busy(a.s.id)).toBe(true);expect((await view(a.s)).authorizeAbandonEligible).toBe(false);expect(h.ledger.submissions).toHaveLength(0);
   });
-  test('abandonment serializes against concurrent abandonment and fresh consent',async()=>{
-    const a=await expiredAuthorizeDraft();let entered!:()=>void,release!:(v:any)=>void;const started=new Promise<void>(r=>entered=r),waiting=new Promise<any>(r=>release=r);
+  test.each([false,true])('abandonment serializes against concurrent abandonment and fresh consent (policy list %s)',async policyList=>{
+    const a=await expiredAuthorizeDraft(policyList);let entered!:()=>void,release!:(v:any)=>void;const started=new Promise<void>(r=>entered=r),waiting=new Promise<any>(r=>release=r);
     c.ledger.getFinalizedBlockhashStatus=async()=>{entered();return waiting;};const first=a.abandon();await started;
     expect((await a.abandon()).status).toBe(409);
     expect((await app.request(`${origin}/api/orders/${a.s.id}/wallet-consent`,{method:'POST',headers:{cookie:a.s.cookie,origin,'content-type':'application/json'},body:JSON.stringify({unsignedSha256:createHash('sha256').update(a.s.unsigned).digest('hex')})})).status).toBe(409);
