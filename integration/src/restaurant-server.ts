@@ -20,10 +20,11 @@ import { E2E_SPONSOR, requireE2eRuntimeRpc, trustedRuntimeFile } from './e2e-run
 import { validateFaucetPolicy, type FaucetPolicy } from './devnet-faucet-store.ts';
 import { devnetFaucetProxy } from './devnet-faucet-proxy.ts';
 import { ata } from './program.ts';
+import {validateMerchantDemoPolicy,E2E_MERCHANT_DEMO_POLICY} from './merchant-demo.ts';
 
 export const DEMO_TIMING = { captureSeconds: 150, refundSecondsAfterCapture: 30 } as const;
 const root = fileURLToPath(new URL("../web/", import.meta.url));
-export function createPresentationApp(info: { programId: string; network: string; configured: boolean; reason?: string; sponsor?: string; merchant?: string; mint?: string; faucetEnabled?:boolean }, backend?: Hono): Hono {
+export function createPresentationApp(info: { programId: string; network: string; configured: boolean; reason?: string; sponsor?: string; merchant?: string; mint?: string; faucetEnabled?:boolean; publicMerchantDemoEnabled?:boolean }, backend?: Hono): Hono {
   const app = new Hono();
   app.use("*", async (c, next) => {
     c.header("X-Content-Type-Options", "nosniff");
@@ -91,8 +92,16 @@ async function main() {
         ...(authorizeIsolationPolicy ? {authorizeIsolationPolicy} : {}),
         now:() => ledger.now() } : {}),
     };
+    const demoPolicyPath=process.env.SAC006_E2E_PUBLIC_MERCHANT_DEMO_POLICY_PATH;
+    if(demoPolicyPath) {
+      if(!e2e || process.env.SAC006_E2E_MAX_ORDERS!=='100')throw Error('public merchant demo restricted to bounded E2E');
+      validateMerchantDemoPolicy(JSON.parse(trustedRuntimeFile(demoPolicyPath)));
+      const p=E2E_MERCHANT_DEMO_POLICY;
+      if(config.origin!==p.origin || config.network!==p.network || config.programId!==p.programId || config.feePayer!==p.sponsor || server.address!==p.merchant || config.asset!==p.mint)throw Error('public merchant demo runtime identity differs');
+      config.publicMerchantDemo=true;
+    }
     backend = createRestaurantApp(config); info.configured = true;
-    Object.assign(info, { sponsor: config.feePayer, merchant: server.address, mint: config.asset, reason: undefined,...(faucet?{faucetEnabled:true}:{}) });
+    Object.assign(info, { sponsor: config.feePayer, merchant: server.address, mint: config.asset, reason: undefined,...(faucet?{faucetEnabled:true}:{}),...(config.publicMerchantDemo?{publicMerchantDemoEnabled:true}:{}) });
   }
   console.log(missing.length ? `Restaurant UI available; missing configuration: ${missing.join(", ")}` : "Restaurant backend enabled against accepted Devnet deployment");
   serve({ fetch: createPresentationApp(info, backend).fetch, hostname: process.env.SAC006_HOST ?? "127.0.0.1", port: Number(process.env.SAC006_RESOURCE_PORT ?? 8788) });

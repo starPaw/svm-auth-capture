@@ -295,6 +295,7 @@ try {
     export const wallets=()=>[wallet];export const onWallets=()=>()=>{};
     export const connect=async()=>({wallet,account:{address:${JSON.stringify(info.merchant)}}});
     export const walletSign=async()=>{window.fixtureSigns=(window.fixtureSigns||0)+1;return 'signed-flow-stub-not-a-transaction';};
+    export const walletSignMerchantDemo=async()=>{throw new Error('Merchant demo is disabled in this fixture');};
     export const walletSignFaucetRequest=async()=>{throw new Error('Faucet is disabled in the reclaim fixture');};
     export const encodeEnvelope=x=>btoa(JSON.stringify(x));export const decodeEnvelope=x=>JSON.parse(atob(x));
     export const signingReport=()=>undefined;export const assertDevnetPolicy=()=>{};
@@ -334,6 +335,7 @@ try {
     export const wallets=()=>[wallet];export const onWallets=()=>()=>{};
     export const connect=async()=>({wallet,account:{address:${JSON.stringify(info.merchant)}}});
     export const walletSign=async()=>{throw new Error('No transaction signing in faucet DOM fixture');};
+    export const walletSignMerchantDemo=async()=>{throw new Error('Merchant demo is disabled in this fixture');};
     export const walletSignFaucetRequest=async()=>{window.fixtureMessages=(window.fixtureMessages||0)+1;return 'unsigned-DOM-fixture-not-a-signature';};
     export const encodeEnvelope=x=>btoa(JSON.stringify(x));export const decodeEnvelope=x=>JSON.parse(atob(x));
     export const signingReport=()=>undefined;export const assertDevnetPolicy=()=>{};
@@ -360,6 +362,47 @@ try {
   assert.equal(await faucetPage.locator('#faucet-receipt').getAttribute('href'),`https://explorer.solana.com/tx/${faucetSignature}?cluster=devnet`);
   check('Faucet DOM: message request, lost response/reload stop, read-only original observation and finalized receipt without a second POST');
   await faucetContext.close();
+  // Public demo orchestration only: synthetic readable consent, no cryptography.
+  const demoContext=await browser.newContext({ignoreHTTPSErrors:true,viewport:{width:390,height:844}}),demoPage=await demoContext.newPage();
+  let demoPosts=0,demoMessages=0,demoChallenge=0,demoHeader='';const demoState=held();
+  demoPage.on('pageerror',error=>errors.push(error.message));
+  await demoPage.addInitScript(id=>localStorage.setItem('capture402-order',id),id);
+  await demoPage.route('**/api/config',r=>r.fulfill({contentType:'application/json',body:JSON.stringify({...info,publicMerchantDemoEnabled:true})}));
+  await demoPage.route('**/wallet.js',r=>r.fulfill({contentType:'text/javascript',body:`
+    const wallet={name:'Public demo fixture wallet; no cryptography'};
+    export const wallets=()=>[wallet];export const onWallets=()=>()=>{};
+    export const connect=async()=>({wallet,account:{address:${JSON.stringify(info.merchant)}}});
+    export const walletSign=async()=>{throw Error('Transaction signing disabled in fixture');};
+    export const walletSignMerchantDemo=async()=>{window.demoMessages=(window.demoMessages||0)+1;return 'synthetic-message-proof';};
+    export const walletSignFaucetRequest=async()=>{throw Error('Faucet disabled');};
+    export const encodeEnvelope=x=>btoa(JSON.stringify(x));export const decodeEnvelope=x=>JSON.parse(atob(x));
+    export const signingReport=()=>undefined;export const assertDevnetPolicy=()=>{};
+  `}));
+  await demoPage.route('**/api/orders**',r=>{
+    const req=r.request(),path=new URL(req.url()).pathname;
+    if(path.endsWith('/merchant-demo')){demoChallenge++;assert.equal(req.method(),'POST');return r.fulfill({contentType:'application/json',body:JSON.stringify({token:'synthetic-order-challenge',expiresAt:demoState.refundDeadline})});}
+    if(path.includes('/actions/')){
+      assert(req.headers().authorization.startsWith('Demo '));demoHeader=req.headers().authorization;
+      if(req.method()==='GET')return r.fulfill({contentType:'application/json',body:JSON.stringify({...demoState,operatorAccess:true})});
+      demoPosts++;return r.abort();
+    }
+    return r.fulfill({contentType:'application/json',body:JSON.stringify(demoState)});
+  });
+  await demoPage.goto(origin+'/customer');await demoPage.waitForSelector('#enable-demo-controls',{state:'visible'});
+  assert(await demoPage.locator('#operator-credentials').isHidden());assert(await demoPage.locator('#enable-demo-controls').isDisabled());
+  await demoPage.locator('#connect-wallet').click();await demoPage.locator('#wallet-list button').first().click();
+  await demoPage.locator('#enable-demo-controls').click();await demoPage.waitForFunction(()=>!document.querySelector('[data-action=beer]').disabled);
+  demoMessages=await demoPage.evaluate(()=>window.demoMessages);assert.equal(demoMessages,1);assert.equal(demoChallenge,1);assert.equal(demoPosts,0);
+  assert(!(await demoPage.content()).includes(demoHeader));assert(!(await demoPage.evaluate(()=>JSON.stringify({...localStorage}))).includes(demoHeader));
+  assert.equal(await demoPage.evaluate(()=>document.documentElement.scrollWidth),390);
+  await demoPage.reload();await demoPage.waitForFunction(()=>document.querySelector('[data-action=beer]').disabled);assert(await demoPage.locator('#operator-credentials').isHidden());
+  await demoPage.locator('#connect-wallet').click();await demoPage.locator('#wallet-list button').first().click();
+  await demoPage.locator('#enable-demo-controls').click();await demoPage.waitForFunction(()=>!document.querySelector('[data-action=beer]').disabled);
+  await demoPage.locator('[data-action=beer]').click();await demoPage.waitForFunction(()=>document.getElementById('payment-state').textContent.includes('Unknown'));
+  assert.equal(demoPosts,1);assert(await demoPage.locator('#enable-demo-controls').isDisabled());
+  await demoPage.reload();await demoPage.waitForFunction(()=>document.getElementById('payment-state').textContent.includes('Unknown'));assert.equal(demoPosts,1);assert(await demoPage.locator('#enable-demo-controls').isDisabled());
+  check('Public demo DOM: explicit message/preflight, memory-only grant, reload clears access, mobile layout and UNKNOWN survive reload without another POST');
+  await demoContext.close();
   assert.equal(errors.length,0,errors.join('\n'));
   check('No browser page errors or external runtime requests');
   writeFileSync(join(output,'restaurant-browser-report.json'),JSON.stringify(report,null,2));
