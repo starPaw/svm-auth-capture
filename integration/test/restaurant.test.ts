@@ -73,6 +73,15 @@ test('public faucet proxy preserves same-origin and body limits and never forwar
   const response=await app.request(`${origin}/api/faucet/challenge`,{method:'POST',headers:{origin,'Content-Type':'application/json'},body:payload});
   expect(response.status).toBe(200);expect(response.headers.get('Authorization')).toBeNull();expect(response.headers.get('Set-Cookie')).toBeNull();expect(calls).toEqual([{path:'/challenge',method:'POST',body:{recipient:h.payer.address}}]);
 });
+test('new restaurant UNKNOWN blocks faucet claims for any fresh visitor while original faucet observation stays available',async()=>{
+  const s=await offer();await authorize(s);const original=c.orders.read(s.id);original.status='pending';c.orders.write(original);
+  const calls:string[]=[];c.faucet={request:async(path)=>{calls.push(path);return new Response('{}');}};app=createRestaurantApp(c);
+  for(const path of ['/api/faucet/challenge','/api/faucet/claim']) {
+    expect((await app.request(origin+path,{method:'POST',headers:{origin,'Content-Type':'application/json'},body:JSON.stringify({recipient:h.outsider.address})})).status).toBe(409);
+  }
+  expect(calls).toEqual([]);expect((await app.request(origin+'/api/faucet/claims/'+'a'.repeat(64))).status).toBe(200);
+  expect(calls).toEqual(['/claims/'+'a'.repeat(64)]);
+});
 async function expectAction(s: Session, a: string) {
   const r = await action(s, a); const body = await r.json() as any;
   expect(body, JSON.stringify(body)).toMatchObject({ receipt: { success: true } }); expect(r.status).toBe(200);
@@ -124,6 +133,10 @@ describe('selected UNKNOWN authorize effect isolation',()=>{
     expect(statSync(`${f.path}.busy`).ino).toBe(f.busy.ino);expect(JSON.parse(readFileSync(f.journalPath,'utf8')).attempts).toHaveLength(1);
     expect(h.ledger.submissions).toHaveLength(1);expect(await h.ledger.getAccount(f.policy.payment as never)).toBeNull();
     expect((await authorize(f.s)).status).toBe(409);expect((await prepare()).status).toBe(409);
+    const faucetCalls:string[]=[];c.faucet={request:async(path)=>{faucetCalls.push(path);return new Response('{}');}};app=createRestaurantApp(c);
+    const faucet=await app.request(`${origin}/api/faucet/challenge`,{method:'POST',headers:{origin,'Content-Type':'application/json'},body:JSON.stringify({recipient:h.payer.address})});
+    expect(faucet.status).toBe(200);expect(faucetCalls).toEqual(['/challenge']);
+    expect(readFileSync(f.path)).toEqual(f.original);expect(statSync(`${f.path}.busy`).ino).toBe(f.busy.ino);
   });
   test.each(['active','unavailable','stale-account','weak-status','known-success','landed','changed-consent','duplicate-action','invalid-signature','inode-drift'])(
     'UNKNOWN isolation refuses %s without modifying originals or making a submission',async fault=>{

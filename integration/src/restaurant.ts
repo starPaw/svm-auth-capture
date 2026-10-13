@@ -4,7 +4,7 @@ import { assertStoreAccess, domainFromEnvironment, withShared, type RecoveryDoma
 // actions. HttpOnly per-order capabilities are application session control, not onchain authority.
 import { transactionObservation, type LifetimeObservation } from "./lifetime-provenance.ts";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { existsSync, readFileSync, unlinkSync, openSync, fsyncSync, closeSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, unlinkSync, openSync, fsyncSync, closeSync } from "node:fs";
 import { join } from "node:path";
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { Hono } from "hono";
@@ -208,6 +208,20 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
   // SDK/provider errors can embed private credential URLs. Never echo them to the browser.
   app.onError((error, ctx) => ctx.json({ error: error instanceof RestaurantRefusal ? error.message : error.message.includes("ENOENT") ? "order unavailable" : error.message.includes("EEXIST") ? "action reserved; inspect original outcome before any new consent" : "Finalized RPC evidence unavailable or order conflict; refresh and inspect original signatures." }, 409));
   if(c.faucet) {
+    app.use('/api/faucet/*',async(ctx,next)=>{
+      if(ctx.req.method==='POST') {
+        // A fresh visitor cannot evade the global UNKNOWN stop by using another
+        // wallet or cookie. Only the already reviewed exact historical isolation
+        // is excluded, after authenticating its unchanged original custody.
+        for(const name of readdirSync(c.orders.dir).filter(n=>/^[a-f0-9]{32}\.json$/.test(n))) {
+          const original=c.orders.read(name.slice(0,32));
+          if(original.status==='pending' || c.orders.busy(original.id)) {
+            if(!authorizeIsolationEvidence(c.authorizeIsolationPolicy,original,c.orders.path(original.id)))return ctx.json({error:'Original demo operation pending or unknown; new token claims stopped.'},409);
+          }
+        }
+      }
+      await next();
+    });
     app.use('*',async(ctx,next)=>{
       const path=ctx.req.path;
       if((ctx.req.method==='POST' && (path==='/resource'||path.startsWith('/api/orders'))) ||
