@@ -81,6 +81,7 @@ function render() {
   $('enable-demo-controls').hidden=!config?.publicMerchantDemoEnabled;
   $('enable-demo-controls').disabled=busy || diagnosticOnly || stale || faucetStopped() || uncertain() || !order || order.status==='draft' || connection?.account?.address!==order.payer || clockNow()>=order.refundDeadline;
   $('operator-credentials').hidden=!!config?.publicMerchantDemoEnabled;
+  if(config?.publicMerchantDemoEnabled && !merchantSecret && !demoGrant)$('operator-status').textContent='Enable controls with the original payer wallet. Only this test order is allowed.';
   $('merchant-heading').textContent=config?.publicMerchantDemoEnabled?'2–4 · Test this order as the merchant':'2–4 · Merchant operator only';
   $('merchant-control-hint').textContent=config?.publicMerchantDemoEnabled?'Wallet consent enables fixed actions for this order only, until its original refund deadline. Access stays in this tab; reload requires fresh consent.':'Explicit actions only. The secret stays in this tab’s memory and is cleared on lock or navigation. Pending or unknown results stay locked.';
   $('authority-description').textContent=config?.publicMerchantDemoEnabled?'The existing merchant signs onchain. Your readable wallet consent enables only this original test order and fixed scenario actions. Other orders, amounts and deadlines cannot be selected.':'Payer signing, wallet, order ID and cookie never grant merchant authority. The separate operator secret stays only in current-tab memory and is cleared on lock or navigation.';

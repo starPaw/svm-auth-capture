@@ -390,6 +390,7 @@ try {
   });
   await demoPage.goto(origin+'/customer');await demoPage.waitForSelector('#enable-demo-controls',{state:'visible'});
   assert(await demoPage.locator('#operator-credentials').isHidden());assert(await demoPage.locator('#enable-demo-controls').isDisabled());
+  assert((await demoPage.locator('#operator-status').textContent()).includes('original payer wallet'));
   await demoPage.locator('#connect-wallet').click();await demoPage.locator('#wallet-list button').first().click();
   await demoPage.locator('#enable-demo-controls').click();await demoPage.waitForFunction(()=>!document.querySelector('[data-action=beer]').disabled);
   demoMessages=await demoPage.evaluate(()=>window.demoMessages);assert.equal(demoMessages,1);assert.equal(demoChallenge,1);assert.equal(demoPosts,0);
