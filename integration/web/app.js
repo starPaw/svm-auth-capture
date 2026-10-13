@@ -1,4 +1,4 @@
-import { wallets, onWallets, connect, walletSign, walletSignFaucetRequest, encodeEnvelope, decodeEnvelope, signingReport, assertDevnetPolicy } from './wallet.js';
+import { wallets, onWallets, connect, walletSign, walletSignFaucetRequest, walletSignMerchantDemo, encodeEnvelope, decodeEnvelope, signingReport, assertDevnetPolicy } from './wallet.js';
 import { definitiveReceipt, recoveryMatches, authorizeIsolationMatches } from './receipt-state.js';
 const $ = id => document.getElementById(id);
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
@@ -6,7 +6,7 @@ const explorer = (kind, value) => `https://explorer.solana.com/${kind}/${encodeU
 const addressLink = value => `<a href="${explorer('address',value)}" target="_blank" rel="noopener noreferrer">${esc(value)} ↗</a>`;
 const diagnosticOnly = new URLSearchParams(location.search).get('walletDiagnostic') === '1';
 let config, order, scenario = 'normal', connection, busy = false, stale = false, reading = false;
-let anchor = { clock: 0, at: Date.now() }, merchantSecret = '', accessId = '', credentialEpoch = 0, renderedClockStage = '';
+let anchor = { clock: 0, at: Date.now() }, merchantSecret = '', accessId = '', credentialEpoch = 0, renderedClockStage = '', demoGrant;
 const storedId = () => localStorage.getItem('capture402-order');
 const faucetOriginal = () => localStorage.getItem('capture402-faucet-original');
 const faucetStopped = () => !!faucetOriginal();
@@ -24,8 +24,9 @@ const safeOperatorTransport = () => { try { assertDevnetPolicy(config); return l
 const clockNow = () => anchor.clock + Math.floor((Date.now() - anchor.at) / 1000);
 const clockStage = () => order ? `${clockNow() >= order.captureDeadline}:${clockNow() >= order.refundDeadline}` : 'no-offer';
 const expiredDraft = () => order?.status === 'draft' && order.events.length === 0 && clockNow() >= order.captureDeadline;
-function lockMerchant(message = 'Operator-only: separate merchant secret. Payer signing cannot unlock access.') {
-  merchantSecret = ''; accessId = ''; credentialEpoch++; $('merchant-secret').value = '';
+const merchantAuthorization=()=>demoGrant && demoGrant.order===order?.id && demoGrant.payer===connection?.account?.address && clockNow()<demoGrant.expiresAt ? demoGrant.authorization : merchantSecret ? `Bearer ${merchantSecret}` : '';
+function lockMerchant(message = config?.publicMerchantDemoEnabled ? 'Enable controls with the original payer wallet. Only this test order is allowed.' : 'Operator-only: separate merchant secret. Payer signing cannot unlock access.') {
+  merchantSecret = ''; demoGrant=undefined; accessId = ''; credentialEpoch++; $('merchant-secret').value = '';
   $('operator-status').textContent = message;
 }
 // A memory-only secret must not survive a history/BFCache restoration or tab navigation.
@@ -68,7 +69,7 @@ function refundReason() {
   return '';
 }
 function merchantReason(action) {
-  const reason = faucetStopped() ? 'Check the original test-token request before new economics.' : diagnosticOnly ? 'Signing-only diagnostic disables merchant operations.' : !safeOperatorTransport() ? 'Merchant access requires HTTPS and configured Devnet.' : !order ? 'Original payer order required.' : busy ? 'One operation is already in flight.' : uncertain() ? 'Original response unknown; all new operations are locked.' : stale ? 'Fresh finalized RPC state unavailable; refresh the original order.' : accessId !== order.id || !merchantSecret ? 'Merchant operator access required.' :
+  const reason = faucetStopped() ? 'Check the original test-token request before new economics.' : diagnosticOnly ? 'Signing-only diagnostic disables merchant operations.' : !safeOperatorTransport() ? 'Merchant access requires HTTPS and configured Devnet.' : !order ? 'Original payer order required.' : busy ? 'One operation is already in flight.' : uncertain() ? 'Original response unknown; all new operations are locked.' : stale ? 'Fresh finalized RPC state unavailable; refresh the original order.' : accessId !== order.id || !merchantAuthorization() ? config?.publicMerchantDemoEnabled ? 'Enable demo controls for this order with your payer wallet.' : 'Merchant operator access required.' :
     clockNow() >= (action === 'refund' ? order.refundDeadline : order.captureDeadline) ? 'Deadline reached on the informational timer; refresh Solana Clock eligibility.' : !order.actions?.[action] ? order.actionReasons?.[action] || 'Original finalized payment is not eligible for this action.' : '';
   return reason || (action === 'refund' ? refundReason() : '');
 }
@@ -77,7 +78,13 @@ function render() {
   $('claim-test-tokens').disabled = !config?.faucetEnabled || diagnosticOnly || busy || faucetStopped() || uncertain() || stale || !connection?.account || !!order && (order.status==='draft' || order.remaining>0 || order.status==='pending');
   $('refresh-test-tokens').hidden = !faucetStopped();
   $('refresh-test-tokens').disabled = busy;
-  $('setup-notice').hidden = !!config?.configured; document.body.classList.toggle('has-order', !!order); document.body.classList.toggle('operator-locked', accessId !== order?.id || !merchantSecret);
+  $('enable-demo-controls').hidden=!config?.publicMerchantDemoEnabled;
+  $('enable-demo-controls').disabled=busy || diagnosticOnly || stale || faucetStopped() || uncertain() || !order || order.status==='draft' || connection?.account?.address!==order.payer || clockNow()>=order.refundDeadline;
+  $('operator-credentials').hidden=!!config?.publicMerchantDemoEnabled;
+  $('merchant-heading').textContent=config?.publicMerchantDemoEnabled?'2–4 · Test this order as the merchant':'2–4 · Merchant operator only';
+  $('merchant-control-hint').textContent=config?.publicMerchantDemoEnabled?'Wallet consent enables fixed actions for this order only, until its original refund deadline. Access stays in this tab; reload requires fresh consent.':'Explicit actions only. The secret stays in this tab’s memory and is cleared on lock or navigation. Pending or unknown results stay locked.';
+  $('authority-description').textContent=config?.publicMerchantDemoEnabled?'The existing merchant signs onchain. Your readable wallet consent enables only this original test order and fixed scenario actions. Other orders, amounts and deadlines cannot be selected.':'Payer signing, wallet, order ID and cookie never grant merchant authority. The separate operator secret stays only in current-tab memory and is cleared on lock or navigation.';
+  $('setup-notice').hidden = !!config?.configured; document.body.classList.toggle('has-order', !!order); document.body.classList.toggle('operator-locked', accessId !== order?.id || !merchantAuthorization());
   for (const key of ['authorized','captured','remaining','refunded']) $(key).textContent = (order?.[key] ?? 0).toLocaleString('en-US', { maximumFractionDigits: 6 });
   $('refundable').textContent = order?.refundableBaseUnits !== undefined ? (Number(order.refundableBaseUnits) / 1_000_000).toLocaleString('en-US', { maximumFractionDigits: 6 }) : '0';
   const state = order?.status ?? 'idle';
@@ -91,7 +98,7 @@ function render() {
   document.querySelector('[data-action=refund]').textContent = (order?.scenario ?? scenario) === 'normal' ? 'Refund 10' : 'Merchant-funded refund';
   $('finish').textContent = `4 · Void ${scenario === 'refund' ? 60 : 35}`;
   $('unlock-merchant').disabled = busy || !safeOperatorTransport() || !order || uncertain() || stale;
-  $('lock-merchant').hidden = !merchantSecret; $('merchant-secret').disabled = busy || !!merchantSecret;
+  $('lock-merchant').hidden = !merchantSecret && !demoGrant; $('merchant-secret').disabled = busy || !!merchantSecret;
   if (!safeOperatorTransport()) $('operator-status').textContent = 'Operator-only controls require HTTPS on the configured Devnet demo.';
   $('reclaim-box').hidden = !order || order.remaining <= 0;
   const payerMatches = order?.payer === connection?.account?.address;
@@ -140,11 +147,11 @@ async function run(fn, renewalMessage = '', refreshAfter = true) {
   catch (error) { setStatus(error.message + (diagnosticOnly && signingReport() ? '\n\n' + JSON.stringify(signingReport(),null,2) : ''), true); try { await refresh(); } catch { stale = true; accessId = ''; } }
   finally { busy = false; render(); }
 }
-async function operatorPreflight(action, candidate = merchantSecret) {
-  if (!candidate || candidate.length < 32 || candidate.length > 512 || candidate.trim() !== candidate || /[\r\n]/.test(candidate)) throw new Error('Operator-only: enter a valid separate merchant credential. Payer signing cannot unlock access.');
+async function operatorPreflight(action, candidate = merchantAuthorization()) {
+  if (!candidate || candidate.length < 32 || candidate.length > (candidate.startsWith('Demo ')?4096:520) || candidate.trim() !== candidate || /[\r\n]/.test(candidate)) throw new Error('Operator-only: enter a valid separate merchant credential. Payer signing cannot unlock access.');
   if (!order || uncertain()) throw new Error('Original order required and unknown responses must remain locked.');
   const id = order.id, epoch = credentialEpoch;
-  const { data } = await request(`/api/orders/${id}/actions/${action}`, { headers: { Authorization: `Bearer ${candidate}` } });
+  const { data } = await request(`/api/orders/${id}/actions/${action}`, { headers: { Authorization: candidate } });
   if (epoch !== credentialEpoch || order.id !== id || data.id !== id || data.operatorAccess !== true) throw new Error('Operator access changed. Unlock the original order explicitly.');
   // Only consume sanitized state fields; the credential is never rendered or persisted.
   order = { ...order, ...data }; anchor = { clock: data.now, at: Date.now() }; stale = false; accessId = id;
@@ -220,10 +227,25 @@ $('authorize').onclick = () => {
 };
 $('unlock-merchant').onclick = () => run(async () => {
   const candidate = $('merchant-secret').value; $('merchant-secret').value = '';
-  try { await operatorPreflight('beer', candidate); merchantSecret = candidate; $('operator-status').textContent = 'Devnet operator access verified. Explicit clicks only.'; }
+  try { await operatorPreflight('beer', `Bearer ${candidate}`); merchantSecret = candidate; $('operator-status').textContent = 'Devnet operator access verified. Explicit clicks only.'; }
   catch { lockMerchant('Operator-only: credential refused or finalized RPC evidence unavailable. Verify the separate merchant credential and refresh. Payer signing cannot unlock access.'); throw new Error('Merchant unlock failed; no economic request was sent.'); }
 });
 $('lock-merchant').onclick = () => { lockMerchant(); render(); };
+$('enable-demo-controls').onclick=()=>{
+  if($('enable-demo-controls').disabled)return;
+  return run(async()=>{
+    lockMerchant();const id=order.id,epoch=credentialEpoch;
+    const {data:challenge}=await request(`/api/orders/${id}/merchant-demo`,{method:'POST'});
+    const signature=await walletSignMerchantDemo(connection,challenge,order,config);
+    if(epoch!==credentialEpoch || order.id!==id || connection.account.address!==order.payer)throw new Error('Order or payer changed. Nothing submitted.');
+    const encoded=btoa(JSON.stringify({token:challenge.token,signature})).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+    const authorization=`Demo ${encoded}`;
+    await operatorPreflight('beer',authorization);
+    demoGrant={authorization,order:id,payer:order.payer,expiresAt:challenge.expiresAt};
+    $('operator-status').textContent='Controls enabled for this test order only. Choose each action explicitly.';
+  });
+};
+
 for (const button of document.querySelectorAll('[data-action]')) button.onclick = () => {
   const action = button.dataset.action;
   if (merchantReason(action)) return;
@@ -231,7 +253,7 @@ for (const button of document.querySelectorAll('[data-action]')) button.onclick 
     await operatorPreflight(action);
     const reason = order.actionReasons?.[action] || (action === 'refund' ? refundReason() : '');
     if (!order.actions?.[action] || reason || clockNow() >= (action === 'refund' ? order.refundDeadline : order.captureDeadline)) throw new Error(reason || 'Original action eligibility changed; no operation sent.');
-    const { data } = await submitOriginal(`/api/orders/${order.id}/actions/${action}`, { method:'POST', headers:{ Authorization:`Bearer ${merchantSecret}` } }, [409]);
+    const { data } = await submitOriginal(`/api/orders/${order.id}/actions/${action}`, { method:'POST', headers:{ Authorization:merchantAuthorization() } }, [409]);
     if (!data.receipt?.success) throw new Error('Merchant operation refused or pending. Inspect original signatures and finalized state.');
   });
 };

@@ -88,3 +88,20 @@ describe("Wallet Standard adapter", () => {
   });
 
 });
+
+describe('merchant demo readable wallet consent',()=>{
+  test('checks original order, payer, immutable limits and exact returned message before enabling any HTTP action',async()=>{
+    Object.assign(window,{location:{origin:'https://demo.test'}});
+    const {MerchantDemoConsent}=await import('../src/merchant-demo.ts');
+    const now=Math.floor(Date.now()/1000),order={id:'a'.repeat(32),payer:h.payer.address,payment:h.outsider.address,scenario:'normal',captureDeadline:now+150,refundDeadline:now+180,now};
+    const policy={...adapter.DEVNET_POLICY,programId:h.facilitator.programId,sponsor:h.facilitatorKey.address,merchant:h.server.address,mint:h.mint};
+    const q=new MerchantDemoConsent('private-fixture-merchant-key-0123456789').challenge({schema:1,origin:window.location.origin,network:policy.network,programId:policy.programId,sponsor:policy.sponsor,merchant:policy.merchant,mint:policy.mint,budget:'100000000',order:order.id,payment:order.payment,payer:order.payer,scenario:order.scenario,captureDeadline:order.captureDeadline,refundDeadline:order.refundDeadline,capabilityHash:'b'.repeat(64)},BigInt(now));
+    const {signBytes}=await import('@solana/kit');
+    const connection={account:account(),signMessage:async({message}:any)=>[{signedMessage:new Uint8Array(message),signature:new Uint8Array(await signBytes(h.payer.keyPair.privateKey,message))}]};
+    expect(Buffer.from(await adapter.walletSignMerchantDemo(connection,q,order,policy),'base64')).toHaveLength(64);
+    for(const changed of [{order:'c'.repeat(32)},{payment:h.server.address},{budget:'101000000'},{mint:h.outsider.address},{origin:'https://foreign.example'},{merchant:h.outsider.address},{scenario:'refund'},{expiresAt:now+181},{message:q.message+' changed'}])await expect(adapter.walletSignMerchantDemo(connection,{...q,...changed},order,policy)).rejects.toThrow();
+    connection.signMessage=async({message}:any)=>{message[0]^=1;return[{signedMessage:message,signature:new Uint8Array(64)}];};
+    await expect(adapter.walletSignMerchantDemo(connection,q,order,policy)).rejects.toThrow(/changed/);
+    expect(h.ledger.submissions).toHaveLength(0);
+  });
+});

@@ -31,6 +31,7 @@ import { currentReclaimGeneration, nextReclaimArchive } from './reclaim-generati
 import { abandonmentCustody, abandonmentEvidence, proveExpiredUnfundedAuthorize, sha256, type AuthorizeAbandonPolicy } from './authorize-abandon.ts';
 import { authorizeIsolationEvidence, type InstalledIsolationPolicy } from './unknown-authorize-isolation.ts';
 import type { FaucetProxy } from './devnet-faucet-proxy.ts';
+import {MerchantDemoConsent,type MerchantDemoScope} from './merchant-demo.ts';
 
 export const DEMO_UNIT = 1_000_000n;
 export const DEMO_BUDGET = 100n * DEMO_UNIT;
@@ -39,7 +40,7 @@ type Scenario = typeof SCENARIOS[number];
 type Action = "authorize" | "beer" | "salmon" | "finish" | "void" | "refund" | "reclaim" | "atomic";
 type Event = { lifetimeObservation?: LifetimeObservation; action: Action; label: string; amount: string; at: string; status: "prepared" | "pending" | "finalized" | "rejected"; transaction: string; transactionBase64: string; receipt?: SettleResponse };
 type Order = { authorizeLifetime?: LifetimeObservation; id: string; capabilityHash: string; payer: Address; payment: Address; scenario: Scenario; required: PaymentRequired; unsigned: string; createdAt: number; status: "draft" | "active" | "closed" | "pending" | "rejected"; events: Event[]; reclaimUnsigned?: string; reclaimLifetime?: { blockhash: string; lastValidBlockHeight: string; blockhashSlot?: string } };
-export type RestaurantConfig = ResourceServerConfig & { ledger: Ledger & Pick<ChainReader, "getSignatureStatus"> & Pick<RpcLedger,"getAccountAtLeast"> & {offerBlockhashValid?: (hash: string) => Promise<boolean>; getClockAtLeast?:RpcLedger['getClockAtLeast']; getFinalizedBlockhashStatus?:RpcLedger['getFinalizedBlockhashStatus']}; orders: RestaurantOrders; reclaimJournal: SubmissionJournal; origin: string; merchantToken?: string; orderAdmission?: AdmissionJournal; b3Recovery?:B3Recovery; authorizeAbandonPolicy?:AuthorizeAbandonPolicy; authorizeAbandonPolicies?:readonly AuthorizeAbandonPolicy[]; authorizeIsolationPolicy?:InstalledIsolationPolicy; faucet?:FaucetProxy };
+export type RestaurantConfig = ResourceServerConfig & { ledger: Ledger & Pick<ChainReader, "getSignatureStatus"> & Pick<RpcLedger,"getAccountAtLeast"> & {offerBlockhashValid?: (hash: string) => Promise<boolean>; getClockAtLeast?:RpcLedger['getClockAtLeast']; getFinalizedBlockhashStatus?:RpcLedger['getFinalizedBlockhashStatus']}; orders: RestaurantOrders; reclaimJournal: SubmissionJournal; origin: string; merchantToken?: string; publicMerchantDemo?:boolean; orderAdmission?: AdmissionJournal; b3Recovery?:B3Recovery; authorizeAbandonPolicy?:AuthorizeAbandonPolicy; authorizeAbandonPolicies?:readonly AuthorizeAbandonPolicy[]; authorizeIsolationPolicy?:InstalledIsolationPolicy; faucet?:FaucetProxy };
 
 export class RestaurantOrders {
   readonly dir: string;
@@ -185,6 +186,8 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
     throw new Error("merchant token must be independent and at least 32 characters");
   }
   const merchantAuth = merchantToken ? requireBearerToken(merchantToken) : undefined;
+  if(c.publicMerchantDemo && !merchantToken)throw Error('public merchant demo requires private merchant configuration');
+  const demoConsent=c.publicMerchantDemo ? new MerchantDemoConsent(merchantToken!) : undefined;
   const app = new Hono();
   // Acquire before any order/draft read; all callbacks and durable results stay in this scope.
   if (c.orders.coordination !== c.reclaimJournal.coordination && c.orders.coordination?.metadata.domain !== c.reclaimJournal.coordination?.metadata.domain) throw new Error("restaurant journals require one complete domain");
@@ -198,6 +201,19 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
     if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) throw new Error("this order requires its wallet-created demo session");
     return order;
   }
+  function demoScope(order:Order):MerchantDemoScope {
+    const terms=order.required.accepts[0]!;
+    return {schema:1,origin:c.origin,network:c.network,programId:c.programId,sponsor:c.feePayer,merchant:c.server.address,mint:c.asset,budget:'100000000',
+      order:order.id,payment:order.payment,payer:order.payer,scenario:order.scenario,captureDeadline:Number(terms.extra!.captureDeadline),refundDeadline:Number(terms.extra!.refundDeadline),capabilityHash:order.capabilityHash};
+  }
+  function assertPublicCampaignReady(except?:string) {
+    if(!demoConsent)return;
+    for(const name of readdirSync(c.orders.dir).filter(n=>/^[a-f0-9]{32}\.json$/.test(n))) {
+      const original=c.orders.read(name.slice(0,32));
+      if(original.id!==except && (original.status==='pending' || c.orders.busy(original.id)) &&
+        !authorizeIsolationEvidence(c.authorizeIsolationPolicy,original,c.orders.path(original.id)))throw new RestaurantRefusal('Original demo operation pending or unknown; new economics stopped.');
+    }
+  }
   app.use("*", bodyLimit({ maxSize: 32_768, onError: ctx => ctx.json({ error: "request too large" }, 413) }));
   app.use("*", async (ctx, next) => {
     ctx.header("Cache-Control", "no-store");
@@ -207,6 +223,12 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
   });
   // SDK/provider errors can embed private credential URLs. Never echo them to the browser.
   app.onError((error, ctx) => ctx.json({ error: error instanceof RestaurantRefusal ? error.message : error.message.includes("ENOENT") ? "order unavailable" : error.message.includes("EEXIST") ? "action reserved; inspect original outcome before any new consent" : "Finalized RPC evidence unavailable or order conflict; refresh and inspect original signatures." }, 409));
+  if(demoConsent)app.use('*',async(ctx,next)=>{
+    const path=ctx.req.path;
+    if(ctx.req.method==='POST' && (path==='/resource'||path.startsWith('/api/orders') && !/\/actions\//.test(path)) ||
+      ctx.req.method==='GET' && /^\/api\/orders\/[^/]+\/(signing-preflight|reclaim)$/.test(path) || ctx.req.method==='GET' && /\/actions\//.test(path))assertPublicCampaignReady();
+    await next();
+  });
   if(c.faucet) {
     app.use('/api/faucet/*',async(ctx,next)=>{
       if(ctx.req.method==='POST') {
@@ -443,6 +465,7 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
     const tx = decode(payload.payload.transaction); const signed = await peekAuthorize(c, tx);
     if (signed.payer !== order.payer || !equalMessage(tx, decode(order.unsigned))) return ctx.json({ error: "wallet must sign the exact offered budget" }, 400);
     c.orders.reserve(order.id, "authorize");
+    try {assertPublicCampaignReady(order.id);}catch(e){c.orders.unlock(order.id);throw e;}
     if(existsSync(`${c.orders.path(order.id)}.authorize-abandon.lock`)) {c.orders.unlock(order.id);return ctx.json({error:"Original authorization abandoned; no dispatch."},409);}
     const event: Event = { action: "authorize", label: labels.authorize, amount: DEMO_BUDGET.toString(), at: new Date().toISOString(), status: "prepared", transaction: "", transactionBase64: payload.payload.transaction, lifetimeObservation: order.authorizeLifetime };
     c.orders.prepare(order, event);
@@ -452,11 +475,28 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
     return ctx.json({ receipt: result.receipt, order: order.id }, result.kind === "succeeded" ? 200 : 402);
   });
   app.use("/api/orders/:id/actions/*", async (ctx, next) => {
+    if(demoConsent && ctx.req.header('authorization')?.startsWith('Demo ')) {
+      try {
+        const order=owned(ctx.req.param('id'),getCookie(ctx,cookieName));
+        const expiresAt=await demoConsent.verify(ctx.req.header('authorization')!,demoScope(order));
+        if(await orderClock(c,order)>=BigInt(expiresAt))return ctx.json({error:'Original demo consent expired; deadlines never reset.'},401);
+      }catch {return ctx.json({error:'Original payer consent and this order session required.'},401);}
+      return next();
+    }
     if (!merchantAuth) return ctx.json({ error: "merchant operations disabled" }, 503);
     return merchantAuth(ctx, next);
   });
+  app.post('/api/orders/:id/merchant-demo',async ctx=>{
+    if(!demoConsent)return ctx.json({error:'Public merchant demo disabled.'},403);
+    if(await ctx.req.text())return ctx.json({error:'Original owned order only; omit the body.'},400);
+    const order=owned(ctx.req.param('id'),getCookie(ctx,cookieName));
+    if(order.status==='draft'||order.status==='pending'||c.orders.busy(order.id) || !order.events.some(e=>e.action==='authorize'&&e.status==='finalized'))return ctx.json({error:'Original finalized payer authorization required.'},409);
+    const p=await restaurantSnapshot(c,order);if(!p)return ctx.json({error:'Original finalized payment required.'},409);
+    return ctx.json(demoConsent.challenge(demoScope(order),await orderClock(c,order)));
+  });
   // Order-scoped read-only preflight on the existing action surface, behind the
-  // very same bearer check as POST. Invalid credentials cannot cause economics.
+  // same operator bearer or explicit original-payer demo consent as POST.
+  // Invalid credentials cannot cause economics.
   app.get("/api/orders/:id/actions/:action", async ctx => {
     if (!(merchantActions as readonly string[]).includes(ctx.req.param("action"))) return ctx.json({ error: "unsupported menu action" }, 400);
     const snapshot = await view(c.orders.read(ctx.req.param("id")));
@@ -472,6 +512,7 @@ export function createRestaurantApp(c: RestaurantConfig): Hono {
     order = c.orders.read(order.id);
     let prepared = false;
     try {
+      assertPublicCampaignReady(order.id);
       const p = await restaurantSnapshot(c, order);
       // No new consent while an earlier attempt is unresolved.
       const now = await orderClock(c,order);

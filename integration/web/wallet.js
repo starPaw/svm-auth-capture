@@ -134,3 +134,22 @@ export async function walletSignFaucetRequest(connection, challenge, policy = DE
     !(signed.signedMessage instanceof Uint8Array)||!equal(baseline,signed.signedMessage) || connection.account.address!==recipient)throw new Error('Wallet message changed or recipient changed. Nothing submitted.');
   return toBase64(signed.signature);
 }
+
+export async function walletSignMerchantDemo(connection, challenge, order, policy = DEVNET_POLICY) {
+  assertDevnetPolicy(policy);
+  const payer=connection?.account?.address;
+  if(!payer || order?.payer!==payer || challenge?.payer!==payer || challenge.order!==order.id || challenge.payment!==order.payment ||
+    challenge.scenario!==order.scenario || challenge.origin!==window.location.origin || challenge.network!==policy.network ||
+    challenge.mint!==policy.mint || challenge.merchant!==policy.merchant || challenge.sponsor!==policy.sponsor || challenge.programId!==policy.programId ||
+    challenge.budget!=='100000000' || challenge.captureDeadline!==order.captureDeadline || challenge.refundDeadline!==order.refundDeadline ||
+    challenge.expiresAt!==order.refundDeadline || challenge.expiresAt<=order.now || !/^[a-f0-9]{64}$/.test(challenge.nonce??''))throw new Error('Merchant demo request differs from this original test order.');
+  const expected=`Capture402 Devnet merchant demo controls\nOrigin: ${window.location.origin}\nPayer: ${payer}\nOrder: ${order.id}\nPayment: ${order.payment}\nScenario: ${order.scenario}\nMerchant: ${policy.merchant}\nSponsor: ${policy.sponsor}\nMint: ${policy.mint}\nProgram: ${policy.programId}\nBudget: 100 test tokens\nCapture deadline: ${order.captureDeadline}\nRefund deadline: ${order.refundDeadline}\nRequest: ${challenge.nonce}\nExpires: ${order.refundDeadline}\nI allow fixed capture, release and merchant-funded refund actions for this test order only. No other order or wallet transaction authority is granted.`;
+  if(challenge.message!==expected)throw new Error('Unexpected merchant demo consent. Nothing signed.');
+  const sign=connection.signMessage??connection.wallet.features['solana:signMessage']?.signMessage;
+  if(!sign)throw new Error('This wallet cannot sign the order-specific demo consent.');
+  const message=new TextEncoder().encode(expected),baseline=new Uint8Array(message);
+  const [signed]=await sign({account:connection.account,message});
+  if(!(signed?.signature instanceof Uint8Array)||signed.signature.length!==64 || !(signed.signedMessage instanceof Uint8Array)||
+    !equal(baseline,signed.signedMessage) || connection.account.address!==payer)throw new Error('Wallet message or payer changed. Nothing submitted.');
+  return toBase64(signed.signature);
+}

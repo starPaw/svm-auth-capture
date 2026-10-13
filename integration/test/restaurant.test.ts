@@ -1203,3 +1203,84 @@ describe("Gate 1 refund scope review", () => {
     expect(c.orders.attempted(s.id, "refund")).toBe(false);
   });
 });
+
+describe('public merchant demo: original payer consent and order session',()=>{
+  beforeEach(()=>{c.publicMerchantDemo=true;app=createRestaurantApp(c);});
+  const challenge=(s:Session)=>app.request(`${origin}/api/orders/${s.id}/merchant-demo`,{method:'POST',headers:{origin,cookie:s.cookie}});
+  async function consent(s:Session,signer=h.payer) {
+    const r=await challenge(s);expect(r.status).toBe(200);const q=await r.json() as any;
+    const {signBytes}=await import('@solana/kit');
+    const signature=Buffer.from(await signBytes(signer.keyPair.privateKey,new TextEncoder().encode(q.message))).toString('base64');
+    return {q,header:'Demo '+Buffer.from(JSON.stringify({token:q.token,signature})).toString('base64url')};
+  }
+  const demoAction=(s:Session,header:string,a:string,method='POST')=>app.request(`${origin}/api/orders/${s.id}/actions/${a}`,{method,headers:{origin,cookie:s.cookie,authorization:header}});
+  test('one wallet message enables fixed 40/25/35/refund10 on its own real SBF order; original action cannot replay',async()=>{
+    const s=await offer();await authorize(s);const payerBefore=h.tokens(await h.payerAta()),files=readdirSync(c.orders.dir).sort(),disk=readFileSync(c.orders.path(s.id));
+    const {q,header}=await consent(s);
+    expect(q).toMatchObject({order:s.id,payer:h.payer.address,budget:'100000000',expiresAt:Number(NOW+180n)});
+    expect(JSON.stringify(q)).not.toContain(merchantToken);expect(readdirSync(c.orders.dir).sort()).toEqual(files);expect(readFileSync(c.orders.path(s.id))).toEqual(disk);
+    expect((await demoAction(s,header,'beer','GET')).status).toBe(200);expect(h.ledger.submissions).toHaveLength(1);
+    for(const a of ['beer','salmon','finish','refund'])expect((await demoAction(s,header,a)).status).toBe(200);
+    const v=await view(s);expect(h.state(v.payment)).toMatchObject({held:0n,refundable:55n*DEMO_UNIT});
+    expect(h.tokens(await h.payerAta())).toBe(payerBefore+45n*DEMO_UNIT);expect(h.tokens(await h.serverAta())).toBe(55n*DEMO_UNIT);
+    expect((await demoAction(s,header,'refund')).status).toBe(409);expect(h.ledger.submissions).toHaveLength(5);
+  });
+  test('draft/cookie without explicit wallet consent does not grant merchant authority',async()=>{
+    const s=await offer();expect((await challenge(s)).status).toBe(409);await authorize(s);
+    expect((await demoAction(s,'','beer')).status).toBe(401);
+    expect((await demoAction(s,'Demo '+Buffer.from('{}').toString('base64url'),'beer')).status).toBe(401);
+    expect(h.ledger.submissions).toHaveLength(1);expect(c.orders.attempted(s.id,'beer')).toBe(false);
+  });
+  test.each(['other-order','missing-cookie','wrong-cookie','wrong-payer','foreign-origin','changed-scope','changed-signature','extra-proof-field'])('rejects %s before signing/reservation',async fault=>{
+    const s=await offer();await authorize(s);const {header,q}=await consent(s,fault==='wrong-payer'?h.outsider:h.payer);
+    let target=s.id,cookie=s.cookie,value=header,requestOrigin=origin;
+    if(fault==='other-order'){const other=await offer();target=other.id;cookie=other.cookie;}
+    if(fault==='missing-cookie')cookie='';if(fault==='wrong-cookie')cookie='capture402-order=foreign';if(fault==='foreign-origin')requestOrigin='https://foreign.example';
+    if(fault==='changed-scope'){const [p,m]=q.token.split('.'),i=JSON.parse(Buffer.from(p,'base64url').toString());i.budget='101000000';const proof=JSON.parse(Buffer.from(header.slice(5),'base64url').toString());proof.token=Buffer.from(JSON.stringify(i)).toString('base64url')+'.'+m;value='Demo '+Buffer.from(JSON.stringify(proof)).toString('base64url');}
+    if(fault==='changed-signature'||fault==='extra-proof-field'){const proof=JSON.parse(Buffer.from(header.slice(5),'base64url').toString());if(fault==='changed-signature')proof.signature=Buffer.alloc(64).toString('base64');else proof.role='merchant';value='Demo '+Buffer.from(JSON.stringify(proof)).toString('base64url');}
+    const count=h.ledger.submissions.length,signer=vi.fn(c.server.signTransactions),reserve=vi.spyOn(c.orders,'reserve');
+    app=createRestaurantApp({...c,server:{...c.server,signTransactions:signer}});
+    const r=await app.request(`${origin}/api/orders/${target}/actions/beer`,{method:'POST',headers:{origin:requestOrigin,cookie,authorization:value}});
+    expect(r.status).toBe(fault==='foreign-origin'?403:401);expect(reserve).not.toHaveBeenCalled();expect(signer).not.toHaveBeenCalled();expect(h.ledger.submissions).toHaveLength(count);
+    reserve.mockRestore();
+  });
+  test('consent survives server restart without a new signature or expanded scope, expires at original refund deadline',async()=>{
+    const s=await offer();await authorize(s);const {header}=await consent(s);app=createRestaurantApp({...c,orders:new RestaurantOrders(c.orders.dir)});
+    expect((await demoAction(s,header,'beer')).status).toBe(200);h.setTime(NOW+180n);
+    expect((await demoAction(s,header,'void')).status).toBe(401);expect((await challenge(s)).status).toBe(409);expect(h.ledger.submissions).toHaveLength(2);
+  });
+  test('fixed scenario and refund amounts remain authoritative under demo consent',async()=>{
+    const s=await offer('atomic');await authorize(s);const {header}=await consent(s);
+    expect((await demoAction(s,header,'beer')).status).toBe(409);expect((await demoAction(s,header,'atomic')).status).toBe(200);
+    expect((await demoAction(s,header,'refund')).status).toBe(409);expect(h.state((await view(s)).payment)).toMatchObject({held:0n,refundable:40n*DEMO_UNIT});expect(h.ledger.submissions).toHaveLength(2);
+  });
+  test('a different pending order stops new offers and actions while original receipts remain readable',async()=>{
+    const s=await offer();await authorize(s);const {header}=await consent(s),other=await offer();const old=c.orders.read(other.id);old.status='pending';c.orders.write(old);
+    expect((await demoAction(s,header,'beer','GET')).status).toBe(409);
+    const result=await demoAction(s,header,'beer');expect(result.status).toBe(409);expect(await result.json()).toMatchObject({receipt:{errorReason:'settlement_not_submitted',transaction:''}});
+    expect((await challenge(s)).status).toBe(409);expect((await view(s)).id).toBe(s.id);expect(h.ledger.submissions).toHaveLength(1);expect(c.orders.busy(s.id)).toBe(false);
+  });
+  test('lost demo capture response preserves the original wire and stops all campaign economics across restart',async()=>{
+    const s=await offer();await authorize(s);const {header}=await consent(s);h.ledger.failSubmit='after-landing';
+    const r=await demoAction(s,header,'beer');expect(r.status).toBe(409);expect(await r.json()).toMatchObject({receipt:{errorReason:'settlement_pending',transaction:expect.any(String)}});
+    const bytes=readFileSync(c.orders.path(s.id)),event=c.orders.read(s.id).events.at(-1)!;expect(event.transactionBase64.length).toBeGreaterThan(0);expect(event.status).toBe('pending');
+    const signer=vi.fn(c.server.signTransactions);app=createRestaurantApp({...c,orders:new RestaurantOrders(c.orders.dir),server:{...c.server,signTransactions:signer}});
+    expect((await demoAction(s,header,'beer')).status).toBe(409);expect((await demoAction(s,header,'salmon')).status).toBe(409);expect((await challenge(s)).status).toBe(409);
+    expect((await app.request(origin+'/api/orders',{method:'POST',headers:{origin,'Content-Type':'application/json'},body:JSON.stringify({payer:h.outsider.address})})).status).toBe(409);
+    expect(readFileSync(c.orders.path(s.id))).toEqual(bytes);expect(c.orders.busy(s.id)).toBe(true);expect(h.ledger.submissions).toHaveLength(2);expect(signer).not.toHaveBeenCalled();
+  });
+  test('a busy different order appearing after access verification stops before merchant signing',async()=>{
+    const s=await offer();await authorize(s);const {header}=await consent(s),other=await offer();
+    const reserve=c.orders.reserve.bind(c.orders),spy=vi.spyOn(c.orders,'reserve').mockImplementation((id,a)=>{reserve(id,a);if(id===s.id)reserve(other.id,'authorize');});
+    const signer=vi.fn(c.server.signTransactions);app=createRestaurantApp({...c,server:{...c.server,signTransactions:signer}});
+    const r=await demoAction(s,header,'beer');expect(r.status).toBe(409);expect(await r.json()).toMatchObject({receipt:{errorReason:'settlement_not_submitted',transaction:''}});
+    expect(signer).not.toHaveBeenCalled();expect(c.orders.busy(s.id)).toBe(false);expect(c.orders.busy(other.id)).toBe(true);expect(h.ledger.submissions).toHaveLength(1);spy.mockRestore();
+  });
+  test('faucet UNKNOWN still stops delegate signing and the legacy operator path remains separate',async()=>{
+    const s=await offer();await authorize(s);const {header}=await consent(s);
+    c.faucet={request:async()=>new Response('{"blocked":true}',{headers:{'Content-Type':'application/json'}})};app=createRestaurantApp(c);
+    expect((await demoAction(s,header,'beer')).status).toBe(409);expect(h.ledger.submissions).toHaveLength(1);
+    c.faucet=undefined;app=createRestaurantApp({...c,publicMerchantDemo:false});expect((await demoAction(s,header,'beer')).status).toBe(401);expect((await challenge(s)).status).toBe(403);
+    expect((await action(s,'beer')).status).toBe(200);
+  });
+});
