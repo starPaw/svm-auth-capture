@@ -10,11 +10,11 @@
     <div id="c402-home-root">
       <a class="c402-home-skip" href="#content">Skip to content</a>
       <header class="c402-home-wrap c402-home-header"><a class="c402-home-brand" href="/" aria-label="Capture402 home"><svg width="24" height="24" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 1H2V23H8M16 1H22V23H16" fill="none" stroke="currentColor" stroke-width="2"/><path d="M9 8H15V14H9Z" fill="#264BDB"/></svg>Capture402</a>
-        <nav class="c402-home-desktop-nav" aria-label="Main navigation"><a href="#how-it-works">How it works</a><a href="#proof">Devnet record</a><a href="#developers">Developers</a><a class="c402-home-button" href="/customer">Open demo ↗</a>
+        <nav class="c402-home-desktop-nav" aria-label="Main navigation"><a href="#how-it-works">How it works</a><a href="#latest-demo">Devnet record</a><a href="#developers">Developers</a><a class="c402-home-button" href="https://e2e.capture402.xyz/customer">Try your own order ↗</a>
         </nav>
         <details class="c402-home-menu">
           <summary>Menu</summary>
-          <nav aria-label="Mobile navigation"><a href="#how-it-works">How it works</a><a href="#proof">Devnet record</a><a href="#developers">Developers</a><a href="/customer">Open demo ↗</a>
+          <nav aria-label="Mobile navigation"><a href="#how-it-works">How it works</a><a href="#latest-demo">Devnet record</a><a href="#developers">Developers</a><a href="https://e2e.capture402.xyz/customer">Try your own order ↗</a>
           </nav>
         </details>
       </header>
@@ -26,9 +26,9 @@
               <h1 id="hero-title"><span>Authorize <br class="c402-home-mobile-break">once.</span><span>Capture as <br class="c402-home-mobile-break">you go.</span></h1>
               <p class="c402-home-lead">Set a maximum upfront. Let a service collect payments in parts. Release what remains.</p>
               <p class="c402-home-clarifier">Authorization moves the maximum into escrow. Each capture pays the service from that hold.</p>
-              <div class="c402-home-actions"><a class="c402-home-button c402-home-primary" href="#how-it-works">Follow the money ↓</a><a class="c402-home-button" href="/customer">Open Devnet demo ↗</a>
+              <div class="c402-home-actions"><a class="c402-home-button c402-home-primary" href="#how-it-works">Follow the money ↓</a><a class="c402-home-button" href="https://e2e.capture402.xyz/customer">Try the Devnet demo ↗</a>
               </div>
-              <p class="c402-home-note">Understand the flow without a wallet. The demo uses test tokens.</p>
+              <p class="c402-home-note">Explore the flow below, or test your own order with a Devnet wallet. Test tokens only.</p>
             </div>
             <figure class="c402-home-instrument">
               <figcaption class="c402-home-eyebrow">One authorization / 100 example units</figcaption>
@@ -122,6 +122,25 @@
               <summary>What if the merchant stops responding?</summary>
               <p>At or after the capture deadline, the payer can submit a reclaim transaction to recover any remaining hold without the merchant or facilitator. Funds do not move automatically when the deadline passes. Previously captured payments are unaffected.</p>
             </details>
+          </div>
+        </section>
+        <section class="c402-home-proof c402-home-section" id="latest-demo" aria-labelledby="latest-demo-title">
+          <div class="c402-home-wrap">
+            <p class="c402-home-eyebrow">Try it / Your own test order</p>
+            <h2 id="latest-demo-title">Test both sides of your own order.</h2>
+            <p>Connect a Devnet wallet, get 1,000 test tokens, and authorize 100. Enable merchant demo controls with your wallet, then capture 40 and 25, release 35, and refund 10. Each action is limited to your original order and deadlines. No merchant secret is needed.</p>
+            <div class="c402-home-actions"><a class="c402-home-button c402-home-primary" href="https://e2e.capture402.xyz/customer">Try your own order ↗</a><a class="c402-home-button" href="https://github.com/starPaw/svm-auth-capture/pull/90#issuecomment-6153510430">Browser test record ↗</a></div>
+            <p class="c402-home-note">Solana Devnet only. No real USDC or monetary value. Limited shared test campaign.</p>
+            <table class="c402-home-evidence"><caption>13 Oct 2026 · Browser controls and finalized Devnet receipts</caption><thead><tr><th scope="col">Action</th><th scope="col">State after operation</th><th scope="col">Transaction</th></tr></thead><tbody>
+              <tr><th scope="row">Authorize 100</th><td>Held 100 · Captured, unrefunded 0<small>Finalized on Devnet</small></td><td><a href="https://explorer.solana.com/tx/4bWWdmRCgKuthG9Cnmtmy5EhmDjRgC2gXCW7cMysiDgCDAemb8ncTKYXFcWr3VEcqsoGiNsU4mHmuvBm5HNYxDWV?cluster=devnet">Authorize 100 receipt ↗</a><small class="c402-home-mono">Slot 510729558</small></td></tr>
+              <tr><th scope="row">Capture 40</th><td>Held 60 · Captured, unrefunded 40<small>Finalized on Devnet</small></td><td><a href="https://explorer.solana.com/tx/561WoMwERBLVr8bjxbhM2RzqsGsrbYeYRGsQkCwCz6MpvxZCX3hqgNLXKveYdqiiTzKwb8pCR3vRQCNN5wYhyb64?cluster=devnet">Capture 40 receipt ↗</a><small class="c402-home-mono">Slot 510729842</small></td></tr>
+              <tr><th scope="row">Capture 25</th><td>Held 35 · Captured, unrefunded 65<small>Finalized on Devnet</small></td><td><a href="https://explorer.solana.com/tx/4h622EBukmjTAHSSV9zGKR5fKg6sTT1TmQniAzGZbR6pECX1M3MWgK4bgYjXerw68qfw8HUjzP7HUhWSNVhsmSEN?cluster=devnet">Capture 25 receipt ↗</a><small class="c402-home-mono">Slot 510729935</small></td></tr>
+              <tr><th scope="row">Release 35</th><td>Held 0 · Captured, unrefunded 65<small>Finalized on Devnet</small></td><td><a href="https://explorer.solana.com/tx/4RGzSEmPMgKsEVgRTzFftkJ7dcQBbdHaBERDYtxRbk62YYoHiatz5me4ovBtGjUMYnSCL36Q7ii1qdsJWzTqm1U6?cluster=devnet">Release 35 receipt ↗</a><small class="c402-home-mono">Slot 510729987</small></td></tr>
+              <tr><th scope="row">Refund 10</th><td>Held 0 · Captured, unrefunded 55<small>Finalized on Devnet</small></td><td><a href="https://explorer.solana.com/tx/kFXsRgQNZqfNb9iDy8UcQBzKcKvJML58Nkp9sV4kXwJcDuQixyFcbbrSHmU1YPCLu1EDZtaA7sBuVfTJroXzDqj?cluster=devnet">Refund 10 receipt ↗</a><small class="c402-home-mono">Slot 510730045</small></td></tr>
+            </tbody></table>
+            <p>The browser check ended with held 0 and refundable 55. The payer retained 945 of the 1,000 test tokens; the merchant received 55. Reload restored the receipts and sent no new operations.</p>
+            <p class="c402-home-note">Browser check used a one-use test wallet. Solflare's approval interface was not exercised.</p>
+            <p><a href="/customer">Previous order history ↗</a></p>
           </div>
         </section>
         <section class="c402-home-proof c402-home-section" id="proof" aria-labelledby="proof-title">
@@ -366,7 +385,7 @@
           <p class="c402-home-eyebrow">The application demo</p>
           <h2 id="demo-title">See the lifecycle in an application.</h2>
           <p>The restaurant demo uses a familiar bill to show authorization, captures and unused-budget release. It is one example built on Capture402.</p>
-          <div class="c402-home-actions"><a class="c402-home-button c402-home-primary" href="/customer">Open restaurant demo ↗</a><a class="c402-home-button c402-home-text-button" href="#developers">Explore developer notes ↑</a>
+          <div class="c402-home-actions"><a class="c402-home-button c402-home-primary" href="https://e2e.capture402.xyz/customer">Open restaurant demo ↗</a><a class="c402-home-button c402-home-text-button" href="#developers">Explore developer notes ↑</a>
           </div>
           <p class="c402-home-note">Solana Devnet · Test tokens · Wallet setup required to authorize. Merchant actions require a separately authenticated operator.</p>
         </section>
@@ -375,7 +394,7 @@
         <div><a class="c402-home-brand" href="/">Capture402</a>
           <p class="c402-home-note">Authorize a maximum. Capture in parts. Release the unused balance.</p>
         </div>
-        <nav aria-label="Footer navigation"><a href="https://github.com/starPaw/svm-auth-capture">GitHub — access required ↗</a><a href="#proof">Devnet record ↑</a><a href="/customer">Restaurant demo ↗</a>
+        <nav aria-label="Footer navigation"><a href="https://github.com/starPaw/svm-auth-capture">GitHub — access required ↗</a><a href="#latest-demo">Devnet record ↑</a><a href="https://e2e.capture402.xyz/customer">Restaurant demo ↗</a>
         </nav>
         <p class="c402-home-note">Experimental Devnet implementation. No mainnet or security-audit claim.</p>
       </footer>

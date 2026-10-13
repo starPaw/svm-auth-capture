@@ -91,7 +91,7 @@
 #c402-home-root summary{min-height:48px;padding:16px 0;font-size:16px;font-weight:700}
 #c402-home-root details p{margin-top:16px}
 .c402-home-proof{background:var(--ink);color:var(--paper)}
-.c402-home-proof .c402-home-eyebrow,#c402-home-root .c402-home-proof small{color:#b8c5bf}
+.c402-home-proof .c402-home-eyebrow,.c402-home-proof .c402-home-note,#c402-home-root .c402-home-proof small{color:#b8c5bf}
 #c402-home-root .c402-home-proof a{color:#dce4ff;display:inline-flex;align-items:center;min-height:44px;text-decoration:underline}
 #c402-home-root .c402-home-proof :is(a,summary):focus-visible{outline-color:#f4bd7c}
 .c402-home-evidence{width:100%;border-collapse:collapse;margin-top:40px;text-align:left}

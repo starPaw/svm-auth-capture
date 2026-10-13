@@ -1,0 +1,123 @@
+{
+  "status": "LIVE_BROWSER_UI_REAL_WEBCRYPTO_WALLET_FINALIZED",
+  "source": "c3d8ea8380a6cd9665a90ff851120162e80a0702",
+  "scope": "REAL_PUBLISHED_UI_WALLET_STANDARD_HARNESS_NO_HTTP_MOCK_NO_DIRECT_ECONOMIC_API_CALL",
+  "order": "e8195333622e325a9a5a0507ce74bcb4",
+  "payer": "8CaaMzVdhrxLhkvQ46my5AYA7wDvFZL4o4iZtuXXBFcT",
+  "payment": "Cvnx3iy4gG8azkLrxJAEKwks83Gi2jm4PwMJJPfS31tv",
+  "mint": "91wxVDcTEf5kRRRFmkUKohdNLFRAh5tw9YqWxV8FYvJp",
+  "merchant": "CbSG1T25CHcKqPGgu5nrd2b62yVdXMp2GK6UhWYocA1t",
+  "sponsor": "5mkvwgKeWMYrFppGm8ugLzQC9Wff4vduqWphsGhQNigX",
+  "signatures": [
+    {
+      "action": "faucet",
+      "signature": "4H4n6JCEwwokWJnoWcUfoNBBMkb8aKLy8wLVu7aPnZ1FFsj14oQRJEimyNH7Moeha9GtP2Zyc6yrPTcQCsQrNSN6",
+      "slot": "510729240",
+      "feeLamports": "7100",
+      "messageSha256": "cde9be45c1c49fd7a82008306e4b505bbf7f71154dd44179893dc1f81f571397",
+      "verifiedSigners": [
+        "5mkvwgKeWMYrFppGm8ugLzQC9Wff4vduqWphsGhQNigX"
+      ],
+      "payerDelta": "1000000000",
+      "merchantDelta": "0",
+      "vaultDelta": "0",
+      "poolDelta": "-1000000000"
+    },
+    {
+      "action": "authorize",
+      "signature": "4bWWdmRCgKuthG9Cnmtmy5EhmDjRgC2gXCW7cMysiDgCDAemb8ncTKYXFcWr3VEcqsoGiNsU4mHmuvBm5HNYxDWV",
+      "slot": "510729558",
+      "feeLamports": "16000",
+      "messageSha256": "ac3b2df0fb33ae68d092ca751b8ab850e9c81c709dc8f0503776064120813006",
+      "verifiedSigners": [
+        "5mkvwgKeWMYrFppGm8ugLzQC9Wff4vduqWphsGhQNigX",
+        "8CaaMzVdhrxLhkvQ46my5AYA7wDvFZL4o4iZtuXXBFcT"
+      ],
+      "payerDelta": "-100000000",
+      "merchantDelta": "0",
+      "vaultDelta": "100000000",
+      "poolDelta": "0"
+    },
+    {
+      "action": "beer",
+      "signature": "561WoMwERBLVr8bjxbhM2RzqsGsrbYeYRGsQkCwCz6MpvxZCX3hqgNLXKveYdqiiTzKwb8pCR3vRQCNN5wYhyb64",
+      "slot": "510729842",
+      "feeLamports": "13100",
+      "messageSha256": "d7171ffd1ea85032703b30bf952a577294c44f9f73a5e26c4a07fd07870c05da",
+      "verifiedSigners": [
+        "5mkvwgKeWMYrFppGm8ugLzQC9Wff4vduqWphsGhQNigX",
+        "CbSG1T25CHcKqPGgu5nrd2b62yVdXMp2GK6UhWYocA1t"
+      ],
+      "payerDelta": "0",
+      "merchantDelta": "40000000",
+      "vaultDelta": "-40000000",
+      "poolDelta": "0"
+    },
+    {
+      "action": "salmon",
+      "signature": "4h622EBukmjTAHSSV9zGKR5fKg6sTT1TmQniAzGZbR6pECX1M3MWgK4bgYjXerw68qfw8HUjzP7HUhWSNVhsmSEN",
+      "slot": "510729935",
+      "feeLamports": "13100",
+      "messageSha256": "9f34b1298dbbbec84826c650d00e564758e42e07637565f008676c7143318f85",
+      "verifiedSigners": [
+        "5mkvwgKeWMYrFppGm8ugLzQC9Wff4vduqWphsGhQNigX",
+        "CbSG1T25CHcKqPGgu5nrd2b62yVdXMp2GK6UhWYocA1t"
+      ],
+      "payerDelta": "0",
+      "merchantDelta": "25000000",
+      "vaultDelta": "-25000000",
+      "poolDelta": "0"
+    },
+    {
+      "action": "finish",
+      "signature": "4RGzSEmPMgKsEVgRTzFftkJ7dcQBbdHaBERDYtxRbk62YYoHiatz5me4ovBtGjUMYnSCL36Q7ii1qdsJWzTqm1U6",
+      "slot": "510729987",
+      "feeLamports": "14000",
+      "messageSha256": "0b0f142384901803940fcc15ce5a7cd268ecbce0ef30d6f312d429902e3f3116",
+      "verifiedSigners": [
+        "5mkvwgKeWMYrFppGm8ugLzQC9Wff4vduqWphsGhQNigX",
+        "CbSG1T25CHcKqPGgu5nrd2b62yVdXMp2GK6UhWYocA1t"
+      ],
+      "payerDelta": "35000000",
+      "merchantDelta": "0",
+      "vaultDelta": "-35000000",
+      "poolDelta": "0"
+    },
+    {
+      "action": "refund",
+      "signature": "kFXsRgQNZqfNb9iDy8UcQBzKcKvJML58Nkp9sV4kXwJcDuQixyFcbbrSHmU1YPCLu1EDZtaA7sBuVfTJroXzDqj",
+      "slot": "510730045",
+      "feeLamports": "13100",
+      "messageSha256": "91144a46f981f1ebc2bf5f60e22a6898315d644b0a96210de03a5963183ab084",
+      "verifiedSigners": [
+        "5mkvwgKeWMYrFppGm8ugLzQC9Wff4vduqWphsGhQNigX",
+        "CbSG1T25CHcKqPGgu5nrd2b62yVdXMp2GK6UhWYocA1t"
+      ],
+      "payerDelta": "10000000",
+      "merchantDelta": "-10000000",
+      "vaultDelta": "0",
+      "poolDelta": "0"
+    }
+  ],
+  "finalSnapshotSlot": "510730960",
+  "final": {
+    "H": "0",
+    "F": "55000000",
+    "payerBaseUnits": "945000000",
+    "merchantBeforeBaseUnits": "295000000",
+    "merchantAfterBaseUnits": "350000000",
+    "merchantDeltaBaseUnits": "55000000",
+    "vaultBaseUnits": "0",
+    "poolBaseUnits": "97000000000"
+  },
+  "quota": {
+    "orders": 18,
+    "relays": 57,
+    "faucetClaims": 3
+  },
+  "keyExtractable": false,
+  "keyExported": false,
+  "walletHarness": "BROWSER_DEVNET_ONLY_ONE_USE_WEBCRYPTO_ED25519",
+  "solflareExtensionApproval": "NOT RUN",
+  "historicalUnknownReserveRetained": true
+}

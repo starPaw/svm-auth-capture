@@ -101,3 +101,18 @@ test("critical lifecycle, refund and reclaim copy survives without JS and assets
   }
   expect(gzipSync(Buffer.from(html)).byteLength + gzipSync(readFileSync(new URL("homepage.css", web))).byteLength + gzipSync(readFileSync(new URL("homepage.js", web))).byteLength).toBeLessThan(200_000);
 });
+
+test('homepage connects visitors to the fixed public campaign and records the actual browser scope',()=>{
+  const latest=JSON.parse(readFileSync(new URL('public-demo-proof.json',web),'utf8'));
+  expect(latest.source).toBe('c3d8ea8380a6cd9665a90ff851120162e80a0702');
+  expect(latest.scope).toBe('REAL_PUBLISHED_UI_WALLET_STANDARD_HARNESS_NO_HTTP_MOCK_NO_DIRECT_ECONOMIC_API_CALL');
+  expect(latest.keyExported).toBe(false);expect(latest.solflareExtensionApproval).toBe('NOT RUN');
+  const section=html.split('id="latest-demo"')[1]!.split('</section>')[0]!;
+  expect(section).toContain('https://e2e.capture402.xyz/customer');
+  expect(section).toContain('href="/customer">Previous order history');
+  expect(section).toContain("Solflare's approval interface was not exercised");
+  for(const e of latest.signatures.slice(1)){expect(section).toContain(`https://explorer.solana.com/tx/${e.signature}?cluster=devnet`);expect(section).toContain(`Slot ${e.slot}`);}
+  expect([...html.matchAll(/href="\/customer">([^<]+)/g)].map(m=>m[1])).toEqual(['Previous order history ↗']);
+  expect(latest.final).toMatchObject({H:'0',F:'55000000',payerBaseUnits:'945000000',merchantDeltaBaseUnits:'55000000'});
+  expect([...html.matchAll(/href="([^"]+)">[^<]*(?:Try your own order|Try the Devnet demo)/g)].map(m=>m[1])).toEqual(Array(4).fill('https://e2e.capture402.xyz/customer'));
+});
