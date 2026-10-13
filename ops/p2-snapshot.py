@@ -31,7 +31,8 @@ def main():
  for p,expected in [(node,NODE_ARCHIVE),(deps,DEPS_ARCHIVE),(inventory,INVENTORY)]:
   if digest(p)!=expected:raise RuntimeError('authenticated B1 archive/inventory mismatch')
  root.mkdir(mode=0o700)
- paths=['integration/src','integration/evidence','integration/package.json','integration/package-lock.json','ops/p2-compartment.sh','ops/p2-verify.py','ops/p2-operator-parent.conf']
+ paths=['integration/src','integration/evidence','integration/package.json','integration/package-lock.json','ops/p2-compartment.sh','ops/p2-verify.py','ops/p2-operator-parent.conf',
+        'ops/faucet-stock-compartment.sh','ops/faucet-stock-verify.py','docs/evidence/sac-007/deployment-identity.v1.json']
  archive=subprocess.check_output(['git','-C',repo,'archive',sha,*paths])
  with tarfile.open(fileobj=io.BytesIO(archive)) as t:unpack(t,root)
  with tarfile.open(deps) as t:unpack(t,root/'integration')
