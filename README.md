@@ -5,6 +5,8 @@ spending ceiling, capturing portions of it, releasing unused funds, and issuing
 merchant-funded refunds. The HTTP integration uses x402 v2 transport with a
 project-specific SVM Auth-Capture binding.
 
+Project website: [capture402.xyz](https://capture402.xyz/).
+
 ## Payment lifecycle
 
 | Operation | Authority | Effect |
