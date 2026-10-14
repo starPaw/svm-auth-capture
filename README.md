@@ -81,5 +81,28 @@ rewritten commit identities differ from the original private history. Future
 changes should start from this public history rather than merging an old private
 branch into it.
 
+## Development and publication
+
+Owner development, accepted operational records and both website deployment
+sources remain in private `starPaw/capture402`. This public repository publishes
+reviewed source and dated product history. It does not select a deployed release.
+
+The main site is [capture402.xyz](https://capture402.xyz); its code and integration
+links point here. The [isolated development demo](https://e2e.capture402.xyz/customer)
+uses a separately accepted private revision. Private test records and reviews are
+labelled as access required; contact [starPaw](https://github.com/starPaw) to request
+access before relying on those records.
+
+Public contributions start from this repository's `main` and use a task branch
+and PR. Maintainer publications transfer selected reviewed changes while retaining
+contributor attribution and original author dates. Neither direction merges the
+other repository's history. Public CI and history/privacy checks must pass before
+publication. Private instructions, evidence, credentials and runtime deployment
+records stay private; public tests retain their synthetic fixtures.
+
+Repository synchronization is reviewed per change; no automatic mirroring,
+publication or deployment pipeline connects the two repositories. Each merge and
+each live deployment requires its own owner authorization.
+
 Licensed under [Apache-2.0](LICENSE). Existing third-party notices, including the
 generated wallet bundle's legal notices, retain their original terms.

@@ -72,6 +72,11 @@ test("static evidence includes every full historical identity, URL, slot and cor
   expect(html).not.toContain("/docs/evidence/");
   expect(html).toContain("not a live service-status indicator or validation of the current website release");
   expect(html).toContain("upgrade authority"); expect(html).toContain("Public source and integration documentation.");
+  expect(html).toContain('href="https://github.com/starPaw/svm-auth-capture/blob/main/src/lib.rs"');
+  expect(html).toContain('href="https://github.com/starPaw/svm-auth-capture">Public GitHub ↗');
+  expect(html).toContain('href="https://github.com/starPaw/capture402/pull/90#issuecomment-6153510430">Browser test record — access required ↗');
+  expect(html).toContain('href="https://github.com/starPaw">request access from starPaw');
+  expect(html).not.toMatch(/https:\/\/github\.com\/starPaw\/svm-auth-capture\/(?:pull|issues)\//);
 });
 
 test("critical lifecycle, refund and reclaim copy survives without JS and assets stay within budgets", () => {
