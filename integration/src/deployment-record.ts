@@ -17,7 +17,7 @@ export const ACCEPTED_DEPLOYMENT_RECORD = {
   revision: "333d87fbd777ceed89ce432a6fe2368639c9bbc2",
   path: "docs/evidence/sac-007/deployment-identity.v1.json",
   sha256: "f013c31e871c7b66812a8156b2f9bfef8b76dc14c1d77722512d952852d47b87",
-  acceptance: "https://github.com/starPaw/svm-auth-capture/pull/13#issuecomment-6020976687",
+  acceptance: "https://github.com/starPaw/capture402/pull/13#issuecomment-6020976687",
 } as const;
 
 export type DeploymentRecord = {

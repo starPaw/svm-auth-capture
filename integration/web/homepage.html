@@ -129,8 +129,8 @@
             <p class="c402-home-eyebrow">Try it / Your own test order</p>
             <h2 id="latest-demo-title">Test both sides of your own order.</h2>
             <p>Connect a Devnet wallet, get 1,000 test tokens, and authorize 100. Enable merchant demo controls with your wallet, then capture 40 and 25, release 35, and refund 10. Each action is limited to your original order and deadlines. No merchant secret is needed.</p>
-            <div class="c402-home-actions"><a class="c402-home-button c402-home-primary" href="https://e2e.capture402.xyz/customer">Try your own order ↗</a><a class="c402-home-button" href="https://github.com/starPaw/svm-auth-capture/pull/90#issuecomment-6153510430">Browser test record ↗</a></div>
-            <p class="c402-home-note">Solana Devnet only. No real USDC or monetary value. Limited shared test campaign.</p>
+            <div class="c402-home-actions"><a class="c402-home-button c402-home-primary" href="https://e2e.capture402.xyz/customer">Try your own order ↗</a><a class="c402-home-button" href="https://github.com/starPaw/capture402/pull/90#issuecomment-6153510430">Browser test record — access required ↗</a></div>
+            <p class="c402-home-note">Solana Devnet only. No real USDC or monetary value. Limited shared test campaign. The browser test record is private; <a href="https://github.com/starPaw">request access from starPaw</a>.</p>
             <table class="c402-home-evidence"><caption>13 Oct 2026 · Browser controls and finalized Devnet receipts</caption><thead><tr><th scope="col">Action</th><th scope="col">State after operation</th><th scope="col">Transaction</th></tr></thead><tbody>
               <tr><th scope="row">Authorize 100</th><td>Held 100 · Captured, unrefunded 0<small>Finalized on Devnet</small></td><td><a href="https://explorer.solana.com/tx/4bWWdmRCgKuthG9Cnmtmy5EhmDjRgC2gXCW7cMysiDgCDAemb8ncTKYXFcWr3VEcqsoGiNsU4mHmuvBm5HNYxDWV?cluster=devnet">Authorize 100 receipt ↗</a><small class="c402-home-mono">Slot 510729558</small></td></tr>
               <tr><th scope="row">Capture 40</th><td>Held 60 · Captured, unrefunded 40<small>Finalized on Devnet</small></td><td><a href="https://explorer.solana.com/tx/561WoMwERBLVr8bjxbhM2RzqsGsrbYeYRGsQkCwCz6MpvxZCX3hqgNLXKveYdqiiTzKwb8pCR3vRQCNN5wYhyb64?cluster=devnet">Capture 40 receipt ↗</a><small class="c402-home-mono">Slot 510729842</small></td></tr>
@@ -324,7 +324,7 @@
             <div>
               <h3>Start with the integration model</h3>
               <p>Start by defining the merchant, asset, ceiling and deadlines. Connect application metering to merchant-signed operations, and preserve pending outcomes until they are resolved. The repository contains reference flows; it is not a hosted billing service or a published drop-in SDK.</p>
-              <p><a href="https://github.com/starPaw/svm-auth-capture/blob/main/README.md">Architecture ↗</a> · <a href="https://github.com/starPaw/svm-auth-capture/blob/main/integration/README.md">Integration guide ↗</a></p>
+              <p><a href="https://github.com/starPaw/svm-auth-capture/blob/main/README.md">Implementation overview ↗</a> · <a href="https://github.com/starPaw/svm-auth-capture/blob/main/integration/README.md">Integration guide ↗</a></p>
               <p class="c402-home-note">Public source and integration documentation.</p>
             </div>
           </div>
@@ -335,15 +335,15 @@
             </details>
             <details>
               <summary>Explore the implementation</summary>
-              <p>Explore the public source and integration guide below.</p>
+              <p>Explore the public source and integration guide below. Current development and operational records are private; <a href="https://github.com/starPaw">request access from starPaw</a>.</p>
               <ul class="c402-home-sources">
-                <li><a href="https://github.com/starPaw/svm-auth-capture/blob/main/README.md">Architecture ↗</a>
+                <li><a href="https://github.com/starPaw/svm-auth-capture/blob/main/README.md">Implementation overview ↗</a>
                 </li>
                 <li><a href="https://github.com/starPaw/svm-auth-capture/blob/main/integration/README.md">Integration guide ↗</a>
                 </li>
                 <li><a href="https://github.com/starPaw/svm-auth-capture/blob/main/src/lib.rs">Solana program ↗</a>
                 </li>
-                <li><a href="https://github.com/starPaw/svm-auth-capture">GitHub ↗</a>
+                <li><a href="https://github.com/starPaw/svm-auth-capture">Public GitHub ↗</a>
                 </li>
               </ul>
             </details>
@@ -381,7 +381,7 @@
         <div><a class="c402-home-brand" href="/">Capture402</a>
           <p class="c402-home-note">Authorize a maximum. Capture in parts. Release the unused balance.</p>
         </div>
-        <nav aria-label="Footer navigation"><a href="https://github.com/starPaw/svm-auth-capture">GitHub ↗</a><a href="#latest-demo">Devnet record ↑</a><a href="https://e2e.capture402.xyz/customer">Restaurant demo ↗</a>
+        <nav aria-label="Footer navigation"><a href="https://github.com/starPaw/svm-auth-capture">Public GitHub ↗</a><a href="#latest-demo">Devnet record ↑</a><a href="https://e2e.capture402.xyz/customer">Restaurant demo ↗</a>
         </nav>
         <p class="c402-home-note">Experimental Devnet implementation. No mainnet or security-audit claim.</p>
       </footer>
