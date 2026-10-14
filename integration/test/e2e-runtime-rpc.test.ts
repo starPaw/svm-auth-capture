@@ -5,12 +5,12 @@ import {once} from 'node:events';
 import {readFileSync} from 'node:fs';
 import {getAddressEncoder} from '@solana/kit';
 import {rpcBackend} from '../operators/e2e-provision.ts';
-import {loadDeploymentRecord} from '../src/deployment-record.ts';
-const record=loadDeploymentRecord('../docs/evidence/sac-007/deployment-identity.v1.json');
+import {parsedDeploymentFixture,fixtureExecutable} from './fixtures/deployment-fixture.ts';
+const record=parsedDeploymentFixture();
 test.each(['accepted','wrong-genesis','wrong-program','stale-finalized-bank'])('same configured provider binds all quotes/finality/minContextSlot: %s',async fault=>{
   const calls:{method:string;params:any[]}[]=[];
   const pin=record.deployment,p=Buffer.alloc(36);p.writeUInt32LE(2);p.set(getAddressEncoder().encode(pin.programData),4);
-  const binary=readFileSync('../docs/evidence/sac-007/build-candidate/svm_auth_capture.so'),d=Buffer.alloc(45+binary.length);
+  const binary=fixtureExecutable,d=Buffer.alloc(45+binary.length);
   d.writeUInt32LE(3);d.writeBigUInt64LE(pin.slot,4);d[12]=1;d.set(getAddressEncoder().encode(pin.upgradeAuthority!),13);d.set(binary,45);
   if(fault==='wrong-program')d[45]=d[45]!^1;
   const account=(bytes:Buffer,executable:boolean)=>({owner:pin.loader,executable,lamports:1,data:[bytes.toString('base64'),'base64'],rentEpoch:0,space:bytes.length});

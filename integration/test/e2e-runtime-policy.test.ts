@@ -1,8 +1,8 @@
 import {expect,test} from 'vitest';
 import {createHash} from 'node:crypto';
 import {validateRuntimeRpc} from '../src/e2e-runtime-policy.ts';
-import {loadDeploymentRecord} from '../src/deployment-record.ts';
-const record=loadDeploymentRecord('../docs/evidence/sac-007/deployment-identity.v1.json');
+import {parsedDeploymentFixture,fixtureExecutable} from './fixtures/deployment-fixture.ts';
+const record=parsedDeploymentFixture();
 const endpoint='https://approved.invalid/private-fixture-token';
 const policy={schema:1,endpointSha256:createHash('sha256').update(endpoint).digest('hex'),genesisHash:record.network.genesisHash,deploymentSha256:record.sha256};
 test('private owner-selected endpoint is exact-bound to network and accepted program identity',()=>{

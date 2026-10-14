@@ -1,0 +1,14 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Environment-variable identifiers are names, not credential values"
+regexTarget = "secret"
+regexes = ['''^SAC006_[A-Z0-9_]+$''']
+
+[[rules]]
+id = "helius-rpc-api-key"
+description = "Credential embedded in a Helius RPC URL"
+regex = '''(?i)https?://[^\s"<>]*helius-rpc\.com/\?api-key=([a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})'''
+secretGroup = 1
+keywords = ["helius-rpc.com"]

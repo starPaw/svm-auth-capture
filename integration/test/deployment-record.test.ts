@@ -1,18 +1,17 @@
-// Tests for SAC-007 deployment-identity v1 record validation (SAC-006 consumer side) — no network
-// access. The accepted record in this repository must load under the default pin; every
-// incomplete, malformed, placeholder, ineligible, or inconsistent variant of it must be rejected,
-// and a record whose bytes differ from the pinned accepted record is rejected even if valid.
+// Offline schema, RPC identity and immutable acceptance-pin regressions.
+// The public repository supplies synthetic test data; private deployment records
+// are not copied or silently substituted for the production acceptance pin.
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "vitest";
 import { getAddressEncoder, type Rpc, type SolanaRpcApi } from "@solana/kit";
 import { RpcLedger } from "../src/rpc-ledger.ts";
 import { ACCEPTED_DEPLOYMENT_RECORD, loadDeploymentRecord, parseDeploymentRecord } from "../src/deployment-record.js";
 
-const ACCEPTED_PATH = fileURLToPath(new URL(`../../${ACCEPTED_DEPLOYMENT_RECORD.path}`, import.meta.url));
-const accepted = (): Record<string, any> => JSON.parse(readFileSync(ACCEPTED_PATH, "utf8"));
+import { deploymentFixture, parsedDeploymentFixture, fixtureExecutable } from "./fixtures/deployment-fixture.ts";
+const accepted = deploymentFixture;
+const ACCEPTED_PATH = writeRecord(accepted()).path;
 
 function writeRecord(record: unknown): { path: string } {
   const path = join(mkdtempSync(join(tmpdir(), "sac006-record-")), "deployment-identity.v1.json");
@@ -28,14 +27,14 @@ function rejects(mutate: (r: Record<string, any>) => void, reason: RegExp): void
   expect(() => parseDeploymentRecord(r)).toThrow(reason);
 }
 
-describe("the accepted SAC-007 record", () => {
+describe("synthetic deployment validation and immutable acceptance pin", () => {
   test.each(["matching", "byte", "padding", "slot", "authority", "pointer", "loader", "executable", "stale"])("live deployment comparison: %s", async (mutation) => {
-    const record = loadDeploymentRecord(ACCEPTED_PATH);
+    const record = parsedDeploymentFixture();
     const pin = record.deployment;
     const p = new Uint8Array(36);
     new DataView(p.buffer).setUint32(0, 2, true);
     p.set(getAddressEncoder().encode(pin.programData), 4);
-    const binary = readFileSync(new URL("../../docs/evidence/sac-007/build-candidate/svm_auth_capture.so", import.meta.url));
+    const binary = fixtureExecutable;
     const d = new Uint8Array(45 + binary.length + 8);
     const view = new DataView(d.buffer);
     view.setUint32(0, 3, true); view.setBigUint64(4, pin.slot, true);
@@ -58,18 +57,14 @@ describe("the accepted SAC-007 record", () => {
   });
 
   test("startup must reject a missing or upgraded live program even when genesis and record match", async () => {
-    const record = loadDeploymentRecord(ACCEPTED_PATH);
+    const record = parsedDeploymentFixture();
     const config = { network: record.network.caip2, genesisHash: record.network.genesisHash, rpcUrl: "http://unused.invalid", deployment: record,
       rpc: { getGenesisHash: () => ({ send: async () => record.network.genesisHash }), getMultipleAccounts: () => ({ send: async () => ({ context: { slot: 600000000n }, value: [null, null] }) }) } as unknown as Rpc<SolanaRpcApi> };
     await expect(new RpcLedger(config).verifyGenesis()).rejects.toThrow(/deployment/);
   });
-  test("loads under the default pin and yields the consumed identity", () => {
-    const record = loadDeploymentRecord(ACCEPTED_PATH);
-    expect(record).toMatchObject({
-      network: { cluster: "devnet", genesisHash: "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG", caip2: "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1" },
-      programId: "992QmwmwCebawRJsTCgvc8qnzGivbFaD39ZQE7VhHp7o",
-      sha256: ACCEPTED_DEPLOYMENT_RECORD.sha256,
-    });
+  test("synthetic fixture is valid schema but cannot become an accepted deployment", () => {
+    expect(() => parseDeploymentRecord(accepted())).not.toThrow();
+    expect(() => loadDeploymentRecord(ACCEPTED_PATH)).toThrow(/not the pinned accepted record/);
   });
 
   test("a valid record whose bytes differ from the pinned accepted record is rejected", () => {
@@ -77,10 +72,10 @@ describe("the accepted SAC-007 record", () => {
     expect(() => loadDeploymentRecord(path)).toThrow(/not the pinned accepted record/);
   });
 
-  test("a CRLF checkout of the accepted record still matches the pin", () => {
+  test("CRLF conversion cannot promote a synthetic record into the accepted pin", () => {
     const path = join(mkdtempSync(join(tmpdir(), "sac006-record-")), "deployment-identity.v1.json");
     writeFileSync(path, readFileSync(ACCEPTED_PATH, "utf8").replace(/\n/g, "\r\n"));
-    expect(loadDeploymentRecord(path).sha256).toBe(ACCEPTED_DEPLOYMENT_RECORD.sha256);
+    expect(() => loadDeploymentRecord(path)).toThrow(/not the pinned accepted record/);
   });
 
   test("callers cannot substitute another acceptance hash", () => {
@@ -120,7 +115,9 @@ describe("incomplete records are rejected", () => {
   });
 
   test("the unpopulated template", () => {
-    const template = JSON.parse(readFileSync(ACCEPTED_PATH.replace(".v1.json", ".v1.template.json"), "utf8"));
+    const template = deploymentFixture();
+    template.record_status = "template";
+    template.program.executable = "placeholder";
     expect(() => parseDeploymentRecord(template)).toThrow(/record_status is "template"/);
     template.record_status = "verified";
     expect(() => parseDeploymentRecord(template)).toThrow(/placeholder|malformed|not boolean true/);
@@ -156,16 +153,16 @@ describe("ineligible or inconsistent verified records are rejected", () => {
   test("unknown upgrade authority", () => rejects((r) => ((r.program.upgrade_authority = { status: "unknown", public_key: null })), /unknown/));
   test("absent authority with a key", () => rejects((r) => (r.program.upgrade_authority.status = "absent"), /must be null/));
   test("upgradeable loader without ProgramData", () => rejects((r) => (r.program.program_data = null), /ProgramData/));
-  test("a deployment transaction below finalized", () => rejects((r) => (r.deployment.transactions[3].commitment = "confirmed"), /finalized\/success/));
-  test("a failed deployment transaction", () => rejects((r) => (r.deployment.transactions[3].result = "failure"), /finalized\/success/));
-  test("observation slot before the deployment slot", () => rejects((r) => (r.verification.observation_slot = "508146248"), /observation_slot/));
+  test("a deployment transaction below finalized", () => rejects((r) => (r.deployment.transactions[0].commitment = "confirmed"), /finalized\/success/));
+  test("a failed deployment transaction", () => rejects((r) => (r.deployment.transactions[0].result = "failure"), /finalized\/success/));
+  test("observation slot before the deployment slot", () => rejects((r) => (r.verification.observation_slot = "9"), /observation_slot/));
   test("executable comparison not match", () => rejects((r) => (r.verification.executable_comparison.result = "unknown"), /requires match/));
   test("compared length differs from the artifact size", () => rejects((r) => (r.verification.executable_comparison.compared_length_bytes = "116703"), /compared_length_bytes/));
   test("deployed hash differs from the artifact hash", () => rejects((r) => (r.verification.executable_comparison.deployed_executable_sha256 = "0".repeat(64)), /deployed_executable_sha256/));
 });
 
-// The accepted producer template is the required-field inventory, rather than a second schema.
-const template = JSON.parse(readFileSync(ACCEPTED_PATH.replace(".v1.json", ".v1.template.json"), "utf8"));
+// The synthetic record enumerates the same v1 producer fields without private evidence.
+const template = deploymentFixture();
 function requiredPaths(value: unknown, prefix: string[] = []): string[][] {
   if (!value || typeof value !== "object") return [];
   const entries = Array.isArray(value) ? (value.length ? [["0", value[0]] as const] : []) : Object.entries(value);

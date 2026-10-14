@@ -170,7 +170,7 @@ class HostCommandTests(unittest.TestCase):
                   mock.patch.object(cli.urllib.request, 'build_opener', return_value=opener)):
                 client = cli.GitHub()
                 with self.assertRaisesRegex(RuntimeError, '^release API HTTP 403$'):
-                    client('repos/starPaw/svm-auth-capture/git/ref/heads/main')
+                    client('repos/starPaw/capture402/git/ref/heads/main')
             request = opener.open.call_args.args[0]
             self.assertNotIn('fixture-token', request.full_url)
             self.assertEqual(request.get_header('Authorization'), 'Bearer fixture-token')

@@ -43,7 +43,7 @@ MAX_TAR_STREAM = 256 * 1024 * 1024
 # This key is unrelated to Actions -> VPS SSH or Solana economic authorities.
 SOURCE_KEY = Path("/home/capture402-deploy/.ssh/github-source-readonly")
 SOURCE_KNOWN_HOSTS = Path("/etc/capture402/github_known_hosts")
-SOURCE_REMOTE = "ssh://git@github.com/starPaw/svm-auth-capture.git"
+SOURCE_REMOTE = "ssh://git@github.com/starPaw/capture402.git"
 
 
 def require(condition: bool, message: str) -> None:

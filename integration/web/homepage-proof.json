@@ -1,9 +1,7 @@
 {
-  "purpose": "Design handoff publication candidate. Curated historical evidence, not a live status feed.",
+  "purpose": "Curated historical on-chain explorer references. Original internal audit retained privately; not acceptance of this rewritten source.",
   "reviewedOn": "2026-10-09",
-  "repositoryRevision": "b52386c7432e356d20516d69be24d8c20d4764aa",
   "runId": "20261007T194057Z",
-  "runSourceRevision": "54333b260064c746a7fc939cf39d9cef87145bd7",
   "recordedAuditAt": "2026-10-07T19:54:42.106Z",
   "network": "Solana Devnet",
   "units": "test token base units; no currency or USDC denomination",
@@ -27,8 +25,7 @@
         "held": "100",
         "refundable": "0"
       },
-      "explorerUrl": "https://explorer.solana.com/tx/iFvw98yRxhyxwUn6xdnmoYSbonNCLXsjuE62TgphuE3ctXbvMwCj6MH2ZhomgphV44wVULRLqsB31Rh7LEs68dY?cluster=devnet",
-      "sourcePath": "docs/evidence/sac-006/runs/20261007T194057Z/logs/20-chains.log"
+      "explorerUrl": "https://explorer.solana.com/tx/iFvw98yRxhyxwUn6xdnmoYSbonNCLXsjuE62TgphuE3ctXbvMwCj6MH2ZhomgphV44wVULRLqsB31Rh7LEs68dY?cluster=devnet"
     },
     {
       "label": "A partial capture 30",
@@ -46,8 +43,7 @@
         "held": "70",
         "refundable": "30"
       },
-      "explorerUrl": "https://explorer.solana.com/tx/4tVQhdHzUmEdNkFRDwY8V8rzd9fh1YqudHtpZzg5jKoTDefrWQcwUYz5sFAZJAL3h5hvqYypQb6uiFok3noN8dek?cluster=devnet",
-      "sourcePath": "docs/evidence/sac-006/runs/20261007T194057Z/logs/20-chains.log"
+      "explorerUrl": "https://explorer.solana.com/tx/4tVQhdHzUmEdNkFRDwY8V8rzd9fh1YqudHtpZzg5jKoTDefrWQcwUYz5sFAZJAL3h5hvqYypQb6uiFok3noN8dek?cluster=devnet"
     },
     {
       "label": "A capture-and-void 20",
@@ -66,8 +62,7 @@
         "held": "0",
         "refundable": "50"
       },
-      "explorerUrl": "https://explorer.solana.com/tx/61HWVqNFmepZEQWKSfb6qHJVGqXPkkAYoSM9HeGTSA9Ez7kkjTdszFkXaoGVXtMQ8Kixxe8kbJL92AYtCMvzijRL?cluster=devnet",
-      "sourcePath": "docs/evidence/sac-006/runs/20261007T194057Z/logs/21-chains-continuation.log"
+      "explorerUrl": "https://explorer.solana.com/tx/61HWVqNFmepZEQWKSfb6qHJVGqXPkkAYoSM9HeGTSA9Ez7kkjTdszFkXaoGVXtMQ8Kixxe8kbJL92AYtCMvzijRL?cluster=devnet"
     },
     {
       "label": "A later refund 15",
@@ -84,8 +79,7 @@
         "held": "0",
         "refundable": "35"
       },
-      "explorerUrl": "https://explorer.solana.com/tx/3f4YSodspGkKRWzboi5WUpom154Y3yzUNMx3YSDkPq1ad5mhgAP5VjnrvPYtZZPPZrEd3axLGAwceEeWKA68RTkC?cluster=devnet",
-      "sourcePath": "docs/evidence/sac-006/runs/20261007T194057Z/logs/21-chains-continuation.log"
+      "explorerUrl": "https://explorer.solana.com/tx/3f4YSodspGkKRWzboi5WUpom154Y3yzUNMx3YSDkPq1ad5mhgAP5VjnrvPYtZZPPZrEd3axLGAwceEeWKA68RTkC?cluster=devnet"
     }
   ],
   "finalSnapshot": {
@@ -102,43 +96,5 @@
     "Source revision differs from current main and running dev checkout. No current deployment or browser-wallet acceptance claim.",
     "Upgradeable Devnet deployment in retained record; not audited/mainnet readiness.",
     "Refund requires merchant signature and sufficient merchant tokens before refund deadline."
-  ],
-  "sourceFiles": [
-    {
-      "path": "docs/evidence/sac-006/runs/20261007T194057Z/paced-live-audit.json",
-      "sha256": "db42e11dab71bf895e1503810405a36b607fbd8e73c820017ce7ed231c0620a1",
-      "url": "https://github.com/starPaw/svm-auth-capture/blob/b52386c7432e356d20516d69be24d8c20d4764aa/docs/evidence/sac-006/runs/20261007T194057Z/paced-live-audit.json",
-      "access": "private repository"
-    },
-    {
-      "path": "docs/evidence/sac-006/runs/20261007T194057Z/MANIFEST.txt",
-      "sha256": "e0f4ca43ed2ae2b711feab9753a4a29d78bf9646ff5dbf9e1e3aaacdca06007a",
-      "url": "https://github.com/starPaw/svm-auth-capture/blob/b52386c7432e356d20516d69be24d8c20d4764aa/docs/evidence/sac-006/runs/20261007T194057Z/MANIFEST.txt",
-      "access": "private repository"
-    },
-    {
-      "path": "docs/evidence/sac-006/runs/20261007T194057Z/logs/20-chains.log",
-      "sha256": "4ead56efcbea1c99e2337e5a825b3a079f593877eb7c02461482942107c84540",
-      "url": "https://github.com/starPaw/svm-auth-capture/blob/b52386c7432e356d20516d69be24d8c20d4764aa/docs/evidence/sac-006/runs/20261007T194057Z/logs/20-chains.log",
-      "access": "private repository"
-    },
-    {
-      "path": "docs/evidence/sac-006/runs/20261007T194057Z/logs/21-chains-continuation.log",
-      "sha256": "60a86c0063131d46eafdece7b724bdbb23d23da63886b575c135293b1dcfc25f",
-      "url": "https://github.com/starPaw/svm-auth-capture/blob/b52386c7432e356d20516d69be24d8c20d4764aa/docs/evidence/sac-006/runs/20261007T194057Z/logs/21-chains-continuation.log",
-      "access": "private repository"
-    },
-    {
-      "path": "docs/ARCHITECTURE.md",
-      "sha256": "f3bf5a67e2b0379f1d6c37ae7d6b38c50d7c2c4ba9feca8bb1c60a376bcb9bb4",
-      "url": "https://github.com/starPaw/svm-auth-capture/blob/b52386c7432e356d20516d69be24d8c20d4764aa/docs/ARCHITECTURE.md",
-      "access": "private repository"
-    },
-    {
-      "path": "docs/evidence/sac-007/deployment-identity.v1.json",
-      "sha256": "f013c31e871c7b66812a8156b2f9bfef8b76dc14c1d77722512d952852d47b87",
-      "url": "https://github.com/starPaw/svm-auth-capture/blob/b52386c7432e356d20516d69be24d8c20d4764aa/docs/evidence/sac-007/deployment-identity.v1.json",
-      "access": "private repository"
-    }
   ]
 }

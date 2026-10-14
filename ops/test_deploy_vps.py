@@ -455,7 +455,7 @@ class LauncherRecoveryTests(unittest.TestCase):
         def run(*args, **kwargs):
             calls.append(args)
             if args == ('git', 'remote', 'get-url', 'origin'):
-                return 'https://github.com/starPaw/svm-auth-capture.git'
+                return 'https://github.com/starPaw/capture402.git'
             if args == ('git', 'status', '--porcelain'): return ''
             raise RuntimeError('network unavailable')
         with (mock.patch.object(source, 'run', side_effect=run),

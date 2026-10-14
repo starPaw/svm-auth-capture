@@ -208,7 +208,7 @@ class PrivateSourceTests(unittest.TestCase):
             self.assertIn("/usr/bin/env", cmd)
         self.assertIn("core.sshCommand=ssh pinned", commands[0])
         self.assertIn(cd.SOURCE_REMOTE, commands[0])
-        self.assertNotIn("https://github.com/starPaw/svm-auth-capture.git", commands[0])
+        self.assertNotIn("https://github.com/starPaw/capture402.git", commands[0])
 
     def test_archive_source_isolated_from_global_git_config(self):
         with (mock.patch.object(cd.pwd, "getpwnam", return_value=self.user),

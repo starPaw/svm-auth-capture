@@ -2,7 +2,7 @@
 import datetime
 import re
 
-REPOSITORY = 'starPaw/svm-auth-capture'
+REPOSITORY = 'starPaw/capture402'
 REQUIRED_JOBS = {'SBF build and component checks', 'x402 integration, typecheck and wallet build'}
 
 

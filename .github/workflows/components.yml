@@ -1,0 +1,79 @@
+name: Components
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: components-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  components:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Reject private material throughout history
+        run: |
+          python3 -B ops/check_local_paths.py --staged
+          python3 -B ops/check_public_history.py
+          curl --fail --location --silent --show-error https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz -o "$RUNNER_TEMP/gitleaks.tar.gz"
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $RUNNER_TEMP/gitleaks.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP" gitleaks
+          "$RUNNER_TEMP/gitleaks" git . --log-opts='--all --full-history' --redact=100 --no-banner --ignore-gitleaks-allow
+      - name: Install pinned Rust and SBF CLI
+        run: |
+          rustup toolchain install 1.90.0 --profile minimal --component rustfmt --component clippy
+          curl --fail --location --retry 3 https://github.com/anza-xyz/agave/releases/download/v2.2.14/solana-release-x86_64-unknown-linux-gnu.tar.bz2 -o "$RUNNER_TEMP/solana-release.tar.bz2"
+          echo "b5dadeb39ab7f31062c599ead459b9d809dd9d709365df6cb5943828b7693b36  $RUNNER_TEMP/solana-release.tar.bz2" | sha256sum --check
+          tar -xjf "$RUNNER_TEMP/solana-release.tar.bz2" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/solana-release/bin" >> "$GITHUB_PATH"
+      - name: Build SBF and run Rust suites
+        run: |
+          cargo fmt --check
+          ./scripts/test-sac003.sh
+          cargo clippy --locked --all-targets -- -D warnings
+      - name: Run operator regressions
+        run: |
+          python3 -B -m unittest discover -s ops -p 'test_*.py'
+          sudo apt-get update && sudo apt-get install --yes nginx
+          sudo env GITHUB_ACTIONS=true CAPTURE402_SYSTEMD_TEST=1 PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s ops -p 'test_boot_gate.py' -v
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: tested-sbf
+          path: target/deploy/svm_auth_capture.so
+          if-no-files-found: error
+          retention-days: 7
+  integration:
+    needs: components
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: integration/package-lock.json
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: tested-sbf
+          path: target/deploy
+      - name: Install and validate integration
+        env:
+          SAC006_TEST_NGINX: /usr/sbin/nginx
+          SAC006_TEST_STRACE: /usr/bin/strace
+        run: |
+          sudo apt-get update && sudo apt-get install --yes nginx strace
+          npm ci --prefix integration
+          npm run typecheck --prefix integration
+          npm run build:wallet --prefix integration
+          git diff --exit-code -- integration/web/solflare.js integration/web/solflare.js.LEGAL.txt
+          npm test --prefix integration

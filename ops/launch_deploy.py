@@ -95,7 +95,7 @@ def require_acceptance(sha):
 def main():
     if sys.argv[1:] not in ([], ['--install-cli']):
         raise RuntimeError('usage: ./deploy.sh [--install-cli] (clean, exact current main checkout)')
-    source.require(source.run('git', 'remote', 'get-url', 'origin') == 'https://github.com/starPaw/svm-auth-capture.git', 'wrong repository')
+    source.require(source.run('git', 'remote', 'get-url', 'origin') == 'https://github.com/starPaw/capture402.git', 'wrong repository')
     source.require(not source.run('git', 'status', '--porcelain'), 'deployment requires clean checkout')
     recover_first()
     source.run('git', 'fetch', 'origin', 'main', timeout=120)

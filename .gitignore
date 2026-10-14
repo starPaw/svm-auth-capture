@@ -5,3 +5,15 @@
 .env.*
 target/
 node_modules/
+
+__pycache__/
+*.pyc
+.agents/
+.codex/
+AGENT.md
+AGENTS.md
+agent.md
+agents.md
+docs/evidence/
+integration/evidence/
+tasks/
