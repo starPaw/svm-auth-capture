@@ -38,9 +38,8 @@ jobs:
           cargo fmt --check
           ./scripts/test-sac003.sh
           cargo clippy --locked --all-targets -- -D warnings
-      - name: Run operator regressions
+      - name: Exercise disposable systemd recovery
         run: |
-          python3 -B -m unittest discover -s ops -p 'test_*.py'
           sudo apt-get update && sudo apt-get install --yes nginx
           sudo env GITHUB_ACTIONS=true CAPTURE402_SYSTEMD_TEST=1 PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s ops -p 'test_boot_gate.py' -v
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -73,6 +72,7 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install --yes nginx strace
           npm ci --prefix integration
+          python3 -B -m unittest discover -s ops -p 'test_*.py'
           npm run typecheck --prefix integration
           npm run build:wallet --prefix integration
           git diff --exit-code -- integration/web/solflare.js integration/web/solflare.js.LEGAL.txt
